@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+.turbo
+apps/backend/.venv
+pnpm-lock.yaml
+uv.lock
