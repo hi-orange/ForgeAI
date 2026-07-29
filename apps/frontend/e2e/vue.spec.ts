@@ -1,8 +1,8 @@
 import { test, expect } from '@playwright/test'
 
-// See here how to get started:
-// https://playwright.dev/docs/intro
-test('visits the app root url', async ({ page }) => {
+test('redirects unauthenticated users to login', async ({ page }) => {
   await page.goto('/')
-  await expect(page.locator('h1')).toHaveText('Enterprise Platform')
+  await expect(page).toHaveURL(/\/login/)
+  await expect(page.getByText('ForgeAI').first()).toBeVisible()
+  await expect(page.getByRole('heading', { name: '登录工作台' })).toBeVisible()
 })
