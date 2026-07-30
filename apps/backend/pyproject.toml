@@ -39,4 +39,5 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test.py", "test_*.py", "*_test.py"]
 pythonpath = ["."]

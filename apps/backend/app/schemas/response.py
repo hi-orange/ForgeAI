@@ -9,7 +9,7 @@ class ApiResponse[T](BaseModel):
     data: T | None = None
 
 
-def ok(data: Any = None, *, msg: str = "ok") -> dict[str, Any]:
+def success(data: Any = None, *, msg: str = "ok") -> dict[str, Any]:
     if isinstance(data, BaseModel):
         data = data.model_dump(mode="json")
     return {"code": 0, "msg": msg, "data": data}

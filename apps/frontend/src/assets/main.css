@@ -3,12 +3,16 @@
 @theme {
   --font-display: 'Syne', sans-serif;
   --font-sans: 'DM Sans', sans-serif;
+  --color-forge-blue: #2f6bff;
+  --color-forge-blue-deep: #1f54e0;
+  --color-forge-ink: #0f172a;
+  --color-forge-muted: #64748b;
+  --color-forge-line: #e2e8f0;
+  --color-forge-panel: #f8fafc;
   --color-ink: #0f1419;
-  --color-slate-panel: #1a222c;
-  --color-ember: #e36f3c;
-  --color-ember-deep: #c45528;
   --color-mist: #d7dde5;
   --color-fog: #9aa7b5;
+  --color-ember: #e36f3c;
 }
 
 @layer base {
@@ -21,8 +25,8 @@
   body {
     margin: 0;
     font-family: var(--font-sans);
-    color: var(--color-mist);
-    background: var(--color-ink);
+    color: var(--color-forge-ink);
+    background: #f7f8fb;
     -webkit-font-smoothing: antialiased;
   }
 

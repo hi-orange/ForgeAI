@@ -15,13 +15,12 @@ export type TokenOut = {
 }
 
 export type RegisterPayload = {
-  username: string
   email: string
   password: string
 }
 
 export type LoginPayload = {
-  username: string
+  email: string
   password: string
 }
 
@@ -43,5 +42,30 @@ export function fetchMe(token: string) {
   return apiRequest<User>('/api/v1/auth/me', {
     method: 'GET',
     token,
+  })
+}
+
+export type UsernameUpdatePayload = {
+  username: string
+}
+
+export function updateUsername(token: string, payload: UsernameUpdatePayload) {
+  return apiRequest<User>('/api/v1/auth/username', {
+    method: 'PATCH',
+    token,
+    body: payload,
+  })
+}
+
+export type ChangePasswordPayload = {
+  old_password: string
+  new_password: string
+}
+
+export function changePassword(token: string, payload: ChangePasswordPayload) {
+  return apiRequest<null>('/api/v1/auth/password', {
+    method: 'PATCH',
+    token,
+    body: payload,
   })
 }

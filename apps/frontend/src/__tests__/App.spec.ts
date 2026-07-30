@@ -40,7 +40,9 @@ describe('App shell', () => {
       },
     })
 
-    expect(wrapper.text()).toContain('ForgeAI')
-    expect(wrapper.text()).toContain('登录工作台')
+    expect(wrapper.text()).toContain('Forge')
+    expect(wrapper.text()).toContain('Welcome back')
+    expect(wrapper.text()).toContain('Email')
+    expect(wrapper.text()).not.toContain('GitHub')
   })
 })
