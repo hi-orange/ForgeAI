@@ -14,10 +14,10 @@ class Settings(BaseSettings):
     mysql_host: str = "localhost"
     mysql_port: int = 3306
     mysql_user: str = "root"
-    mysql_password: str
-    mysql_database: str
+    mysql_password: str = ""
+    mysql_database: str = "agent_platform"
 
-    secret_key: str
+    secret_key: str = "change-me-to-a-long-random-string"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 10080
 
