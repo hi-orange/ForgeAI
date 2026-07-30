@@ -23,6 +23,15 @@ export default defineConfigWithVueTs(
   vueTsConfigs.recommended,
 
   {
+    name: 'app/vue-sfc-order',
+    files: ['**/*.vue'],
+    rules: {
+      // Keep Vue SFC order: template -> script -> style
+      'vue/block-order': ['error', { order: ['template', 'script', 'style'] }],
+    },
+  },
+
+  {
     ...pluginPlaywright.configs['flat/recommended'],
     files: ['e2e/**/*.{test,spec}.{js,ts,jsx,tsx}'],
   },

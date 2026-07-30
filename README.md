@@ -23,7 +23,7 @@ pnpm dev
 ```
 
 - Frontend: http://localhost:5173
-- Backend: http://localhost:8000 (`/health`)
+- Backend: http://localhost:8000
 
 ## Quality gates
 

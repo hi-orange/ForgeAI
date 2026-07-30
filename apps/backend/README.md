@@ -25,5 +25,3 @@ uv run ruff check app tests
 uv run mypy app
 uv run pytest
 ```
-
-Health check: `GET /health`

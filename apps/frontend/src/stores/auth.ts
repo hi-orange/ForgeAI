@@ -2,7 +2,13 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import * as authApi from '@/api/auth'
-import type { LoginPayload, RegisterPayload, User } from '@/api/auth'
+import type {
+  ChangePasswordPayload,
+  LoginPayload,
+  RegisterPayload,
+  User,
+  UsernameUpdatePayload,
+} from '@/api/auth'
 
 const TOKEN_KEY = 'forgeai_access_token'
 
@@ -61,9 +67,43 @@ export const useAuthStore = defineStore('auth', () => {
     error.value = null
     try {
       await authApi.register(payload)
-      await login({ username: payload.username, password: payload.password })
+      await login({ email: payload.email, password: payload.password })
     } catch (err) {
       error.value = err instanceof Error ? err.message : '注册失败'
+      throw err
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function updateUsername(payload: UsernameUpdatePayload) {
+    if (!token.value) {
+      throw new Error('未登录或登录已过期')
+    }
+    loading.value = true
+    error.value = null
+    try {
+      user.value = await authApi.updateUsername(token.value, payload)
+      return user.value
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '修改用户名失败'
+      throw err
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function changePassword(payload: ChangePasswordPayload) {
+    if (!token.value) {
+      throw new Error('未登录或登录已过期')
+    }
+    loading.value = true
+    error.value = null
+    try {
+      await authApi.changePassword(token.value, payload)
+      logout()
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '修改密码失败'
       throw err
     } finally {
       loading.value = false
@@ -86,6 +126,8 @@ export const useAuthStore = defineStore('auth', () => {
     bootstrap,
     login,
     register,
+    updateUsername,
+    changePassword,
     logout,
   }
 })

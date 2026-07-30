@@ -1,3 +1,76 @@
+<template>
+  <AuthLayout
+    headline="Start Building with Forge"
+    tagline="Turn ideas into intelligent workflows."
+    description="Fast setup. Powerful automation. Unified AI operations."
+  >
+    <header class="intro">
+      <h2>Create your account</h2>
+      <p>Get started with Forge and build intelligent workflows faster</p>
+    </header>
+
+    <form class="auth-form" @submit.prevent="onSubmit">
+      <label>
+        <span>Email</span>
+        <div class="field">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="3" y="5" width="18" height="14" rx="2" />
+              <path d="m3 7 9 6 9-6" />
+            </svg>
+          </span>
+          <input
+            v-model="form.email"
+            type="email"
+            autocomplete="email"
+            placeholder="you@example.com"
+          />
+        </div>
+      </label>
+
+      <label>
+        <span>Password</span>
+        <div class="field">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="5" y="11" width="14" height="10" rx="2" />
+              <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+            </svg>
+          </span>
+          <input
+            v-model="form.password"
+            :type="showPassword ? 'text' : 'password'"
+            autocomplete="new-password"
+            placeholder="Create a password"
+          />
+          <button
+            type="button"
+            class="eye"
+            :aria-label="showPassword ? 'Hide password' : 'Show password'"
+            @click="showPassword = !showPassword"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+          </button>
+        </div>
+      </label>
+
+      <p v-if="localError" class="error" role="alert">{{ localError }}</p>
+
+      <button type="submit" class="primary" :disabled="auth.loading">
+        {{ auth.loading ? 'Creating…' : 'Create Account' }}
+      </button>
+    </form>
+
+    <p class="switch">
+      Already have an account?
+      <RouterLink :to="{ name: 'login' }">Sign in</RouterLink>
+    </p>
+  </AuthLayout>
+</template>
+
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -9,32 +82,26 @@ const router = useRouter()
 const auth = useAuthStore()
 
 const form = reactive({
-  username: '',
   email: '',
   password: '',
-  confirmPassword: '',
 })
+const showPassword = ref(false)
 const localError = ref<string | null>(null)
 
 async function onSubmit() {
   localError.value = null
 
-  if (!form.username.trim() || !form.email.trim() || !form.password) {
-    localError.value = '请完整填写注册信息'
+  if (!form.email.trim() || !form.password) {
+    localError.value = '请输入邮箱和密码'
     return
   }
   if (form.password.length < 6) {
     localError.value = '密码至少 6 位'
     return
   }
-  if (form.password !== form.confirmPassword) {
-    localError.value = '两次输入的密码不一致'
-    return
-  }
 
   try {
     await auth.register({
-      username: form.username.trim(),
       email: form.email.trim(),
       password: form.password,
     })
@@ -45,113 +112,110 @@ async function onSubmit() {
 }
 </script>
 
-<template>
-  <AuthLayout title="创建账号" subtitle="注册后即可登录 ForgeAI，开始构建你的智能工作台。">
-    <form class="auth-form" @submit.prevent="onSubmit">
-      <label>
-        <span>用户名</span>
-        <input
-          v-model="form.username"
-          type="text"
-          autocomplete="username"
-          placeholder="至少 3 个字符"
-        />
-      </label>
-      <label>
-        <span>邮箱</span>
-        <input
-          v-model="form.email"
-          type="email"
-          autocomplete="email"
-          placeholder="you@example.com"
-        />
-      </label>
-      <label>
-        <span>密码</span>
-        <input
-          v-model="form.password"
-          type="password"
-          autocomplete="new-password"
-          placeholder="至少 6 位"
-        />
-      </label>
-      <label>
-        <span>确认密码</span>
-        <input
-          v-model="form.confirmPassword"
-          type="password"
-          autocomplete="new-password"
-          placeholder="再输入一次"
-        />
-      </label>
-
-      <p v-if="localError" class="error" role="alert">{{ localError }}</p>
-
-      <button type="submit" class="primary" :disabled="auth.loading">
-        {{ auth.loading ? '注册中…' : '注册并登录' }}
-      </button>
-    </form>
-
-    <p class="switch">
-      已有账号？
-      <RouterLink :to="{ name: 'login' }">去登录</RouterLink>
-    </p>
-  </AuthLayout>
-</template>
-
 <style scoped>
+.intro {
+  text-align: center;
+  margin-bottom: 1.5rem;
+}
+
+.intro h2 {
+  margin: 0;
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  color: #0f172a;
+}
+
+.intro p {
+  margin: 0.45rem 0 0;
+  color: #64748b;
+  font-size: 0.95rem;
+}
+
 .auth-form {
   display: grid;
   gap: 1rem;
 }
 
-label {
+label > span {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.icon,
+.eye {
+  position: absolute;
   display: grid;
-  gap: 0.4rem;
+  place-items: center;
+  width: 2.5rem;
+  color: #94a3b8;
 }
 
-label span {
-  font-size: 0.85rem;
-  color: var(--color-fog);
+.icon {
+  left: 0;
+  pointer-events: none;
 }
 
-input {
+.eye {
+  right: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.icon svg,
+.eye svg {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+
+input[type='email'],
+input[type='password'],
+input[type='text'] {
   width: 100%;
   box-sizing: border-box;
-  border: 1px solid rgba(215, 221, 229, 0.16);
-  border-radius: 0.55rem;
-  background: rgba(26, 34, 44, 0.85);
-  color: var(--color-mist);
-  padding: 0.8rem 0.9rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.7rem;
+  background: #fff;
+  color: #0f172a;
+  padding: 0.85rem 2.6rem;
   outline: none;
   transition:
-    border-color 0.2s ease,
-    box-shadow 0.2s ease;
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 input:focus {
-  border-color: rgba(227, 111, 60, 0.7);
-  box-shadow: 0 0 0 3px rgba(227, 111, 60, 0.18);
+  border-color: #2f6bff;
+  box-shadow: 0 0 0 3px rgba(47, 107, 255, 0.15);
 }
 
 .primary {
-  margin-top: 0.35rem;
+  margin-top: 0.25rem;
   border: 0;
-  border-radius: 0.55rem;
-  background: linear-gradient(135deg, var(--color-ember) 0%, var(--color-ember-deep) 100%);
-  color: #fff8f4;
-  font-weight: 600;
-  padding: 0.85rem 1rem;
+  border-radius: 0.75rem;
+  background: #2f6bff;
+  color: #fff;
+  font-weight: 700;
+  padding: 0.9rem 1rem;
   cursor: pointer;
   transition:
-    transform 0.15s ease,
-    filter 0.15s ease,
-    opacity 0.15s ease;
+    background 0.15s ease,
+    transform 0.15s ease;
 }
 
 .primary:hover:not(:disabled) {
+  background: #1f54e0;
   transform: translateY(-1px);
-  filter: brightness(1.05);
 }
 
 .primary:disabled {
@@ -161,22 +225,19 @@ input:focus {
 
 .error {
   margin: 0;
-  color: #ffb4a2;
+  color: #dc2626;
   font-size: 0.9rem;
 }
 
 .switch {
-  margin: 1.25rem 0 0;
-  color: var(--color-fog);
+  margin: 1.35rem 0 0;
+  text-align: center;
+  color: #64748b;
   font-size: 0.92rem;
 }
 
 .switch a {
-  color: #f0a57a;
-  font-weight: 600;
-}
-
-.switch a:hover {
-  text-decoration: underline;
+  color: #2f6bff;
+  font-weight: 700;
 }
 </style>
