@@ -1,6 +1,24 @@
 {
   "$schema": "https://turborepo.com/schema.json",
   "ui": "stream",
+  "globalPassThroughEnv": [
+    "APP_ENV",
+    "APP_NAME",
+    "DEBUG",
+    "MYSQL_HOST",
+    "MYSQL_PORT",
+    "MYSQL_USER",
+    "MYSQL_PASSWORD",
+    "MYSQL_DATABASE",
+    "SECRET_KEY",
+    "ALGORITHM",
+    "ACCESS_TOKEN_EXPIRE_MINUTES",
+    "CORS_ORIGINS",
+    "LLM_PROVIDER",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_MODEL"
+  ],
   "tasks": {
     "dev": {
       "cache": false,
@@ -16,6 +34,15 @@
     "typecheck": {
       "dependsOn": ["^typecheck"]
     },
-    "test": {}
+    "test": {
+      "env": [
+        "MYSQL_HOST",
+        "MYSQL_PORT",
+        "MYSQL_USER",
+        "MYSQL_PASSWORD",
+        "MYSQL_DATABASE",
+        "SECRET_KEY"
+      ]
+    }
   }
 }

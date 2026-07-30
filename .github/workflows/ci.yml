@@ -24,6 +24,7 @@ jobs:
         image: mysql:8.0
         env:
           MYSQL_ROOT_PASSWORD: root
+          MYSQL_ROOT_HOST: "%"
           MYSQL_DATABASE: agent_platform
         ports:
           - 3306:3306
@@ -52,6 +53,20 @@ jobs:
       - name: Install Python dependencies
         working-directory: apps/backend
         run: uv sync
+
+      - name: Write backend env for CI
+        working-directory: apps/backend
+        run: |
+          printf '%s\n' \
+            'APP_ENV=development' \
+            'MYSQL_HOST=127.0.0.1' \
+            'MYSQL_PORT=3306' \
+            'MYSQL_USER=root' \
+            'MYSQL_PASSWORD=root' \
+            'MYSQL_DATABASE=agent_platform' \
+            'SECRET_KEY=ci-test-secret-key' \
+            'CORS_ORIGINS=http://localhost:5173' \
+            > .env.development
 
       - name: Run database migrations
         working-directory: apps/backend
