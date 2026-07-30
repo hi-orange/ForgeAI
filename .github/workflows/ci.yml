@@ -12,6 +12,26 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DATABASE: agent_platform
+      SECRET_KEY: ci-test-secret-key
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: agent_platform
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +52,10 @@ jobs:
       - name: Install Python dependencies
         working-directory: apps/backend
         run: uv sync
+
+      - name: Run database migrations
+        working-directory: apps/backend
+        run: uv run alembic upgrade head
 
       - name: Check
         run: pnpm check
