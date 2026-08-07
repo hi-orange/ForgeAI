@@ -211,3 +211,42 @@ def test_change_password_rejects_short_new_password() -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 422
+
+
+def test_create_and_start_project() -> None:
+    token = _register_and_login(f"project_ok_{uuid4().hex[:8]}@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    prompt = "我要生成一个旅游网站"
+
+    created = client.post(
+        "/api/v1/projects",
+        json={"prompt": prompt},
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["code"] == 0
+    project = created.json()["data"]
+    assert project["prompt"] == prompt
+    assert project["status"] == "draft"
+    assert project["name"]
+
+    started = client.post(
+        f"/api/v1/projects/{project['id']}/start",
+        json={"prompt": prompt},
+        headers=headers,
+    )
+    assert started.status_code == 200, started.text
+    body = started.json()
+    assert body["code"] == 0
+    assert body["data"]["project"]["status"] == "running"
+    assert body["data"]["workflow_id"].startswith("wf_")
+    assert "Agent Workflow" in body["data"]["message"]
+
+    listed = client.get("/api/v1/projects", headers=headers)
+    assert listed.status_code == 200
+    assert any(p["id"] == project["id"] for p in listed.json()["data"])
+
+
+def test_start_project_requires_auth() -> None:
+    response = client.post("/api/v1/projects/1/start", json={})
+    assert response.status_code == 401

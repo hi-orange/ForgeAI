@@ -24,6 +24,12 @@ const router = createRouter({
       meta: { guestOnly: true },
     },
     {
+      path: '/projects/:id',
+      name: 'project',
+      component: () => import('@/views/ProjectView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
       path: '/:pathMatch(.*)*',
       redirect: '/',
     },

@@ -64,13 +64,20 @@
 
       <div v-show="!collapsed" class="section">
         <p class="section-title">最近</p>
-        <button v-for="item in recentItems" :key="item.id" type="button" class="recent-item">
+        <p v-if="!recentItems.length" class="recent-empty">暂无项目</p>
+        <RouterLink
+          v-for="item in recentItems"
+          :key="item.id"
+          :to="{ name: 'project', params: { id: item.id } }"
+          class="recent-item"
+          :class="{ active: isProjectActive(item.id) }"
+        >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
             <circle cx="12" cy="12" r="8" />
             <path d="M12 8v4l2.5 2.5" />
           </svg>
-          <span>{{ item.title }}</span>
-        </button>
+          <span>{{ item.name }}</span>
+        </RouterLink>
       </div>
     </div>
 
@@ -108,18 +115,20 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
 import ForgeLogo from '@/components/ForgeLogo.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
 import { useAuthStore } from '@/stores/auth'
+import { useProjectStore } from '@/stores/project'
 
 const emit = defineEmits<{
   collapse: [collapsed: boolean]
 }>()
 
 const auth = useAuthStore()
+const projects = useProjectStore()
 const route = useRoute()
 const collapsed = ref(false)
 const settingsOpen = ref(false)
@@ -155,11 +164,21 @@ const navItems = [
   { key: 'projects', label: '我的项目', to: '#projects', icon: 'folder' },
 ] as const
 
-const recentItems = [{ id: '1', title: '招聘网站设计' }]
+const recentItems = computed(() => projects.items.slice(0, 8))
+
+onMounted(() => {
+  void projects.fetchList().catch(() => {
+    /* sidebar stays empty on failure */
+  })
+})
 
 function isActive(to: string) {
   if (to === '/') return route.path === '/'
   return false
+}
+
+function isProjectActive(id: number) {
+  return route.name === 'project' && Number(route.params.id) === id
 }
 </script>
 
@@ -354,6 +373,13 @@ function isActive(to: string) {
   font-weight: 600;
 }
 
+.recent-empty {
+  margin: 0;
+  padding: 0.35rem 0.75rem;
+  color: #94a3b8;
+  font-size: 0.82rem;
+}
+
 .recent-item {
   display: flex;
   align-items: center;
@@ -367,10 +393,19 @@ function isActive(to: string) {
   font-size: 0.88rem;
   cursor: pointer;
   text-align: left;
+  text-decoration: none;
+  box-sizing: border-box;
 }
 
-.recent-item:hover {
+.recent-item:hover,
+.recent-item.active {
   background: #e9eef7;
+}
+
+.recent-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .recent-item svg {
