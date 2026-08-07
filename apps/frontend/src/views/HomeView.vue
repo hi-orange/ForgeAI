@@ -28,7 +28,20 @@
 
         <section class="composer-wrap">
           <div class="composer">
-            <textarea v-model="prompt" rows="4" placeholder="描述你想构建的 Web 应用..." />
+            <div class="composer-input">
+              <textarea
+                ref="textareaRef"
+                v-model="prompt"
+                rows="4"
+                :placeholder="showTypewriter ? '' : '描述你想构建的 Web 应用...'"
+                @focus="composerFocused = true"
+                @blur="composerFocused = false"
+              />
+              <p v-if="showTypewriter" class="typewriter" aria-hidden="true">
+                <span>{{ typedText }}</span>
+                <span class="caret" />
+              </p>
+            </div>
 
             <div class="composer-toolbar">
               <div class="toolbar-left">
@@ -36,13 +49,14 @@
               </div>
 
               <div class="toolbar-right">
-                <button type="button" class="build-btn" @click="onBuild">
-                  <span>构建</span>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="m6 9 6 6 6-6" />
-                  </svg>
-                </button>
-                <button type="button" class="send-btn" title="开始构建" @click="onBuild">
+                <p v-if="buildError" class="build-error">{{ buildError }}</p>
+                <button
+                  type="button"
+                  class="send-btn"
+                  :title="building ? '创建中…' : '开始创建'"
+                  :disabled="building"
+                  @click="onBuild"
+                >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M12 19V5" />
                     <path d="m6 11 6-6 6 6" />
@@ -68,13 +82,109 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 
 import AppSidebar from '@/components/AppSidebar.vue'
 import { useAuthStore } from '@/stores/auth'
+import { useProjectStore } from '@/stores/project'
 
 const auth = useAuthStore()
+const projects = useProjectStore()
+const router = useRouter()
 const prompt = ref('')
+const typedText = ref('')
+const composerFocused = ref(false)
+const textareaRef = ref<HTMLTextAreaElement | null>(null)
+const building = ref(false)
+const buildError = ref<string | null>(null)
+
+const samplePrompts = [
+  '帮我做一个现代化的招聘网站，支持职位筛选和在线投递',
+  '创建一个 SaaS 产品落地页，突出定价方案和客户评价',
+  '构建一个团队协作看板，可以拖拽任务并分配成员',
+  '做一个个人作品集网站，展示项目案例和联系方式',
+  '设计一个在线课程平台首页，包含课程列表和学习进度',
+  '帮我做一个本地生活服务小程序首页，支持预约和下单',
+] as const
+
+const showTypewriter = computed(() => !composerFocused.value && !prompt.value.trim())
+
+let promptIndex = 0
+let charIndex = 0
+let deleting = false
+let timer: ReturnType<typeof setTimeout> | null = null
+let running = false
+
+function clearTimer() {
+  if (timer !== null) {
+    clearTimeout(timer)
+    timer = null
+  }
+}
+
+function schedule(fn: () => void, delay: number) {
+  clearTimer()
+  timer = setTimeout(fn, delay)
+}
+
+function tick() {
+  if (!running || !showTypewriter.value) return
+
+  const current = samplePrompts[promptIndex] ?? samplePrompts[0]!
+
+  if (!deleting) {
+    charIndex += 1
+    typedText.value = current.slice(0, charIndex)
+    if (charIndex >= current.length) {
+      deleting = true
+      schedule(tick, 2200)
+      return
+    }
+    schedule(tick, 42 + Math.random() * 36)
+    return
+  }
+
+  charIndex -= 1
+  typedText.value = current.slice(0, Math.max(charIndex, 0))
+  if (charIndex <= 0) {
+    deleting = false
+    promptIndex = (promptIndex + 1) % samplePrompts.length
+    schedule(tick, 420)
+    return
+  }
+  schedule(tick, 22)
+}
+
+function startTypewriter() {
+  if (running) return
+  running = true
+  schedule(tick, 350)
+}
+
+function stopTypewriter() {
+  running = false
+  clearTimer()
+}
+
+watch(showTypewriter, (visible) => {
+  if (visible) {
+    startTypewriter()
+  } else {
+    stopTypewriter()
+    typedText.value = ''
+    charIndex = 0
+    deleting = false
+  }
+})
+
+onMounted(() => {
+  if (showTypewriter.value) startTypewriter()
+})
+
+onUnmounted(() => {
+  stopTypewriter()
+})
 
 const displayName = computed(() => {
   const raw = auth.user?.username || auth.user?.email?.split('@')[0] || '创作者'
@@ -169,9 +279,30 @@ const features = [
   },
 ]
 
-function onBuild() {
-  if (!prompt.value.trim()) {
-    prompt.value = '帮我构建一个现代化的招聘网站'
+async function onBuild() {
+  if (building.value) return
+
+  let text = prompt.value.trim()
+  if (!text) {
+    text = samplePrompts[promptIndex] || samplePrompts[0]!
+    prompt.value = text
+    stopTypewriter()
+    typedText.value = ''
+  }
+
+  building.value = true
+  buildError.value = null
+  try {
+    const result = await projects.createAndStart(text)
+    await router.push({
+      name: 'project',
+      params: { id: String(result.project.id) },
+      query: { workflow_id: result.workflow_id },
+    })
+  } catch (err) {
+    buildError.value = err instanceof Error ? err.message : '创建失败'
+  } finally {
+    building.value = false
   }
 }
 </script>
@@ -332,6 +463,10 @@ function onBuild() {
   padding: 1rem 1rem 0.85rem;
 }
 
+.composer-input {
+  position: relative;
+}
+
 .composer textarea {
   width: 100%;
   min-height: 6.5rem;
@@ -342,10 +477,45 @@ function onBuild() {
   color: #0f172a;
   line-height: 1.55;
   background: transparent;
+  position: relative;
+  z-index: 1;
 }
 
 .composer textarea::placeholder {
   color: #94a3b8;
+}
+
+.typewriter {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  pointer-events: none;
+  color: #94a3b8;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  z-index: 0;
+}
+
+.caret {
+  display: inline-block;
+  width: 0.1rem;
+  height: 1.05em;
+  margin-left: 0.08rem;
+  vertical-align: text-bottom;
+  background: #64748b;
+  animation: blink 1s steps(1) infinite;
+}
+
+@keyframes blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
 }
 
 .composer-toolbar {
@@ -361,6 +531,15 @@ function onBuild() {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+}
+
+.build-error {
+  margin: 0;
+  max-width: 12rem;
+  color: #dc2626;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.3;
 }
 
 .round-btn,
@@ -386,27 +565,9 @@ function onBuild() {
   color: #1d4ed8;
 }
 
-.build-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.2rem;
-  border: 0;
-  border-radius: 999px;
-  background: #2f6bff;
-  color: #fff;
-  font-weight: 700;
-  font-size: 0.9rem;
-  padding: 0.5rem 0.85rem 0.5rem 1rem;
-  cursor: pointer;
-}
-
-.build-btn svg {
-  width: 1rem;
-  height: 1rem;
-}
-
-.build-btn:hover {
-  background: #1f54e0;
+.send-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
 }
 
 .send-btn svg {
