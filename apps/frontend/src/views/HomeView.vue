@@ -290,14 +290,14 @@ async function onBuild() {
     typedText.value = ''
   }
 
+  // Home rule: each submit creates exactly one new project (never reuse by prompt text).
   building.value = true
   buildError.value = null
   try {
-    const result = await projects.createAndStart(text)
+    const project = await projects.createFromHomeRequirement(text)
     await router.push({
       name: 'project',
-      params: { id: String(result.project.id) },
-      query: { workflow_id: result.workflow_id },
+      params: { id: String(project.id) },
     })
   } catch (err) {
     buildError.value = err instanceof Error ? err.message : '创建失败'

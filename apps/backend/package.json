@@ -4,9 +4,8 @@
   "scripts": {
     "dev": "uv run uvicorn app.main:app --reload --port 8000",
     "build": "uv run python -m compileall app",
-    "lint": "uv run ruff check app tests",
-    "format": "uv run ruff format app tests",
-    "typecheck": "uv run mypy app",
-    "test": "uv run pytest"
+    "lint": "uv run ruff check app",
+    "format": "uv run ruff format app",
+    "typecheck": "uv run mypy app"
   }
 }

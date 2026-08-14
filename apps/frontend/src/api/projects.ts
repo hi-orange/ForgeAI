@@ -6,6 +6,7 @@ export type Project = {
   name: string
   description: string | null
   prompt: string | null
+  prd: string | null
   status: string
   created_at: string
   updated_at: string
@@ -28,6 +29,7 @@ export type ProjectStartResult = {
 }
 
 export function createProject(token: string, payload: ProjectCreatePayload) {
+  // Always creates a new project row; callers must not reuse by prompt/name.
   return apiRequest<Project>('/api/v1/projects', {
     method: 'POST',
     token,

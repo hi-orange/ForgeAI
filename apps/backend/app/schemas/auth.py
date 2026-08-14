@@ -5,18 +5,13 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, mo
 
 class UserRegister(BaseModel):
     """注册只需邮箱和密码，username 由后端根据邮箱自动生成。"""
-
     model_config = ConfigDict(extra="ignore")
-
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
 
 
 class UserLogin(BaseModel):
-    """登录只需邮箱和密码。"""
-
     model_config = ConfigDict(extra="ignore")
-
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
 

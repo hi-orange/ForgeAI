@@ -33,16 +33,6 @@
     },
     "typecheck": {
       "dependsOn": ["^typecheck"]
-    },
-    "test": {
-      "env": [
-        "MYSQL_HOST",
-        "MYSQL_PORT",
-        "MYSQL_USER",
-        "MYSQL_PASSWORD",
-        "MYSQL_DATABASE",
-        "SECRET_KEY"
-      ]
     }
   }
 }

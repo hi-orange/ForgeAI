@@ -165,6 +165,7 @@ const navItems = [
 ] as const
 
 const recentItems = computed(() => projects.items.slice(0, 8))
+// Recent list may contain identical names; each row is a distinct project.id.
 
 onMounted(() => {
   void projects.fetchList().catch(() => {

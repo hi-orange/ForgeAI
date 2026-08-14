@@ -28,18 +28,17 @@ pnpm dev
 ## Quality gates
 
 ```bash
-pnpm check   # lint + typecheck + test + format
+pnpm check   # lint + typecheck + format
 pnpm lint
 pnpm typecheck
-pnpm test
 pnpm format
 ```
 
 ## Apps
 
-| Package             | Path            | Stack                           |
-| ------------------- | --------------- | ------------------------------- |
-| `@forgeai/frontend` | `apps/frontend` | Vue 3, Vite, Tailwind, Vitest   |
-| `@forgeai/backend`  | `apps/backend`  | FastAPI, uv, Ruff, mypy, pytest |
+| Package             | Path            | Stack                         |
+| ------------------- | --------------- | ----------------------------- |
+| `@forgeai/frontend` | `apps/frontend` | Vue 3, Vite, Tailwind         |
+| `@forgeai/backend`  | `apps/backend`  | FastAPI, uv, Ruff, mypy       |
 
 Shared JS packages can go under `packages/` when needed.

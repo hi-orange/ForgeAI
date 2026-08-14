@@ -16,6 +16,11 @@ def _name_from_prompt(prompt: str) -> str:
 
 
 def create_project(db: Session, user: User, payload: ProjectCreate) -> Project:
+    """Always insert a new project row.
+
+    Home-page rule: one requirement submission => one project.
+    Never reuse/merge an existing project because name or prompt matches.
+    """
     prompt = payload.prompt.strip()
     if not prompt:
         raise BusinessException("请输入需求")
@@ -75,5 +80,17 @@ def start_project(
     db.commit()
     db.refresh(project)
 
-    workflow_id = agent_service.start_agent_workflow(project)
+    try:
+        workflow_id, prd = agent_service.start_agent_workflow(project)
+        project.prd = prd
+        project.status = "prd_ready"
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+    except Exception:
+        project.status = "failed"
+        db.add(project)
+        db.commit()
+        raise
+
     return project, workflow_id

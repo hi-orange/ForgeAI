@@ -19,6 +19,7 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prd: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="draft", server_default="draft"
     )

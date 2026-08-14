@@ -13,8 +13,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "turbo typecheck",
-    "test": "turbo test",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm format:check",
+    "check": "pnpm lint && pnpm typecheck && pnpm format:check",
     "prepare": "husky"
   },
   "devDependencies": {

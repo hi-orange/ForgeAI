@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProjectCreate(BaseModel):
-    """创建项目：提交用户需求（prompt）。"""
+    """主页每次提交需求都新建一条 project，不按名称/文案去重。"""
 
     prompt: str = Field(min_length=1, max_length=8000)
     name: str | None = Field(default=None, min_length=1, max_length=200)
@@ -12,7 +12,7 @@ class ProjectCreate(BaseModel):
 
 
 class ProjectStart(BaseModel):
-    """启动 Agent Workflow，可覆盖/补充需求。"""
+    """启动已有项目的 Agent Workflow（不创建新项目）。"""
 
     prompt: str | None = Field(default=None, min_length=1, max_length=8000)
 
@@ -25,6 +25,7 @@ class ProjectOut(BaseModel):
     name: str
     description: str | None = None
     prompt: str | None = None
+    prd: str | None = None
     status: str
     created_at: datetime
     updated_at: datetime
@@ -33,4 +34,4 @@ class ProjectOut(BaseModel):
 class ProjectStartOut(BaseModel):
     project: ProjectOut
     workflow_id: str
-    message: str = "已进入 Agent Workflow"
+    message: str = "Product Manager 已生成 PRD"
