@@ -36,9 +36,9 @@ pnpm format
 
 ## Apps
 
-| Package             | Path            | Stack                         |
-| ------------------- | --------------- | ----------------------------- |
-| `@forgeai/frontend` | `apps/frontend` | Vue 3, Vite, Tailwind         |
-| `@forgeai/backend`  | `apps/backend`  | FastAPI, uv, Ruff, mypy       |
+| Package             | Path            | Stack                   |
+| ------------------- | --------------- | ----------------------- |
+| `@forgeai/frontend` | `apps/frontend` | Vue 3, Vite, Tailwind   |
+| `@forgeai/backend`  | `apps/backend`  | FastAPI, uv, Ruff, mypy |
 
 Shared JS packages can go under `packages/` when needed.

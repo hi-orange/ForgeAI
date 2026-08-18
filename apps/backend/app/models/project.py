@@ -20,6 +20,11 @@ class Project(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     prd: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_spec: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    generated_files: Mapped[str | None] = mapped_column(Text, nullable=True)
+    build_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="draft", server_default="draft"
     )

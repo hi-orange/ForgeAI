@@ -16,6 +16,8 @@ export const useProjectStore = defineStore('project', () => {
   const current = ref<Project | null>(null)
   const loading = ref(false)
   const starting = ref(false)
+  const approving = ref(false)
+  const building = ref(false)
   const error = ref<string | null>(null)
   const workflowId = ref<string | null>(null)
 
@@ -88,6 +90,27 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  async function approveSpec(id: number, selectedSections: projectsApi.SectionSelection[]) {
+    if (!auth.token) throw new Error('未登录或登录已过期')
+    if (!selectedSections.length) throw new Error('请至少选择一个页面区块')
+
+    approving.value = true
+    error.value = null
+    try {
+      const approved = await projectsApi.approveProjectSpec(auth.token, id, {
+        selected_sections: selectedSections,
+      })
+      upsertItem(approved)
+      if (!current.value || current.value.id === id) current.value = approved
+      return approved
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '批准网站规格失败'
+      throw err
+    } finally {
+      approving.value = false
+    }
+  }
+
   async function fetchOne(id: number) {
     if (!auth.token) {
       throw new Error('未登录或登录已过期')
@@ -105,15 +128,38 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  async function buildProject(id: number) {
+    if (!auth.token) throw new Error('未登录或登录已过期')
+
+    building.value = true
+    error.value = null
+    try {
+      const built = await projectsApi.buildProject(auth.token, id)
+      upsertItem(built)
+      if (!current.value || current.value.id === id) current.value = built
+      return built
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '网站构建失败'
+      await fetchOne(id).catch(() => undefined)
+      throw err
+    } finally {
+      building.value = false
+    }
+  }
+
   return {
     items,
     current,
     loading,
     starting,
+    approving,
+    building,
     error,
     workflowId,
     createFromHomeRequirement,
     startProject,
+    approveSpec,
+    buildProject,
     fetchList,
     fetchOne,
   }

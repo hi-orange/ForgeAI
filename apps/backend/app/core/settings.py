@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_name: str = "ForgeAI"
     debug: bool = True
+    log_level: str = "INFO"
+    log_file: str = "logs/forgeai.log"
+    log_max_bytes: int = 10 * 1024 * 1024
+    log_backup_count: int = 5
 
     mysql_host: str = "localhost"
     mysql_port: int = 3306

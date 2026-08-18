@@ -10,10 +10,11 @@
     "dev": "turbo dev",
     "build": "turbo build",
     "lint": "turbo lint",
+    "encoding:check": "node scripts/check-encoding.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "turbo typecheck",
-    "check": "pnpm lint && pnpm typecheck && pnpm format:check",
+    "check": "pnpm encoding:check && pnpm lint && pnpm typecheck && pnpm format:check",
     "prepare": "husky"
   },
   "devDependencies": {

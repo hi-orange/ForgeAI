@@ -1,10 +1,15 @@
+import json
+from datetime import UTC, datetime
+
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agents.website_spec import WebsiteSpecification
 from app.core.exceptions import BusinessException, NotFoundException
 from app.models.project import Project
 from app.models.user import User
-from app.schemas.project import ProjectCreate, ProjectStart
+from app.schemas.project import ProjectApproveSpec, ProjectCreate, ProjectStart
 from app.services import agent as agent_service
 
 
@@ -76,6 +81,11 @@ def start_project(
         raise BusinessException("项目已在构建中")
 
     project.status = "running"
+    project.approved_spec = None
+    project.approved_at = None
+    project.generated_files = None
+    project.build_error = None
+    project.built_at = None
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -94,3 +104,79 @@ def start_project(
         raise
 
     return project, workflow_id
+
+
+def approve_project_spec(
+    db: Session,
+    user: User,
+    project_id: int,
+    payload: ProjectApproveSpec,
+) -> Project:
+    project = get_user_project(db, user, project_id)
+    if project.status == "spec_approved" and project.approved_spec:
+        return project
+    if project.status != "prd_ready" or not project.prd:
+        raise BusinessException("网站规格尚未生成，无法批准")
+
+    try:
+        specification = WebsiteSpecification.model_validate_json(project.prd)
+    except (ValidationError, ValueError) as exc:
+        raise BusinessException("当前项目使用旧版 PRD，请重新生成网站规格") from exc
+
+    requested = {(item.page_id, item.section_id) for item in payload.selected_sections}
+    available = {
+        (page.id, section.id) for page in specification.site.pages for section in page.sections
+    }
+    unknown = requested - available
+    if unknown:
+        raise BusinessException("选择中包含不存在的页面区块")
+
+    approved_pages = []
+    for page in specification.site.pages:
+        approved_sections = [
+            section for section in page.sections if (page.id, section.id) in requested
+        ]
+        if approved_sections:
+            approved_pages.append(page.model_copy(update={"sections": approved_sections}))
+
+    approved = specification.model_copy(
+        update={"site": specification.site.model_copy(update={"pages": approved_pages})}
+    )
+    project.approved_spec = json.dumps(approved.model_dump(), ensure_ascii=False, indent=2)
+    project.approved_at = datetime.now(UTC).replace(tzinfo=None)
+    project.status = "spec_approved"
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+def build_project(db: Session, user: User, project_id: int) -> Project:
+    project = get_user_project(db, user, project_id)
+    if project.status == "completed" and project.generated_files:
+        return project
+    if project.status not in {"spec_approved", "build_failed"} or not project.approved_spec:
+        raise BusinessException("请先批准网站规格")
+
+    project.status = "building"
+    project.build_error = None
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    try:
+        _, generated_files = agent_service.start_website_build(project)
+        project.generated_files = generated_files
+        project.built_at = datetime.now(UTC).replace(tzinfo=None)
+        project.status = "completed"
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+    except Exception as exc:
+        project.status = "build_failed"
+        project.build_error = str(exc)[:2000]
+        db.add(project)
+        db.commit()
+        raise
+
+    return project

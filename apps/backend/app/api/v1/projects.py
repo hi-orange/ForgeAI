@@ -1,7 +1,13 @@
 from fastapi import APIRouter
 
 from app.api.deps import CurrentUser, DbSession
-from app.schemas.project import ProjectCreate, ProjectOut, ProjectStart, ProjectStartOut
+from app.schemas.project import (
+    ProjectApproveSpec,
+    ProjectCreate,
+    ProjectOut,
+    ProjectStart,
+    ProjectStartOut,
+)
 from app.schemas.response import ApiResponse, success
 from app.services import project as project_service
 
@@ -49,3 +55,20 @@ def start_project(
             workflow_id=workflow_id,
         )
     )
+
+
+@router.post("/{project_id}/approve-spec", response_model=ApiResponse[ProjectOut])
+def approve_project_spec(
+    project_id: int,
+    payload: ProjectApproveSpec,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    project = project_service.approve_project_spec(db, current_user, project_id, payload)
+    return success(ProjectOut.model_validate(project), msg="网站规格已批准")
+
+
+@router.post("/{project_id}/build", response_model=ApiResponse[ProjectOut])
+def build_project(project_id: int, db: DbSession, current_user: CurrentUser) -> dict:
+    project = project_service.build_project(db, current_user, project_id)
+    return success(ProjectOut.model_validate(project), msg="网站构建完成")

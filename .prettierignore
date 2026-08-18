@@ -3,5 +3,9 @@ dist
 coverage
 .turbo
 apps/backend/.venv
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+**/__pycache__
 pnpm-lock.yaml
 uv.lock
