@@ -1,0 +1,4 @@
+interface:
+  display_name: 'ForgeAI Code Review'
+  short_description: 'Review ForgeAI changes for defects and regressions'
+  default_prompt: 'Use $code-review to review the current working tree against HEAD.'

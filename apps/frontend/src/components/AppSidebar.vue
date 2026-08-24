@@ -120,8 +120,7 @@ import { useRoute } from 'vue-router'
 
 import ForgeLogo from '@/components/ForgeLogo.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
-import { useAuthStore } from '@/stores/auth'
-import { useProjectStore } from '@/stores/project'
+import { useAuthStore, useProjectStore } from '@/stores'
 
 const emit = defineEmits<{
   collapse: [collapsed: boolean]
@@ -183,7 +182,7 @@ function isProjectActive(id: number) {
 }
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .sidebar {
   display: flex;
   flex-direction: column;

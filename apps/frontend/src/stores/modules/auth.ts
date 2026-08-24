@@ -1,14 +1,14 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
-import * as authApi from '@/api/auth'
+import * as authApi from '@/api/modules/auth'
 import type {
   ChangePasswordPayload,
   LoginPayload,
   RegisterPayload,
   User,
   UsernameUpdatePayload,
-} from '@/api/auth'
+} from '@/api/modules/auth'
 
 const TOKEN_KEY = 'forgeai_access_token'
 

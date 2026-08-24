@@ -299,7 +299,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { useAuthStore } from '@/stores/auth'
+import { useAuthStore } from '@/stores'
 
 const open = defineModel<boolean>('open', { default: false })
 
@@ -556,7 +556,7 @@ onUnmounted(() => {
 })
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .overlay {
   position: fixed;
   inset: 0;

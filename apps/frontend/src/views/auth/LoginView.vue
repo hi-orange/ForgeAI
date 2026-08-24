@@ -84,7 +84,7 @@ import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import AuthLayout from '@/layouts/AuthLayout.vue'
-import { useAuthStore } from '@/stores/auth'
+import { useAuthStore } from '@/stores'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -120,7 +120,7 @@ async function onSubmit() {
 }
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .intro {
   text-align: center;
   margin-bottom: 1.5rem;

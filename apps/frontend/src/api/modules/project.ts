@@ -1,4 +1,4 @@
-import { apiRequest } from './client'
+import { apiRequest } from '../request'
 
 export type Project = {
   id: number
@@ -11,6 +11,8 @@ export type Project = {
   approved_at: string | null
   generated_files: string | null
   build_error: string | null
+  validation_report: string | null
+  website_revision: number
   built_at: string | null
   status: string
   created_at: string
@@ -88,6 +90,47 @@ export type ProjectApproveSpecPayload = {
   selected_sections: SectionSelection[]
 }
 
+export type WebsiteElementPatch = {
+  element_id: string
+  changes: {
+    text?: string | null
+    styles?: Partial<Record<EditableStyleName, string>>
+  }
+}
+
+export type EditableStyleName =
+  | 'color'
+  | 'background-color'
+  | 'border-color'
+  | 'font-size'
+  | 'font-weight'
+  | 'font-family'
+  | 'text-align'
+  | 'margin-top'
+  | 'margin-right'
+  | 'margin-bottom'
+  | 'margin-left'
+  | 'padding-top'
+  | 'padding-right'
+  | 'padding-bottom'
+  | 'padding-left'
+  | 'gap'
+  | 'border-radius'
+
+export type ProjectWebsiteEditPayload = {
+  base_revision: number
+  patches: WebsiteElementPatch[]
+}
+
+export type ProjectElementAiEditPayload = {
+  element_id: string
+  tag_name: string
+  text: string
+  text_editable: boolean
+  styles: Partial<Record<EditableStyleName, string>>
+  instruction: string
+}
+
 export type ProjectStartResult = {
   project: Project
   workflow_id: string
@@ -137,5 +180,25 @@ export function buildProject(token: string, id: number) {
   return apiRequest<Project>(`/api/v1/projects/${id}/build`, {
     method: 'POST',
     token,
+  })
+}
+
+export function editProjectWebsite(token: string, id: number, payload: ProjectWebsiteEditPayload) {
+  return apiRequest<Project>(`/api/v1/projects/${id}/website`, {
+    method: 'PATCH',
+    token,
+    body: payload,
+  })
+}
+
+export function suggestProjectElementEdit(
+  token: string,
+  id: number,
+  payload: ProjectElementAiEditPayload,
+) {
+  return apiRequest<WebsiteElementPatch>(`/api/v1/projects/${id}/website/element-suggestion`, {
+    method: 'POST',
+    token,
+    body: payload,
   })
 }

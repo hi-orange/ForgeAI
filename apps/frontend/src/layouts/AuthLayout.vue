@@ -183,7 +183,7 @@ withDefaults(
 )
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .auth-page {
   min-height: 100vh;
   display: grid;

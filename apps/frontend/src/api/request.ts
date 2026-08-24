@@ -1,3 +1,5 @@
+import { notifyAuthExpired } from '@/auth/session'
+
 export type ApiResponse<T> = {
   code: number
   msg: string
@@ -35,6 +37,10 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
 
+  if (token && response.status === 401) {
+    notifyAuthExpired()
+  }
+
   let payload: ApiResponse<T> | null = null
   try {
     payload = (await response.json()) as ApiResponse<T>
@@ -43,6 +49,9 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   }
 
   if (!response.ok || payload.code !== 0) {
+    if (token && response.status !== 401 && payload.code === 401) {
+      notifyAuthExpired()
+    }
     throw new ApiError(payload.code || response.status, payload.msg || '请求失败')
   }
 

@@ -1,0 +1,27 @@
+@use 'variables' as *;
+
+@layer base {
+  html,
+  body,
+  #app {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    color: var(--color-forge-ink);
+    background: $app-background;
+    -webkit-font-smoothing: $font-smoothing;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  button,
+  input {
+    font: inherit;
+  }
+}

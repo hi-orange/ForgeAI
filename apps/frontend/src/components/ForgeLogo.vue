@@ -15,7 +15,7 @@ withDefaults(
 )
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .forge-logo {
   display: inline-grid;
   place-items: center;

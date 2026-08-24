@@ -104,4 +104,12 @@ def chat_completion(
             data=diagnostics,
         )
 
+    logger.info(
+        "LLM completion received: model=%s finish_reason=%s content_length=%s usage=%s",
+        data.get("model", settings.deepseek_model),
+        choice.get("finish_reason"),
+        len(content),
+        data.get("usage") if isinstance(data, dict) else None,
+    )
+
     return content.strip()

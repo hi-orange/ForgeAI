@@ -4,9 +4,12 @@ from app.api.deps import CurrentUser, DbSession
 from app.schemas.project import (
     ProjectApproveSpec,
     ProjectCreate,
+    ProjectElementAiEdit,
     ProjectOut,
     ProjectStart,
     ProjectStartOut,
+    ProjectWebsiteEdit,
+    WebsiteElementPatch,
 )
 from app.schemas.response import ApiResponse, success
 from app.services import project as project_service
@@ -72,3 +75,28 @@ def approve_project_spec(
 def build_project(project_id: int, db: DbSession, current_user: CurrentUser) -> dict:
     project = project_service.build_project(db, current_user, project_id)
     return success(ProjectOut.model_validate(project), msg="网站构建完成")
+
+
+@router.patch("/{project_id}/website", response_model=ApiResponse[ProjectOut])
+def edit_project_website(
+    project_id: int,
+    payload: ProjectWebsiteEdit,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    project = project_service.edit_project_website(db, current_user, project_id, payload)
+    return success(ProjectOut.model_validate(project), msg="网站修改已保存")
+
+
+@router.post(
+    "/{project_id}/website/element-suggestion",
+    response_model=ApiResponse[WebsiteElementPatch],
+)
+def suggest_project_element_edit(
+    project_id: int,
+    payload: ProjectElementAiEdit,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    patch = project_service.suggest_project_element_edit(db, current_user, project_id, payload)
+    return success(patch, msg="已生成元素修改建议")

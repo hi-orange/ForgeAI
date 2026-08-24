@@ -1,9 +1,9 @@
-import * as projectsApi from '@/api/projects'
-import type { Project, ProjectCreatePayload } from '@/api/projects'
+import * as projectsApi from '@/api/modules/project'
+import type { Project, ProjectCreatePayload } from '@/api/modules/project'
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
-import { useAuthStore } from '@/stores/auth'
+import { useAuthStore } from '@/stores/modules/auth'
 
 /**
  * Project identity is always `id`.
@@ -18,6 +18,8 @@ export const useProjectStore = defineStore('project', () => {
   const starting = ref(false)
   const approving = ref(false)
   const building = ref(false)
+  const savingWebsite = ref(false)
+  const suggestingElement = ref(false)
   const error = ref<string | null>(null)
   const workflowId = ref<string | null>(null)
 
@@ -147,6 +149,37 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  async function editWebsite(id: number, payload: projectsApi.ProjectWebsiteEditPayload) {
+    if (!auth.token) throw new Error('未登录或登录已过期')
+    savingWebsite.value = true
+    error.value = null
+    try {
+      const updated = await projectsApi.editProjectWebsite(auth.token, id, payload)
+      upsertItem(updated)
+      if (!current.value || current.value.id === id) current.value = updated
+      return updated
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '保存网站修改失败'
+      throw err
+    } finally {
+      savingWebsite.value = false
+    }
+  }
+
+  async function suggestElementEdit(id: number, payload: projectsApi.ProjectElementAiEditPayload) {
+    if (!auth.token) throw new Error('未登录或登录已过期')
+    suggestingElement.value = true
+    error.value = null
+    try {
+      return await projectsApi.suggestProjectElementEdit(auth.token, id, payload)
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '生成元素修改建议失败'
+      throw err
+    } finally {
+      suggestingElement.value = false
+    }
+  }
+
   return {
     items,
     current,
@@ -154,12 +187,16 @@ export const useProjectStore = defineStore('project', () => {
     starting,
     approving,
     building,
+    savingWebsite,
+    suggestingElement,
     error,
     workflowId,
     createFromHomeRequirement,
     startProject,
     approveSpec,
     buildProject,
+    editWebsite,
+    suggestElementEdit,
     fetchList,
     fetchOne,
   }

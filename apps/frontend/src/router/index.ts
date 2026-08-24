@@ -1,34 +1,16 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
-import { useAuthStore } from '@/stores/auth'
+import { useAuthStore } from '@/stores'
+import { authRoutes } from './modules/auth'
+import { homeRoutes } from './modules/home'
+import { projectRoutes } from './modules/project'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
-    {
-      path: '/',
-      name: 'home',
-      component: () => import('@/views/HomeView.vue'),
-      meta: { requiresAuth: true },
-    },
-    {
-      path: '/login',
-      name: 'login',
-      component: () => import('@/views/LoginView.vue'),
-      meta: { guestOnly: true },
-    },
-    {
-      path: '/register',
-      name: 'register',
-      component: () => import('@/views/RegisterView.vue'),
-      meta: { guestOnly: true },
-    },
-    {
-      path: '/projects/:id',
-      name: 'project',
-      component: () => import('@/views/ProjectView.vue'),
-      meta: { requiresAuth: true },
-    },
+    ...homeRoutes,
+    ...authRoutes,
+    ...projectRoutes,
     {
       path: '/:pathMatch(.*)*',
       redirect: '/',

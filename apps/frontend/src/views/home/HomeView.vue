@@ -86,8 +86,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import AppSidebar from '@/components/AppSidebar.vue'
-import { useAuthStore } from '@/stores/auth'
-import { useProjectStore } from '@/stores/project'
+import { useAuthStore, useProjectStore } from '@/stores'
 
 const auth = useAuthStore()
 const projects = useProjectStore()
@@ -307,7 +306,7 @@ async function onBuild() {
 }
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .dashboard {
   display: flex;
   min-height: 100vh;

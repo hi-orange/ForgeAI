@@ -24,6 +24,13 @@ class Project(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     generated_files: Mapped[str | None] = mapped_column(Text, nullable=True)
     build_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    validation_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+    website_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
     built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="draft", server_default="draft"

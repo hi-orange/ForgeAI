@@ -5,12 +5,22 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agents.element_editor import suggest_element_patch
+from app.agents.website_quality import deterministic_issues
 from app.agents.website_spec import WebsiteSpecification
-from app.core.exceptions import BusinessException, NotFoundException
+from app.core.exceptions import AppException, BusinessException, NotFoundException
 from app.models.project import Project
 from app.models.user import User
-from app.schemas.project import ProjectApproveSpec, ProjectCreate, ProjectStart
+from app.schemas.project import (
+    ProjectApproveSpec,
+    ProjectCreate,
+    ProjectElementAiEdit,
+    ProjectStart,
+    ProjectWebsiteEdit,
+    WebsiteElementPatch,
+)
 from app.services import agent as agent_service
+from app.services.website_editor import apply_website_patches
 
 
 def _name_from_prompt(prompt: str) -> str:
@@ -21,11 +31,6 @@ def _name_from_prompt(prompt: str) -> str:
 
 
 def create_project(db: Session, user: User, payload: ProjectCreate) -> Project:
-    """Always insert a new project row.
-
-    Home-page rule: one requirement submission => one project.
-    Never reuse/merge an existing project because name or prompt matches.
-    """
     prompt = payload.prompt.strip()
     if not prompt:
         raise BusinessException("请输入需求")
@@ -85,7 +90,9 @@ def start_project(
     project.approved_at = None
     project.generated_files = None
     project.build_error = None
+    project.validation_report = None
     project.built_at = None
+    project.website_revision = 0
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -155,28 +162,84 @@ def build_project(db: Session, user: User, project_id: int) -> Project:
     project = get_user_project(db, user, project_id)
     if project.status == "completed" and project.generated_files:
         return project
-    if project.status not in {"spec_approved", "build_failed"} or not project.approved_spec:
+    if (
+        project.status not in {"spec_approved", "build_failed", "validation_failed"}
+        or not project.approved_spec
+    ):
         raise BusinessException("请先批准网站规格")
 
     project.status = "building"
     project.build_error = None
+    project.validation_report = None
     db.add(project)
     db.commit()
     db.refresh(project)
 
     try:
-        _, generated_files = agent_service.start_website_build(project)
+        _, generated_files, validation_report = agent_service.start_website_build(project)
         project.generated_files = generated_files
+        project.website_revision = 1
+        project.validation_report = validation_report
         project.built_at = datetime.now(UTC).replace(tzinfo=None)
         project.status = "completed"
         db.add(project)
         db.commit()
         db.refresh(project)
     except Exception as exc:
-        project.status = "build_failed"
+        validation_data = exc.data if isinstance(exc, AppException) else None
+        is_validation_failure = (
+            isinstance(validation_data, dict) and validation_data.get("kind") == "validation_failed"
+        )
+        project.status = "validation_failed" if is_validation_failure else "build_failed"
         project.build_error = str(exc)[:2000]
+        if validation_data:
+            project.validation_report = json.dumps(validation_data, ensure_ascii=False, indent=2)
         db.add(project)
         db.commit()
         raise
 
     return project
+
+
+def edit_project_website(
+    db: Session,
+    user: User,
+    project_id: int,
+    payload: ProjectWebsiteEdit,
+) -> Project:
+    project = get_user_project(db, user, project_id)
+    if project.status != "completed" or not project.generated_files:
+        raise BusinessException("网站尚未构建完成，无法编辑")
+    if payload.base_revision != project.website_revision:
+        raise BusinessException(
+            "网站版本已更新，请刷新后重试",
+            data={"current_revision": project.website_revision},
+        )
+
+    updated_files = apply_website_patches(project.generated_files, payload.patches)
+    issues = deterministic_issues(updated_files)
+    if issues:
+        raise BusinessException(
+            "修改后的页面未通过基础检查",
+            data={"issues": [issue.model_dump() for issue in issues]},
+        )
+
+    project.generated_files = updated_files
+    project.website_revision += 1
+    project.updated_at = datetime.now(UTC).replace(tzinfo=None)
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+def suggest_project_element_edit(
+    db: Session,
+    user: User,
+    project_id: int,
+    payload: ProjectElementAiEdit,
+) -> WebsiteElementPatch:
+    project = get_user_project(db, user, project_id)
+    if project.status != "completed" or not project.generated_files:
+        raise BusinessException("网站尚未构建完成，无法使用元素设计助手")
+    return suggest_element_patch(payload)
