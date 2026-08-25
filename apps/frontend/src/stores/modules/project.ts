@@ -20,6 +20,7 @@ export const useProjectStore = defineStore('project', () => {
   const building = ref(false)
   const savingWebsite = ref(false)
   const suggestingElement = ref(false)
+  const revisingWebsite = ref(false)
   const error = ref<string | null>(null)
   const workflowId = ref<string | null>(null)
 
@@ -171,12 +172,37 @@ export const useProjectStore = defineStore('project', () => {
     suggestingElement.value = true
     error.value = null
     try {
-      return await projectsApi.suggestProjectElementEdit(auth.token, id, payload)
+      const reply = await projectsApi.suggestProjectElementEdit(auth.token, id, payload)
+      if (reply.mode === 'applied' && reply.project) {
+        current.value = reply.project
+        const index = items.value.findIndex((item) => item.id === reply.project!.id)
+        if (index >= 0) items.value[index] = reply.project
+      }
+      return reply
     } catch (err) {
       error.value = err instanceof Error ? err.message : '生成元素修改建议失败'
       throw err
     } finally {
       suggestingElement.value = false
+    }
+  }
+
+  async function reviseWebsite(id: number, payload: projectsApi.ProjectWebsiteRevisePayload) {
+    if (!auth.token) throw new Error('未登录或登录已过期')
+    revisingWebsite.value = true
+    error.value = null
+    try {
+      const reply = await projectsApi.reviseProjectWebsite(auth.token, id, payload)
+      if (reply.mode === 'applied' && reply.project) {
+        upsertItem(reply.project)
+        if (!current.value || current.value.id === id) current.value = reply.project
+      }
+      return reply
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '网站修改失败'
+      throw err
+    } finally {
+      revisingWebsite.value = false
     }
   }
 
@@ -189,6 +215,7 @@ export const useProjectStore = defineStore('project', () => {
     building,
     savingWebsite,
     suggestingElement,
+    revisingWebsite,
     error,
     workflowId,
     createFromHomeRequirement,
@@ -197,6 +224,7 @@ export const useProjectStore = defineStore('project', () => {
     buildProject,
     editWebsite,
     suggestElementEdit,
+    reviseWebsite,
     fetchList,
     fetchOne,
   }

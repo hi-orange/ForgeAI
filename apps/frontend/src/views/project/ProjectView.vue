@@ -3,5 +3,5 @@
 </template>
 
 <script setup lang="ts">
-import ProjectWorkbench from '@/features/project/views/ProjectWorkbench.vue'
+import ProjectWorkbench from './ProjectWorkbench.vue'
 </script>

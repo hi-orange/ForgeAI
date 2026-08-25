@@ -122,6 +122,11 @@ export type ProjectWebsiteEditPayload = {
   patches: WebsiteElementPatch[]
 }
 
+export type ProjectElementAiHistoryItem = {
+  role: 'user' | 'assistant'
+  content: string
+}
+
 export type ProjectElementAiEditPayload = {
   element_id: string
   tag_name: string
@@ -129,6 +134,36 @@ export type ProjectElementAiEditPayload = {
   text_editable: boolean
   styles: Partial<Record<EditableStyleName, string>>
   instruction: string
+  history?: ProjectElementAiHistoryItem[]
+  base_revision: number
+}
+
+export type ProjectElementAiReply = {
+  mode: 'message' | 'applied'
+  message: string
+  patch?: WebsiteElementPatch | null
+  project?: Project | null
+}
+
+export type ProjectWebsiteReviseFocus = {
+  element_id: string
+  tag_name: string
+  text: string
+  text_editable: boolean
+  styles?: Partial<Record<EditableStyleName, string>>
+}
+
+export type ProjectWebsiteRevisePayload = {
+  instruction: string
+  history?: ProjectElementAiHistoryItem[]
+  base_revision: number
+  focus?: ProjectWebsiteReviseFocus | null
+}
+
+export type ProjectWebsiteReviseReply = {
+  mode: 'message' | 'applied'
+  message: string
+  project?: Project | null
 }
 
 export type ProjectStartResult = {
@@ -196,7 +231,19 @@ export function suggestProjectElementEdit(
   id: number,
   payload: ProjectElementAiEditPayload,
 ) {
-  return apiRequest<WebsiteElementPatch>(`/api/v1/projects/${id}/website/element-suggestion`, {
+  return apiRequest<ProjectElementAiReply>(`/api/v1/projects/${id}/website/element-suggestion`, {
+    method: 'POST',
+    token,
+    body: payload,
+  })
+}
+
+export function reviseProjectWebsite(
+  token: string,
+  id: number,
+  payload: ProjectWebsiteRevisePayload,
+) {
+  return apiRequest<ProjectWebsiteReviseReply>(`/api/v1/projects/${id}/website/revise`, {
     method: 'POST',
     token,
     body: payload,

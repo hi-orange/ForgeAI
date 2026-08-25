@@ -5,11 +5,13 @@ from app.schemas.project import (
     ProjectApproveSpec,
     ProjectCreate,
     ProjectElementAiEdit,
+    ProjectElementAiReply,
     ProjectOut,
     ProjectStart,
     ProjectStartOut,
     ProjectWebsiteEdit,
-    WebsiteElementPatch,
+    ProjectWebsiteRevise,
+    ProjectWebsiteReviseReply,
 )
 from app.schemas.response import ApiResponse, success
 from app.services import project as project_service
@@ -90,7 +92,7 @@ def edit_project_website(
 
 @router.post(
     "/{project_id}/website/element-suggestion",
-    response_model=ApiResponse[WebsiteElementPatch],
+    response_model=ApiResponse[ProjectElementAiReply],
 )
 def suggest_project_element_edit(
     project_id: int,
@@ -98,5 +100,21 @@ def suggest_project_element_edit(
     db: DbSession,
     current_user: CurrentUser,
 ) -> dict:
-    patch = project_service.suggest_project_element_edit(db, current_user, project_id, payload)
-    return success(patch, msg="已生成元素修改建议")
+    reply = project_service.suggest_project_element_edit(db, current_user, project_id, payload)
+    msg = "已保存网站修改" if reply.mode == "applied" else "网站修改助手已回复"
+    return success(reply, msg=msg)
+
+
+@router.post(
+    "/{project_id}/website/revise",
+    response_model=ApiResponse[ProjectWebsiteReviseReply],
+)
+def revise_project_website(
+    project_id: int,
+    payload: ProjectWebsiteRevise,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    reply = project_service.revise_project_website(db, current_user, project_id, payload)
+    msg = "已保存网站修改" if reply.mode == "applied" else "网站修改助手已回复"
+    return success(reply, msg=msg)

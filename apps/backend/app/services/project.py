@@ -5,7 +5,6 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.agents.element_editor import suggest_element_patch
 from app.agents.website_quality import deterministic_issues
 from app.agents.website_spec import WebsiteSpecification
 from app.core.exceptions import AppException, BusinessException, NotFoundException
@@ -15,9 +14,12 @@ from app.schemas.project import (
     ProjectApproveSpec,
     ProjectCreate,
     ProjectElementAiEdit,
+    ProjectElementAiReply,
+    ProjectOut,
     ProjectStart,
     ProjectWebsiteEdit,
-    WebsiteElementPatch,
+    ProjectWebsiteRevise,
+    ProjectWebsiteReviseReply,
 )
 from app.services import agent as agent_service
 from app.services.website_editor import apply_website_patches
@@ -238,8 +240,77 @@ def suggest_project_element_edit(
     user: User,
     project_id: int,
     payload: ProjectElementAiEdit,
-) -> WebsiteElementPatch:
+) -> ProjectElementAiReply:
+    """Compat: Design Ask used to be a separate agent; now maps onto website revise."""
+    from app.schemas.project import ProjectWebsiteRevise, ProjectWebsiteReviseFocus
+
+    revise_reply = revise_project_website(
+        db,
+        user,
+        project_id,
+        ProjectWebsiteRevise(
+            instruction=payload.instruction,
+            history=payload.history,
+            base_revision=payload.base_revision,
+            focus=ProjectWebsiteReviseFocus(
+                element_id=payload.element_id,
+                tag_name=payload.tag_name,
+                text=payload.text,
+                text_editable=payload.text_editable,
+                styles=payload.styles,
+            ),
+        ),
+    )
+    return ProjectElementAiReply(
+        mode=revise_reply.mode,
+        message=revise_reply.message,
+        project=revise_reply.project,
+    )
+
+
+def revise_project_website(
+    db: Session,
+    user: User,
+    project_id: int,
+    payload: ProjectWebsiteRevise,
+) -> ProjectWebsiteReviseReply:
+    from app.agents.site_reviser import suggest_site_revise_reply
+
     project = get_user_project(db, user, project_id)
     if project.status != "completed" or not project.generated_files:
-        raise BusinessException("网站尚未构建完成，无法使用元素设计助手")
-    return suggest_element_patch(payload)
+        raise BusinessException("网站尚未构建完成，无法修改")
+
+    reply = suggest_site_revise_reply(
+        payload,
+        current_files=project.generated_files,
+        approved_spec=project.approved_spec,
+    )
+    if reply.mode != "applied" or not reply.files_json:
+        return ProjectWebsiteReviseReply(mode="message", message=reply.message)
+
+    if payload.base_revision != project.website_revision:
+        raise BusinessException(
+            "网站版本已更新，请刷新后重试",
+            data={"current_revision": project.website_revision},
+        )
+
+    issues = deterministic_issues(reply.files_json)
+    if issues:
+        detail = "；".join(issue.description for issue in issues[:3])
+        return ProjectWebsiteReviseReply(
+            mode="message",
+            message=f"改动没通过基础检查：{detail}。换一种改法试试。",
+        )
+
+    project.generated_files = reply.files_json
+    project.website_revision += 1
+    project.updated_at = datetime.now(UTC).replace(tzinfo=None)
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    return ProjectWebsiteReviseReply(
+        mode="applied",
+        message=reply.message,
+        project=ProjectOut.model_validate(project),
+    )

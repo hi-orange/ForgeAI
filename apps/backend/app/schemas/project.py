@@ -104,18 +104,27 @@ class WebsiteElementPatch(BaseModel):
     changes: WebsiteElementChanges
 
 
-class ProjectWebsiteEdit(BaseModel):
-    base_revision: int = Field(ge=0)
-    patches: list[WebsiteElementPatch] = Field(min_length=1, max_length=50)
+class ProjectElementAiHistoryItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
 
 
 class ProjectElementAiEdit(BaseModel):
+    """Legacy Design Ask payload; mapped to ProjectWebsiteRevise.focus server-side."""
+
     element_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$")
     tag_name: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9-]{0,30}$")
     text: str = Field(default="", max_length=2000)
     text_editable: bool = True
     styles: dict[EditableStyleName, str] = Field(default_factory=dict, max_length=17)
     instruction: str = Field(min_length=1, max_length=2000)
+    history: list[ProjectElementAiHistoryItem] = Field(default_factory=list, max_length=12)
+    base_revision: int = Field(default=0, ge=0)
+
+
+class ProjectWebsiteEdit(BaseModel):
+    base_revision: int = Field(ge=0)
+    patches: list[WebsiteElementPatch] = Field(min_length=1, max_length=50)
 
 
 class ProjectOut(BaseModel):
@@ -137,6 +146,43 @@ class ProjectOut(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class ProjectElementAiReply(BaseModel):
+    """Compat reply for the legacy element-suggestion endpoint."""
+
+    mode: Literal["message", "applied"]
+    message: str = Field(min_length=1, max_length=4000)
+    patch: WebsiteElementPatch | None = None
+    project: ProjectOut | None = None
+
+
+class ProjectWebsiteReviseFocus(BaseModel):
+    """Optional selection context from Design mode; still revises website files."""
+
+    element_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$")
+    tag_name: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9-]{0,30}$")
+    text: str = Field(default="", max_length=2000)
+    text_editable: bool = True
+    styles: dict[EditableStyleName, str] = Field(default_factory=dict, max_length=17)
+
+
+class ProjectWebsiteRevise(BaseModel):
+    """Single website Ask path (main chat or Design with optional focus)."""
+
+    instruction: str = Field(min_length=1, max_length=4000)
+    history: list[ProjectElementAiHistoryItem] = Field(default_factory=list, max_length=12)
+    base_revision: int = Field(default=0, ge=0)
+    focus: ProjectWebsiteReviseFocus | None = None
+
+
+class ProjectWebsiteReviseReply(BaseModel):
+    """Website Ask: clarify in chat, or apply+save a new website revision."""
+
+    mode: Literal["message", "applied"]
+    message: str = Field(min_length=1, max_length=4000)
+    project: ProjectOut | None = None
+    files_json: str | None = Field(default=None, exclude=True)
 
 
 class ProjectStartOut(BaseModel):

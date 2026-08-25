@@ -145,7 +145,22 @@ export const EDITOR_BRIDGE_SCRIPT = String.raw`
   }, true);
   document.addEventListener('click', (event) => {
     const element = editableFrom(event.target);
-    if (!element) return;
+    if (!element) {
+      if (selected || editing) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        finishTextEditing();
+        if (selected) selected.classList.remove('forge-editor-hover');
+        selected = null;
+        hovered = null;
+        window.parent.postMessage({
+          source: SOURCE,
+          type: 'element-deselected',
+          payload: { elementId: '' },
+        }, '*');
+      }
+      return;
+    }
     event.preventDefault();
     event.stopImmediatePropagation();
     if (selected) selected.classList.remove('forge-editor-hover');
@@ -223,12 +238,23 @@ export const EDITOR_BRIDGE_SCRIPT = String.raw`
       return;
     }
     if (message.type !== 'update-element' || !message.payload) return;
-    const element = [...document.querySelectorAll('[data-forge-id]')]
-      .find((candidate) => candidate.dataset.forgeId === message.payload.elementId);
+    const targetId = message.payload.elementId;
+    const element = (selected && selected.dataset.forgeId === targetId)
+      ? selected
+      : [...document.querySelectorAll('[data-forge-id]')]
+        .find((candidate) => candidate.dataset.forgeId === targetId);
     if (!element) return;
     const changes = message.payload.changes || {};
     if (typeof changes.text === 'string' && element.children.length === 0) {
+      // Avoid MutationObserver echoing host-driven edits as canvas inline changes.
+      const resumeEditing = editing === element;
+      if (resumeEditing) editing = null;
       element.textContent = changes.text;
+      if (resumeEditing) {
+        editing = element;
+        element.setAttribute('contenteditable', 'plaintext-only');
+        element.classList.add('forge-editor-text-editing');
+      }
     }
     const styles = changes.styles || {};
     const allowedStyles = new Set([
@@ -239,6 +265,7 @@ export const EDITOR_BRIDGE_SCRIPT = String.raw`
     Object.entries(styles).forEach(([name, value]) => {
       if (allowedStyles.has(name) && typeof value === 'string') element.style.setProperty(name, value);
     });
+    selected = element;
     requestAnimationFrame(() => publishSelection(element));
   });
 })();

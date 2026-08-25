@@ -1,8 +1,27 @@
 <template>
-  <div class="workbench" :class="{ 'atoms-mode': generatedFiles, 'design-mode': designMode }">
-    <ProjectTopbar v-if="generatedFiles" :name="project?.name" :status="project?.status" />
-    <aside class="chat-pane">
-      <header v-show="!designMode" class="chat-header">
+  <div
+    class="workbench"
+    :class="{
+      'atoms-mode': generatedFiles,
+      'design-mode': designMode,
+      'chat-collapsed': chatCollapsed,
+    }"
+  >
+    <ProjectTopbar
+      v-if="generatedFiles"
+      :name="project?.name"
+      :status="project?.status"
+      :workspace-view="workspaceView"
+      :chat-collapsed="chatCollapsed"
+      :history-open="historyOpen"
+      @update:workspace-view="setWorkspaceView"
+      @share="shareProject"
+      @publish="publishProject"
+      @toggle-chat="chatCollapsed = !chatCollapsed"
+      @toggle-history="historyOpen = !historyOpen"
+    />
+    <aside class="chat-pane" :class="{ collapsed: chatCollapsed }">
+      <header v-show="!designMode && !generatedFiles" class="chat-header">
         <RouterLink class="home-link" :to="{ name: 'home' }" title="返回首页">
           <ForgeLogo :size="22" />
         </RouterLink>
@@ -17,7 +36,7 @@
         <p v-else-if="bootError" class="thread-error">{{ bootError }}</p>
 
         <template v-else>
-          <div v-if="project?.prompt" class="bubble user">
+          <div v-if="project?.prompt && !generatedFiles" class="bubble user">
             <p>{{ project.prompt }}</p>
           </div>
 
@@ -30,7 +49,9 @@
               </div>
             </div>
             <p class="agent-text">{{ agentStatusText }}</p>
-            <p v-if="workflowId" class="workflow-id">workflow: {{ workflowId }}</p>
+            <p v-if="workflowId && !generatedFiles" class="workflow-id">
+              workflow: {{ workflowId }}
+            </p>
           </div>
 
           <div v-if="showBuilderStatus" class="bubble agent builder-bubble">
@@ -44,7 +65,7 @@
             <p class="agent-text">{{ builderStatusText }}</p>
           </div>
 
-          <div v-if="showPlanCard" class="plan-card">
+          <div v-if="showPlanCard && !generatedFiles" class="plan-card">
             <p class="plan-intro">
               请从这些核心功能和页面设计中，选择您希望优先实现或进一步讨论的部分。
             </p>
@@ -84,8 +105,20 @@
             </p>
           </div>
 
-          <div v-for="(note, index) in followUpNotes" :key="`note-${index}`" class="bubble user">
-            <p>{{ note }}</p>
+          <div
+            v-for="(item, index) in siteChatMessages"
+            :key="`site-chat-${index}`"
+            class="bubble"
+            :class="item.role === 'user' ? 'user' : 'agent'"
+          >
+            <div v-if="item.role === 'assistant'" class="agent-meta">
+              <span class="agent-avatar">AI</span>
+              <div>
+                <strong>Website Editor</strong>
+                <p class="agent-step">整站修改</p>
+              </div>
+            </div>
+            <p>{{ item.content }}</p>
           </div>
         </template>
       </div>
@@ -94,15 +127,15 @@
         <textarea
           v-model="followUp"
           rows="2"
-          placeholder="继续补充需求或修改计划…"
-          :disabled="!project || starting"
+          :placeholder="generatedFiles ? '描述要如何修改整个网站…' : '继续补充需求或修改计划…'"
+          :disabled="!project || starting || revisingWebsite || building"
           @keydown.enter.exact.prevent="sendFollowUp"
         />
         <button
           type="button"
           class="send"
           title="发送"
-          :disabled="!followUp.trim() || starting"
+          :disabled="!followUp.trim() || starting || revisingWebsite || building"
           @click="sendFollowUp"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -112,414 +145,246 @@
         </button>
       </footer>
 
-      <div v-if="designMode" class="visual-editor">
-        <header class="visual-editor-head">
-          <nav class="editor-tabs" aria-label="设计工具">
-            <button
-              v-for="tab in editorTabs"
-              :key="tab.key"
-              type="button"
-              :class="{ active: editorTab === tab.key }"
-              @click="editorTab = tab.key"
-            >
-              {{ tab.label }}
-            </button>
-          </nav>
-          <button type="button" class="tool-btn" @click="exitDesignMode">退出</button>
-        </header>
-
-        <div v-if="editorTab !== 'visual'" class="editor-empty editor-placeholder">
-          <span class="editor-cursor" aria-hidden="true">◇</span>
-          <strong>{{
-            editorTab === 'library' ? '组件库将在下一阶段接入' : '全局主题将在下一阶段接入'
-          }}</strong>
-          <p>
-            {{
-              editorTab === 'library'
-                ? '这里将用于插入图标、图片和预制组件。'
-                : '这里将统一管理颜色、字体、间距和圆角变量。'
-            }}
-          </p>
-        </div>
-
-        <div v-else-if="!selectedElement" class="editor-empty">
-          <span class="editor-cursor" aria-hidden="true">⌖</span>
-          <strong>点击右侧网页中的元素</strong>
-          <p>单击选择元素，双击文字即可在网页中直接修改。</p>
-        </div>
-
-        <div v-else-if="editorTab === 'visual'" class="editor-controls">
-          <div class="selected-element-toolbar">
-            <div class="selected-element-meta">
-              <span>T&nbsp; {{ selectedElement.tagName.toLowerCase() }}</span>
-              <code
-                >{{ Math.round(selectedElement.rect.width) }} ×
-                {{ Math.round(selectedElement.rect.height) }}</code
-              >
-            </div>
-            <button
-              type="button"
-              class="editor-icon-btn"
-              title="撤销上一步"
-              :disabled="!editHistory.length"
-              @click="undoVisualEdit"
-            >
-              ↶
-            </button>
-          </div>
-
-          <section class="editor-section">
-            <h3>Content</h3>
-            <p v-if="selectedElement.textEditable" class="editor-note">
-              可在这里修改，也可以双击右侧文字直接编辑。
-            </p>
-            <label v-if="selectedElement.textEditable" class="editor-field">
-              <textarea
-                :value="selectedElement.text"
-                rows="4"
-                maxlength="2000"
-                @input="updateSelectedText"
-              />
-            </label>
-            <p v-else class="editor-note">该元素包含子元素，暂不支持直接替换文字。</p>
-          </section>
-
-          <section class="editor-section">
-            <h3>Typography</h3>
-            <div class="editor-grid two-columns">
-              <label class="compact-field">
-                <span>Size</span>
-                <input
-                  type="number"
-                  min="8"
-                  max="200"
-                  :value="cssNumber('font-size')"
-                  @input="updatePixelStyle('font-size', $event)"
-                />
-              </label>
-              <label class="compact-field">
-                <span>Weight</span>
-                <select
-                  :value="styleValue('font-weight')"
-                  @change="updateSelectStyle('font-weight', $event)"
-                >
-                  <option v-for="weight in fontWeights" :key="weight" :value="weight">
-                    {{ weight }}
-                  </option>
-                </select>
-              </label>
-              <label class="compact-field full-width">
-                <span>Font</span>
-                <select
-                  :value="styleValue('font-family')"
-                  @change="updateSelectStyle('font-family', $event)"
-                >
-                  <option v-for="font in fontFamilies" :key="font" :value="font">
-                    {{ font }}
-                  </option>
-                </select>
-              </label>
-            </div>
-            <div class="alignment-control" aria-label="文本对齐">
-              <button
-                v-for="alignment in textAlignments"
-                :key="alignment.value"
-                type="button"
-                :class="{ active: styleValue('text-align') === alignment.value }"
-                @click="updateStyle('text-align', alignment.value)"
-              >
-                {{ alignment.icon }}
-              </button>
-            </div>
-          </section>
-
-          <section class="editor-section">
-            <h3>Appearance</h3>
-            <div class="editor-grid three-columns">
-              <label
-                v-for="colorControl in colorControls"
-                :key="colorControl.property"
-                class="compact-field color-compact"
-              >
-                <span>{{ colorControl.label }}</span>
-                <input
-                  type="color"
-                  :value="styleValue(colorControl.property)"
-                  @input="updateColorStyle(colorControl.property, $event)"
-                />
-              </label>
-            </div>
-          </section>
-
-          <section class="editor-section">
-            <h3>Layout</h3>
-            <p class="field-group-label">Margin</p>
-            <div class="editor-grid four-columns">
-              <label v-for="side in boxSides" :key="`margin-${side}`" class="compact-field">
-                <span>{{ side.slice(0, 1).toUpperCase() }}</span>
-                <input
-                  type="number"
-                  :value="cssNumber(`margin-${side}`)"
-                  @input="updatePixelStyle(`margin-${side}`, $event)"
-                />
-              </label>
-            </div>
-            <p class="field-group-label">Padding</p>
-            <div class="editor-grid four-columns">
-              <label v-for="side in boxSides" :key="`padding-${side}`" class="compact-field">
-                <span>{{ side.slice(0, 1).toUpperCase() }}</span>
-                <input
-                  type="number"
-                  min="0"
-                  :value="cssNumber(`padding-${side}`)"
-                  @input="updatePixelStyle(`padding-${side}`, $event)"
-                />
-              </label>
-            </div>
-            <div class="editor-grid two-columns layout-tail">
-              <label class="compact-field">
-                <span>Gap</span>
-                <input
-                  type="number"
-                  min="0"
-                  :value="cssNumber('gap')"
-                  @input="updatePixelStyle('gap', $event)"
-                />
-              </label>
-              <label class="compact-field">
-                <span>Radius</span>
-                <input
-                  type="number"
-                  min="0"
-                  :value="cssNumber('border-radius')"
-                  @input="updatePixelStyle('border-radius', $event)"
-                />
-              </label>
-            </div>
-          </section>
-        </div>
-
-        <p v-if="editorError" class="plan-error editor-error">{{ editorError }}</p>
-        <section class="element-ai-composer" :class="{ selected: selectedElement }">
-          <div class="element-ai-context">
-            <span class="element-ai-mode">✣ Design</span>
-            <span v-if="selectedElement" class="element-ai-tag">
-              T&nbsp; {{ selectedElement.tagName.toLowerCase() }}
-            </span>
-          </div>
-          <div class="element-ai-input-row">
-            <textarea
-              v-model="elementInstruction"
-              rows="2"
-              maxlength="2000"
-              :disabled="!selectedElement || suggestingElement"
-              :placeholder="
-                selectedElement ? '告诉 AI 如何修改当前元素…' : '请先在网页中选择一个元素'
-              "
-              @keydown.enter.exact.prevent="askAiToChangeElement"
-            />
-            <button
-              type="button"
-              class="element-ai-send"
-              :disabled="!selectedElement || !elementInstruction.trim() || suggestingElement"
-              title="修改当前元素"
-              @click="askAiToChangeElement"
-            >
-              {{ suggestingElement ? '…' : '↑' }}
-            </button>
-          </div>
-          <p class="element-ai-hint">
-            {{
-              selectedElement
-                ? 'AI 只会修改当前选中的元素，确认效果后再保存。'
-                : '选中元素后，可让 AI 修改文案、颜色、字体和间距。'
-            }}
-          </p>
-        </section>
-      </div>
+      <VisualEditorPanel
+        v-if="designMode"
+        v-model:editor-tab="editorTab"
+        v-model:element-instruction="elementInstruction"
+        :selected-element="selectedElement"
+        :editor-error="editorError"
+        :can-undo="editHistory.length > 0"
+        :suggesting="suggestingElement"
+        :chat-messages="designChatMessages"
+        :style-value="styleValue"
+        :css-number="cssNumber"
+        @undo="undoVisualEdit"
+        @update-text="updateSelectedText"
+        @update-style="updateStyle"
+        @update-pixel="updatePixelStyle"
+        @update-select="updateSelectStyle"
+        @update-color="updateColorStyle"
+        @ask-ai="askAiToChangeElement"
+      />
     </aside>
 
     <section class="canvas-pane">
       <CanvasToolbar
         v-model:preview-mode="previewMode"
+        v-model:active-page-id="activePageId"
         :generated="Boolean(generatedFiles)"
         :design-mode="designMode"
+        :console-open="consoleOpen"
+        :workspace-view="workspaceView"
         :status="project?.status"
         :status-label="statusLabel"
         :modes="previewModes"
+        :pages="previewPages"
+        @refresh="refreshPreview"
         @toggle-design="toggleDesignMode"
+        @toggle-console="consoleOpen = !consoleOpen"
       />
 
-      <div
-        class="canvas-body"
-        :class="[previewMode, { 'website-mode': generatedFiles && canvasView === 'preview' }]"
-      >
-        <div v-if="building || project?.status === 'building'" class="canvas-empty">
-          <div class="build-spinner" aria-hidden="true" />
-          <p class="empty-title">Website Builder 正在构建网站…</p>
-          <p class="empty-desc">正在生成页面结构、视觉样式和本地交互，请稍候。</p>
-        </div>
+      <div class="canvas-main">
+        <WorkbenchWorkspacePanels
+          v-if="generatedFiles && (workspaceView !== 'viewer' || historyOpen)"
+          class="workspace-panels-host"
+          :class="{ 'overlay-only': workspaceView === 'viewer' && historyOpen }"
+          :workspace-view="workspaceView"
+          :history-open="historyOpen"
+          :files="generatedFiles!"
+          :website-revision="project?.website_revision ?? 1"
+          :status="project?.status"
+          :product-name="websiteSpec?.product.name"
+          :product-summary="websiteSpec?.product.summary"
+          :updated-at="project?.updated_at"
+          @close-history="historyOpen = false"
+          @publish="publishProject"
+          @download-file="downloadGeneratedFile"
+          @download-all="downloadAllGeneratedFiles"
+        />
+
         <div
-          v-else-if="project?.status === 'build_failed' || project?.status === 'validation_failed'"
-          class="canvas-empty"
+          v-show="!generatedFiles || workspaceView === 'viewer'"
+          class="canvas-body"
+          :class="[previewMode, { 'website-mode': generatedFiles && canvasView === 'preview' }]"
         >
-          <p class="empty-title">
-            {{ project?.status === 'validation_failed' ? '网站未通过质量检查' : '网站构建失败' }}
-          </p>
-          <p class="empty-desc">{{ project.build_error || projects.error || '请稍后重试。' }}</p>
-          <ul v-if="validationIssues.length" class="validation-issues">
-            <li v-for="issue in validationIssues" :key="issue.description">
-              {{ issue.description }}
-            </li>
-          </ul>
-          <button type="button" class="btn primary" @click="runBuild">重新构建</button>
-        </div>
-        <div v-else-if="generatedFiles && canvasView === 'preview'" class="website-preview-shell">
-          <iframe
-            :key="previewKey"
-            ref="websiteFrame"
-            class="website-frame"
-            title="生成的网站预览"
-            sandbox="allow-scripts"
-            :srcdoc="previewDocument"
-            @load="reapplyPendingEdits"
-          />
-          <div
-            v-if="designMode && hoveredElement && !selectedElement"
-            class="canvas-hover-box"
-            :style="hoverBoxStyle"
-          >
-            <span class="canvas-hover-label">
-              {{ hoveredElement.tagName.toLowerCase() }} ·
-              {{ Math.round(hoveredElement.rect.width) }} ×
-              {{ Math.round(hoveredElement.rect.height) }}
-            </span>
+          <div v-if="building || project?.status === 'building'" class="canvas-empty">
+            <div class="build-spinner" aria-hidden="true" />
+            <p class="empty-title">Website Builder 正在构建网站…</p>
+            <p class="empty-desc">正在生成页面结构、视觉样式和本地交互，请稍候。</p>
           </div>
           <div
-            v-if="designMode && selectedElement"
-            class="canvas-selection-box"
-            :style="selectionBoxStyle"
+            v-else-if="
+              project?.status === 'build_failed' || project?.status === 'validation_failed'
+            "
+            class="canvas-empty"
           >
-            <span class="canvas-selection-label">
-              {{ selectedElement.tagName.toLowerCase() }} ·
-              {{ Math.round(selectedElement.rect.width) }} ×
-              {{ Math.round(selectedElement.rect.height) }}
-            </span>
-          </div>
-          <div
-            v-if="designMode && selectedElement"
-            class="canvas-element-prompt"
-            :style="elementPromptStyle"
-          >
-            <span class="canvas-element-tag">
-              T&nbsp; {{ selectedElement.tagName.toLowerCase() }}
-            </span>
-            <input
-              v-model="elementInstruction"
-              type="text"
-              maxlength="2000"
-              :disabled="suggestingElement"
-              placeholder="让 AI 修改当前元素…"
-              @keydown.enter.prevent="askAiToChangeElement"
-            />
-            <button
-              type="button"
-              :disabled="!elementInstruction.trim() || suggestingElement"
-              title="修改当前元素"
-              @click="askAiToChangeElement"
-            >
-              {{ suggestingElement ? '…' : '↑' }}
-            </button>
-          </div>
-          <div v-if="designMode && hasPendingEdits" class="canvas-save-bar">
-            <button
-              type="button"
-              class="btn ghost"
-              :disabled="savingWebsite"
-              @click="discardVisualEdits"
-            >
-              放弃
-            </button>
-            <button
-              type="button"
-              class="btn primary"
-              :disabled="savingWebsite"
-              @click="saveVisualEdits"
-            >
-              {{ savingWebsite ? '保存中…' : '保存' }}
-            </button>
-          </div>
-        </div>
-        <div v-else-if="starting || project?.status === 'running'" class="canvas-empty">
-          <p class="empty-title">Product Manager 正在整理网站规格…</p>
-          <p class="empty-desc">左侧可查看进度，完成后将展示页面结构与计划确认。</p>
-        </div>
-        <div v-else-if="project?.status === 'failed'" class="canvas-empty">
-          <p class="empty-title">生成失败</p>
-          <p class="empty-desc">{{ projects.error || '请返回首页重试，或在左侧继续补充需求。' }}</p>
-          <button type="button" class="btn primary" @click="retryStart">重新生成</button>
-        </div>
-        <div v-else-if="websiteSpec" class="spec-panel">
-          <div class="prd-head">
-            <h2>{{ websiteSpec.product.name }}</h2>
-            <p>{{ websiteSpec.product.summary }}</p>
-          </div>
-
-          <dl class="spec-summary">
-            <div>
-              <dt>目标用户</dt>
-              <dd>{{ websiteSpec.product.target_audience }}</dd>
-            </div>
-            <div>
-              <dt>核心目标</dt>
-              <dd>{{ websiteSpec.product.primary_goal }}</dd>
-            </div>
-            <div>
-              <dt>视觉方向</dt>
-              <dd>{{ websiteSpec.design.style }} · {{ websiteSpec.design.tone }}</dd>
-            </div>
-          </dl>
-
-          <section v-for="page in websiteSpec.site.pages" :key="page.id" class="spec-page">
-            <div class="spec-page-head">
-              <div>
-                <h3>{{ page.name }}</h3>
-                <p>{{ page.purpose }}</p>
-              </div>
-              <code>{{ page.path }}</code>
-            </div>
-            <div class="section-grid">
-              <article v-for="section in page.sections" :key="section.id" class="section-card">
-                <span class="section-type">{{ section.type }}</span>
-                <h4>{{ section.title }}</h4>
-                <p>{{ section.description }}</p>
-                <ul v-if="section.content_points.length">
-                  <li v-for="point in section.content_points" :key="point">{{ point }}</li>
-                </ul>
-              </article>
-            </div>
-          </section>
-
-          <section v-if="websiteSpec.requirements.features.length" class="spec-list">
-            <h3>MVP 功能</h3>
-            <ul>
-              <li v-for="feature in websiteSpec.requirements.features" :key="feature">
-                {{ feature }}
+            <p class="empty-title">
+              {{ project?.status === 'validation_failed' ? '网站未通过质量检查' : '网站构建失败' }}
+            </p>
+            <p class="empty-desc">{{ project.build_error || projects.error || '请稍后重试。' }}</p>
+            <ul v-if="validationIssues.length" class="validation-issues">
+              <li v-for="issue in validationIssues" :key="issue.description">
+                {{ issue.description }}
               </li>
             </ul>
-          </section>
-        </div>
-        <div v-else-if="project?.prd" class="prd-panel">
-          <div class="prd-head">
-            <h2>旧版产品需求文档</h2>
-            <p>该项目使用旧格式，新生成的项目将展示结构化网站规格。</p>
+            <button type="button" class="btn primary" @click="runBuild">重新构建</button>
           </div>
-          <pre class="prd-content">{{ project.prd }}</pre>
+          <div v-else-if="generatedFiles && canvasView === 'preview'" class="website-preview-shell">
+            <iframe
+              :key="previewKey"
+              ref="websiteFrame"
+              class="website-frame"
+              title="生成的网站预览"
+              sandbox="allow-scripts"
+              :srcdoc="previewDocument"
+              @load="reapplyPendingEdits"
+            />
+            <div
+              v-if="designMode && hoveredElement && !selectedElement"
+              class="canvas-hover-box"
+              :style="hoverBoxStyle"
+            >
+              <span class="canvas-hover-label">
+                {{ hoveredElement.tagName.toLowerCase() }}
+              </span>
+            </div>
+            <div
+              v-if="designMode && selectedElement"
+              class="canvas-selection-box"
+              :style="selectionBoxStyle"
+            >
+              <span class="canvas-selection-label">
+                {{ selectionLabel }}
+              </span>
+            </div>
+            <div
+              v-if="designMode && selectedElement"
+              class="canvas-element-prompt"
+              :style="elementPromptStyle"
+            >
+              <span class="canvas-element-tag">
+                T&nbsp; {{ selectedElement.tagName.toLowerCase() }}
+              </span>
+              <input
+                v-model="elementInstruction"
+                type="text"
+                maxlength="2000"
+                :disabled="suggestingElement"
+                placeholder="告诉 AI 如何修改当前元素…"
+                @keydown.enter.prevent="askAiToChangeElement"
+              />
+              <button
+                type="button"
+                :disabled="!elementInstruction.trim() || suggestingElement"
+                title="修改当前元素"
+                @click="askAiToChangeElement"
+              >
+                {{ suggestingElement ? '…' : '↑' }}
+              </button>
+            </div>
+            <div v-if="designMode && editorError" class="canvas-editor-error">
+              {{ editorError }}
+            </div>
+            <div v-if="designMode && hasPendingEdits" class="canvas-save-bar">
+              <button
+                type="button"
+                class="btn ghost"
+                :disabled="savingWebsite"
+                @click="discardVisualEdits"
+              >
+                放弃
+              </button>
+              <button
+                type="button"
+                class="btn primary"
+                :disabled="savingWebsite"
+                @click="saveVisualEdits"
+              >
+                {{ savingWebsite ? '保存中…' : '保存' }}
+              </button>
+            </div>
+          </div>
+          <div v-else-if="starting || project?.status === 'running'" class="canvas-empty">
+            <p class="empty-title">Product Manager 正在整理网站规格…</p>
+            <p class="empty-desc">左侧可查看进度，完成后将展示页面结构与计划确认。</p>
+          </div>
+          <div v-else-if="project?.status === 'failed'" class="canvas-empty">
+            <p class="empty-title">生成失败</p>
+            <p class="empty-desc">
+              {{ projects.error || '请返回首页重试，或在左侧继续补充需求。' }}
+            </p>
+            <button type="button" class="btn primary" @click="retryStart">重新生成</button>
+          </div>
+          <div v-else-if="websiteSpec" class="spec-panel">
+            <div class="prd-head">
+              <h2>{{ websiteSpec.product.name }}</h2>
+              <p>{{ websiteSpec.product.summary }}</p>
+            </div>
+
+            <dl class="spec-summary">
+              <div>
+                <dt>目标用户</dt>
+                <dd>{{ websiteSpec.product.target_audience }}</dd>
+              </div>
+              <div>
+                <dt>核心目标</dt>
+                <dd>{{ websiteSpec.product.primary_goal }}</dd>
+              </div>
+              <div>
+                <dt>视觉方向</dt>
+                <dd>{{ websiteSpec.design.style }} · {{ websiteSpec.design.tone }}</dd>
+              </div>
+            </dl>
+
+            <section v-for="page in websiteSpec.site.pages" :key="page.id" class="spec-page">
+              <div class="spec-page-head">
+                <div>
+                  <h3>{{ page.name }}</h3>
+                  <p>{{ page.purpose }}</p>
+                </div>
+                <code>{{ page.path }}</code>
+              </div>
+              <div class="section-grid">
+                <article v-for="section in page.sections" :key="section.id" class="section-card">
+                  <span class="section-type">{{ section.type }}</span>
+                  <h4>{{ section.title }}</h4>
+                  <p>{{ section.description }}</p>
+                  <ul v-if="section.content_points.length">
+                    <li v-for="point in section.content_points" :key="point">{{ point }}</li>
+                  </ul>
+                </article>
+              </div>
+            </section>
+
+            <section v-if="websiteSpec.requirements.features.length" class="spec-list">
+              <h3>MVP 功能</h3>
+              <ul>
+                <li v-for="feature in websiteSpec.requirements.features" :key="feature">
+                  {{ feature }}
+                </li>
+              </ul>
+            </section>
+          </div>
+          <div v-else-if="project?.prd" class="prd-panel">
+            <div class="prd-head">
+              <h2>旧版产品需求文档</h2>
+              <p>该项目使用旧格式，新生成的项目将展示结构化网站规格。</p>
+            </div>
+            <pre class="prd-content">{{ project.prd }}</pre>
+          </div>
+          <div v-else class="canvas-empty">
+            <p class="empty-title">等待开始</p>
+            <p class="empty-desc">提交需求后，这里会展示网站规格与后续预览。</p>
+          </div>
         </div>
-        <div v-else class="canvas-empty">
-          <p class="empty-title">等待开始</p>
-          <p class="empty-desc">提交需求后，这里会展示网站规格与后续预览。</p>
-        </div>
+
+        <aside v-if="consoleOpen" class="workbench-console" aria-label="控制台">
+          <header class="console-head">
+            <strong>Console</strong>
+            <button type="button" class="console-close" @click="consoleOpen = false">×</button>
+          </header>
+          <pre class="console-log">{{ consoleText }}</pre>
+        </aside>
       </div>
     </section>
   </div>
@@ -532,22 +397,27 @@ import { useRoute } from 'vue-router'
 import type {
   EditableStyleName,
   GeneratedWebsiteFiles,
+  ProjectElementAiHistoryItem,
   WebsiteElementPatch,
   WebsiteSpecification,
 } from '@/api/modules/project'
 import ForgeLogo from '@/components/ForgeLogo.vue'
 import { useProjectStore } from '@/stores'
-import CanvasToolbar from '../components/CanvasToolbar.vue'
-import ProjectTopbar from '../components/ProjectTopbar.vue'
-import { EDITOR_BRIDGE_SCRIPT } from '../composables/editorBridge'
+import ProjectTopbar from './components/ProjectTopbar.vue'
+import CanvasToolbar from './components/CanvasToolbar.vue'
+import VisualEditorPanel from './components/VisualEditorPanel.vue'
+import WorkbenchWorkspacePanels from './components/WorkbenchWorkspacePanels.vue'
+import { EDITOR_BRIDGE_SCRIPT } from './editorBridge'
 import type {
   CanvasView,
+  DesignChatMessage,
   EditorTab,
   ElementRect,
   PlanItem,
   PreviewMode,
   SelectedEditableElement,
-} from '../types/projectView'
+  WorkspaceView,
+} from './projectView'
 
 const route = useRoute()
 const projects = useProjectStore()
@@ -559,6 +429,11 @@ const planApproved = ref(false)
 const approveError = ref<string | null>(null)
 const planItems = reactive<PlanItem[]>([])
 const previewMode = ref<PreviewMode>('desktop')
+const workspaceView = ref<WorkspaceView>('viewer')
+const chatCollapsed = ref(false)
+const historyOpen = ref(false)
+const consoleOpen = ref(false)
+const activePageId = ref('home')
 const canvasView = ref<CanvasView>('spec')
 const threadRef = ref<HTMLElement | null>(null)
 const websiteFrame = ref<HTMLIFrameElement | null>(null)
@@ -570,35 +445,33 @@ const hoveredElement = ref<Pick<SelectedEditableElement, 'elementId' | 'tagName'
 )
 const pendingEdits = ref<Record<string, WebsiteElementPatch>>({})
 const editHistory = ref<Record<string, WebsiteElementPatch>[]>([])
+const lastHistoryWasTextFor = ref<string | null>(null)
 const editorError = ref<string | null>(null)
 const elementInstruction = ref('')
+const designChatMessages = ref<DesignChatMessage[]>([])
+const siteChatMessages = ref<ProjectElementAiHistoryItem[]>([])
+const designAskPending = ref(false)
 const previewKey = ref(0)
 const starting = computed(() => projects.starting)
 const approving = computed(() => projects.approving)
 const building = computed(() => projects.building)
 const savingWebsite = computed(() => projects.savingWebsite)
-const suggestingElement = computed(() => projects.suggestingElement)
+const suggestingElement = computed(
+  () => projects.suggestingElement || projects.revisingWebsite || designAskPending.value,
+)
+const revisingWebsite = computed(() => projects.revisingWebsite)
 const hasPendingEdits = computed(() => Object.keys(pendingEdits.value).length > 0)
 
-const editorTabs: { key: EditorTab; label: string }[] = [
-  { key: 'visual', label: 'Visual Editor' },
-  { key: 'library', label: 'Library' },
-  { key: 'theme', label: 'Theme' },
-]
-const fontWeights = ['100', '200', '300', '400', '500', '600', '700', '800', '900']
-const fontFamilies = ['Inter', 'Arial', 'Georgia', 'system-ui', 'sans-serif', 'serif']
-const textAlignments = [
-  { value: 'left', icon: '≡' },
-  { value: 'center', icon: '≣' },
-  { value: 'right', icon: '≡' },
-  { value: 'justify', icon: '☰' },
-] as const
-const colorControls: { label: string; property: EditableStyleName }[] = [
-  { label: 'Text', property: 'color' },
-  { label: 'Fill', property: 'background-color' },
-  { label: 'Border', property: 'border-color' },
-]
-const boxSides = ['top', 'right', 'bottom', 'left'] as const
+watch(
+  () => selectedElement.value?.elementId ?? null,
+  (nextId, prevId) => {
+    if (nextId && nextId !== prevId) {
+      designChatMessages.value = []
+      elementInstruction.value = ''
+      editorError.value = null
+    }
+  },
+)
 
 const project = computed(() => projects.current)
 const workflowId = computed(() => projects.workflowId)
@@ -708,8 +581,15 @@ function handleEditorMessage(event: MessageEvent) {
       | SelectedEditableElement
       | { elementId: string; rect: ElementRect }
       | { elementId: string; text: string; rect: ElementRect }
+      | { elementId?: string }
   }
-  if (message?.source !== 'forge-visual-editor' || !message.payload?.elementId) return
+  if (message?.source !== 'forge-visual-editor') return
+  if (message.type === 'element-deselected') {
+    selectedElement.value = null
+    hoveredElement.value = null
+    return
+  }
+  if (!message.payload || !('elementId' in message.payload) || !message.payload.elementId) return
   if (message.type === 'element-hovered' && 'tagName' in message.payload) {
     if (!selectedElement.value) {
       hoveredElement.value = {
@@ -728,14 +608,14 @@ function handleEditorMessage(event: MessageEvent) {
   }
   if (message.type === 'element-changed' && 'text' in message.payload) {
     const { elementId, text, rect } = message.payload
-    mergePendingEdit(elementId, { text })
+    mergePendingEdit(elementId, { text }, { coalesceText: true })
     if (selectedElement.value?.elementId === elementId) {
       selectedElement.value = { ...selectedElement.value, text, rect }
     }
     editorError.value = null
     return
   }
-  if (message.type === 'selection-position') {
+  if (message.type === 'selection-position' && 'rect' in message.payload) {
     if (selectedElement.value?.elementId === message.payload.elementId) {
       selectedElement.value = {
         ...selectedElement.value,
@@ -747,10 +627,21 @@ function handleEditorMessage(event: MessageEvent) {
   if (message.type !== 'element-selected' || !('styles' in message.payload)) return
   hoveredElement.value = null
   const selectedPayload = message.payload as SelectedEditableElement
-  const pendingText = pendingEdits.value[selectedPayload.elementId]?.changes.text
-  selectedElement.value =
-    typeof pendingText === 'string' ? { ...selectedPayload, text: pendingText } : selectedPayload
+  const pending = pendingEdits.value[selectedPayload.elementId]?.changes
+  selectedElement.value = {
+    ...selectedPayload,
+    text: typeof pending?.text === 'string' ? pending.text : selectedPayload.text,
+    styles: {
+      ...selectedPayload.styles,
+      ...pending?.styles,
+    },
+  }
   editorError.value = null
+}
+
+/** Vue reactive proxies are not structured-cloneable (postMessage / structuredClone throw). */
+function clonePlain<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
 }
 
 function postEditorUpdate(elementId: string, changes: WebsiteElementPatch['changes']) {
@@ -758,14 +649,36 @@ function postEditorUpdate(elementId: string, changes: WebsiteElementPatch['chang
     {
       source: 'forge-visual-editor-host',
       type: 'update-element',
-      payload: { elementId, changes },
+      payload: clonePlain({ elementId, changes }),
     },
     '*',
   )
 }
 
-function mergePendingEdit(elementId: string, changes: WebsiteElementPatch['changes']) {
-  editHistory.value.push(structuredClone(pendingEdits.value))
+function mergePendingEdit(
+  elementId: string,
+  changes: WebsiteElementPatch['changes'],
+  options: { coalesceText?: boolean } = {},
+) {
+  const textOnly =
+    typeof changes.text === 'string' &&
+    !changes.styles &&
+    Object.keys(changes).every((key) => key === 'text')
+  const shouldCoalesce =
+    options.coalesceText &&
+    textOnly &&
+    lastHistoryWasTextFor.value === elementId &&
+    editHistory.value.length > 0
+
+  if (!shouldCoalesce) {
+    editHistory.value.push(clonePlain(pendingEdits.value))
+  }
+  if (textOnly) {
+    lastHistoryWasTextFor.value = elementId
+  } else {
+    lastHistoryWasTextFor.value = null
+  }
+
   const current = pendingEdits.value[elementId]
   pendingEdits.value = {
     ...pendingEdits.value,
@@ -817,8 +730,13 @@ function updateSelectedText(event: Event) {
   if (!element) return
   const text = (event.target as HTMLTextAreaElement).value
   selectedElement.value = { ...element, text }
-  mergePendingEdit(element.elementId, { text })
+  mergePendingEdit(element.elementId, { text }, { coalesceText: true })
   postEditorUpdate(element.elementId, { text })
+}
+
+function appendDesignAssistantMessage(content: string) {
+  const text = content.trim() || '已收到，但暂时没有可用的回复内容。'
+  designChatMessages.value = [...designChatMessages.value, { role: 'assistant', content: text }]
 }
 
 async function askAiToChangeElement() {
@@ -826,24 +744,48 @@ async function askAiToChangeElement() {
   const element = selectedElement.value
   const instruction = elementInstruction.value.trim()
   if (!current || !element || !instruction || suggestingElement.value) return
+
+  const tag = element.tagName.toLowerCase()
+  const history = designChatMessages.value.slice(-12)
+  const apiHistory = history.map(({ role, content }) => ({ role, content }))
+
+  // Chat-first: record the user turn and clear input before awaiting the API.
+  designChatMessages.value = [...history, { role: 'user', content: instruction, tagName: tag }]
+  elementInstruction.value = ''
   editorError.value = null
+  designAskPending.value = true
+  await nextTick()
+
   try {
-    const patch = await projects.suggestElementEdit(current.id, {
-      element_id: element.elementId,
-      tag_name: element.tagName.toLowerCase(),
-      text: element.text,
-      text_editable: element.textEditable,
-      styles: element.styles,
+    const reply = await projects.reviseWebsite(current.id, {
       instruction,
+      history: apiHistory,
+      base_revision: current.website_revision ?? 0,
+      focus: {
+        element_id: element.elementId,
+        tag_name: tag,
+        text: element.text,
+        text_editable: element.textEditable,
+        styles: element.styles,
+      },
     })
-    mergePendingEdit(patch.element_id, patch.changes)
-    postEditorUpdate(patch.element_id, patch.changes)
-    if (patch.changes.text !== undefined) {
-      selectedElement.value = { ...element, text: patch.changes.text ?? element.text }
+    appendDesignAssistantMessage(
+      reply.message || (reply.mode === 'applied' ? '好，已改好并保存。' : '还不太确定你想怎么改。'),
+    )
+    if (reply.mode === 'applied') {
+      pendingEdits.value = {}
+      editHistory.value = []
+      lastHistoryWasTextFor.value = null
+      selectedElement.value = null
+      hoveredElement.value = null
+      previewKey.value += 1
     }
-    elementInstruction.value = ''
   } catch (err) {
-    editorError.value = err instanceof Error ? err.message : 'AI 修改当前元素失败，请重试'
+    const message = err instanceof Error ? err.message : '修改失败，请重试'
+    editorError.value = message
+    appendDesignAssistantMessage(message)
+  } finally {
+    designAskPending.value = false
   }
 }
 
@@ -865,9 +807,42 @@ function undoVisualEdit() {
   const previous = editHistory.value.pop()
   if (!previous) return
   pendingEdits.value = previous
+  lastHistoryWasTextFor.value = null
   selectedElement.value = null
   hoveredElement.value = null
   previewKey.value += 1
+}
+
+function clearCanvasSelection() {
+  selectedElement.value = null
+  hoveredElement.value = null
+  websiteFrame.value?.contentWindow?.postMessage(
+    {
+      source: 'forge-visual-editor-host',
+      type: 'clear-selection',
+    },
+    '*',
+  )
+}
+
+function confirmDiscardPending(): boolean {
+  if (!hasPendingEdits.value) return true
+  return window.confirm('有未保存的设计修改，确定放弃吗？')
+}
+
+function handleDesignKeydown(event: KeyboardEvent) {
+  if (!designMode.value) return
+  if (event.key !== 'Escape') return
+  const target = event.target as HTMLElement | null
+  if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return
+  if (selectedElement.value) {
+    event.preventDefault()
+    clearCanvasSelection()
+    return
+  }
+  event.preventDefault()
+  if (!confirmDiscardPending()) return
+  exitDesignMode()
 }
 
 function reapplyPendingEdits() {
@@ -881,26 +856,43 @@ function reapplyPendingEdits() {
 
 function toggleDesignMode() {
   if (designMode.value) {
+    if (!confirmDiscardPending()) return
     exitDesignMode()
     return
   }
   canvasView.value = 'preview'
+  workspaceView.value = 'viewer'
   designMode.value = true
   selectedElement.value = null
   hoveredElement.value = null
   pendingEdits.value = {}
   editHistory.value = []
+  lastHistoryWasTextFor.value = null
   editorError.value = null
   previewKey.value += 1
 }
 
+const selectionLabel = computed(() => {
+  const element = selectedElement.value
+  if (!element) return ''
+  const fontSize = Number.parseFloat(element.styles['font-size'] || '')
+  const sizeLabel = Number.isFinite(fontSize) ? `${Math.round(fontSize)}px` : ''
+  return sizeLabel
+    ? `${element.tagName.toLowerCase()} - ${sizeLabel}`
+    : element.tagName.toLowerCase()
+})
+
 function discardVisualEdits() {
+  if (!hasPendingEdits.value) return
+  if (!window.confirm('有未保存的设计修改，确定放弃吗？')) return
   pendingEdits.value = {}
   editHistory.value = []
+  lastHistoryWasTextFor.value = null
   selectedElement.value = null
   hoveredElement.value = null
   editorError.value = null
   elementInstruction.value = ''
+  clearCanvasSelection()
   previewKey.value += 1
 }
 
@@ -908,8 +900,12 @@ function exitDesignMode() {
   designMode.value = false
   selectedElement.value = null
   hoveredElement.value = null
+  designChatMessages.value = []
+  elementInstruction.value = ''
+  editorError.value = null
   pendingEdits.value = {}
   editHistory.value = []
+  lastHistoryWasTextFor.value = null
   editorError.value = null
   elementInstruction.value = ''
   previewKey.value += 1
@@ -927,6 +923,7 @@ async function saveVisualEdits() {
     })
     pendingEdits.value = {}
     editHistory.value = []
+    lastHistoryWasTextFor.value = null
     selectedElement.value = null
     previewKey.value += 1
   } catch (err) {
@@ -934,8 +931,14 @@ async function saveVisualEdits() {
   }
 }
 
-onMounted(() => window.addEventListener('message', handleEditorMessage))
-onBeforeUnmount(() => window.removeEventListener('message', handleEditorMessage))
+onMounted(() => {
+  window.addEventListener('message', handleEditorMessage)
+  window.addEventListener('keydown', handleDesignKeydown)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('message', handleEditorMessage)
+  window.removeEventListener('keydown', handleDesignKeydown)
+})
 
 const validationIssues = computed<{ description: string }[]>(() => {
   if (!project.value?.validation_report) return []
@@ -970,11 +973,86 @@ const builderStatusText = computed(() => {
   return '网站规格已批准，准备开始构建。'
 })
 
-const previewModes: { key: PreviewMode; label: string; icon: string }[] = [
-  { key: 'desktop', label: '桌面', icon: '🖥' },
-  { key: 'tablet', label: '平板', icon: '▤' },
-  { key: 'mobile', label: '手机', icon: '▢' },
+const previewModes: { key: PreviewMode; label: string }[] = [
+  { key: 'mobile', label: '显示手机预览' },
+  { key: 'tablet', label: '显示平板预览' },
+  { key: 'desktop', label: '显示桌面预览' },
 ]
+
+const previewPages = computed(() => {
+  const pages = websiteSpec.value?.site.pages
+  if (!pages?.length) return [{ id: 'home', name: 'Home', path: '/' }]
+  return pages.map((page) => ({ id: page.id, name: page.name, path: page.path }))
+})
+
+const consoleText = computed(() => {
+  const lines = [
+    `[status] ${project.value?.status || 'unknown'}`,
+    `[revision] v${project.value?.website_revision ?? 0}`,
+    workflowId.value ? `[workflow] ${workflowId.value}` : null,
+    project.value?.build_error ? `[build_error] ${project.value.build_error}` : null,
+    validationIssues.value.length
+      ? `[validation] ${validationIssues.value.map((item) => item.description).join('; ')}`
+      : null,
+    `[preview] ${workspaceView.value} / ${previewMode.value}`,
+  ]
+  return lines.filter(Boolean).join('\n')
+})
+
+function setWorkspaceView(view: WorkspaceView) {
+  workspaceView.value = view
+  if (view !== 'viewer') {
+    exitDesignMode()
+  }
+}
+
+function refreshPreview() {
+  previewKey.value += 1
+}
+
+async function shareProject() {
+  const url = window.location.href
+  try {
+    await navigator.clipboard.writeText(url)
+    window.alert('项目链接已复制到剪贴板。')
+  } catch {
+    window.prompt('复制以下链接分享项目：', url)
+  }
+}
+
+function publishProject() {
+  if (project.value?.status !== 'completed') {
+    window.alert('网站构建完成后才能发布。')
+    return
+  }
+  workspaceView.value = 'overview'
+  window.alert('发布流程为演示模式：可在概览页管理线上版本与域名。')
+}
+
+function downloadGeneratedFile(name: 'index.html' | 'style.css' | 'script.js') {
+  const files = generatedFiles.value
+  if (!files) return
+  const blob = new Blob([files[name]], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = name
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+function downloadAllGeneratedFiles() {
+  const files = generatedFiles.value
+  if (!files) return
+  const payload = JSON.stringify(files, null, 2)
+  const blob = new Blob([payload], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${project.value?.name || 'website'}-files.json`
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
 
 const statusLabel = computed(() => {
   const map: Record<string, string> = {
@@ -1113,13 +1191,50 @@ async function runBuild() {
   }
 }
 
-const followUpNotes = ref<string[]>([])
-
-function sendFollowUp() {
+async function sendFollowUp() {
   const text = followUp.value.trim()
-  if (!text) return
-  followUpNotes.value.push(text)
+  const current = project.value
+  if (!text || !current || revisingWebsite.value || starting.value || building.value) return
+
   followUp.value = ''
+  const history = siteChatMessages.value.slice(-12)
+  siteChatMessages.value = [...history, { role: 'user', content: text }]
+  void scrollThread()
+
+  if (current.status === 'completed' && current.generated_files) {
+    try {
+      const reply = await projects.reviseWebsite(current.id, {
+        instruction: text,
+        history,
+        base_revision: current.website_revision ?? 0,
+      })
+      siteChatMessages.value = [
+        ...siteChatMessages.value,
+        { role: 'assistant', content: reply.message },
+      ]
+      if (reply.mode === 'applied') {
+        pendingEdits.value = {}
+        editHistory.value = []
+        lastHistoryWasTextFor.value = null
+        selectedElement.value = null
+        hoveredElement.value = null
+        previewKey.value += 1
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '整站修改失败，请重试'
+      siteChatMessages.value = [...siteChatMessages.value, { role: 'assistant', content: message }]
+    }
+    void scrollThread()
+    return
+  }
+
+  siteChatMessages.value = [
+    ...siteChatMessages.value,
+    {
+      role: 'assistant',
+      content: '网站尚未构建完成。请先完成规格批准与构建；构建完成后可在此对话中修改整个网站。',
+    },
+  ]
   void scrollThread()
 }
 
@@ -1196,7 +1311,9 @@ async function loadProject(id: number) {
   bootError.value = null
   planApproved.value = false
   approveError.value = null
-  followUpNotes.value = []
+  siteChatMessages.value = []
+  designChatMessages.value = []
+  elementInstruction.value = ''
   planItems.splice(0, planItems.length)
   canvasView.value = 'spec'
   projects.workflowId = null
@@ -1235,4 +1352,4 @@ watch(
 )
 </script>
 
-<style scoped src="../styles/project-view.scss" lang="scss"></style>
+<style scoped src="./project-view.scss" lang="scss"></style>
