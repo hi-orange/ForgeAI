@@ -1,5 +1,7 @@
 # ForgeAI Frontend Agent Guide
 
+> **Architecture:** [docs/architecture.md](../../docs/architecture.md) · **Phase:** [docs/ROADMAP.md](../../docs/ROADMAP.md)
+
 Rules in this file apply when working under `apps/frontend/`.
 
 ## Stack

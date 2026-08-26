@@ -1,0 +1,14 @@
+---
+description: ForgeAI doc pointers and hard constraints
+alwaysApply: true
+---
+
+# ForgeAI
+
+Dynamic full-stack app builder — **not** static HTML generator.
+
+**Docs (conflict → top wins):** `docs/architecture.md` → `AGENTS.md` → `reference.md` → `SKILL.md` → `ROADMAP.md`
+
+**Hard rules:** spec → design → code → test; user changes start at PM; new pipeline uses `/build-runs`; Dev repairs, QA reports only.
+
+**Before agent/runtime work:** read `docs/architecture.md` and `.agents/skills/forgeai-architecture/SKILL.md`.

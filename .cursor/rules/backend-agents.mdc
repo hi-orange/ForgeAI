@@ -1,0 +1,15 @@
+---
+description: Pointer for backend agent/orchestrator work
+globs: apps/backend/app/agents/**,apps/backend/app/orchestrator/**,apps/backend/app/runtime/**,apps/backend/app/tools/**,app_template/**
+alwaysApply: false
+---
+
+# Backend agents
+
+Design: [docs/architecture.md](../../docs/architecture.md)
+
+Checklist: [.agents/skills/forgeai-architecture/SKILL.md](../../.agents/skills/forgeai-architecture/SKILL.md)
+
+Schemas: [.agents/skills/forgeai-architecture/reference.md](../../.agents/skills/forgeai-architecture/reference.md)
+
+Legacy static agents (`website_builder`, etc.) — do not extend; migrate per ROADMAP.

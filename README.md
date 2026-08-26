@@ -1,42 +1,34 @@
 # ForgeAI
 
-pnpm + Turborepo monorepo with a Vue frontend and FastAPI backend.
+**Conversational full-stack app builder** — describe an app in natural language, get a runnable FastAPI + Vue + SQLite application, refine it through chat.
 
-## Prerequisites
+Monorepo: Vue frontend + FastAPI backend (pnpm + Turborepo).
 
-- Node.js 22.x (see `.nvmrc`)
-- [pnpm](https://pnpm.io/) 9
-- [uv](https://docs.astral.sh/uv/) (Python toolchain)
-- Python 3.13+
+## Docs
+
+| Doc | Purpose |
+|-----|---------|
+| [AGENTS.md](AGENTS.md) | AI/human project guide |
+| [docs/architecture.md](docs/architecture.md) | System design (source of truth) |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Current implementation phase |
 
 ## Setup
 
 ```bash
 pnpm install
 cd apps/backend && uv sync
-```
-
-## Develop
-
-```bash
 pnpm dev
 ```
 
 - Frontend: http://localhost:5173
 - Backend: http://localhost:8000
 
-## Quality gates
+## Quality
 
 ```bash
-pnpm check   # lint + typecheck + format
-pnpm lint
-pnpm typecheck
-pnpm format
+pnpm check
 ```
 
-## Apps
+## Status
 
-| Package             | Path            | Stack                   |
-| ------------------- | --------------- | ----------------------- |
-| `@forgeai/frontend` | `apps/frontend` | Vue 3, Vite, Tailwind   |
-| `@forgeai/backend`  | `apps/backend`  | FastAPI, uv, Ruff, mypy |
+Migrating from legacy static-website generator to dynamic app builder. See [ROADMAP.md](docs/ROADMAP.md) — **Phase 1** in progress.

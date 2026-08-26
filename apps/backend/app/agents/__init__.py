@@ -1,5 +1,7 @@
-from app.agents.product_manager import ProductManagerAgent
-from app.agents.website_builder import WebsiteBuilderAgent
-from app.agents.website_quality import WebsiteQualityAgent
+"""ForgeAI agent package.
 
-__all__ = ["ProductManagerAgent", "WebsiteBuilderAgent", "WebsiteQualityAgent"]
+The legacy static three-file Website agents were removed. New artifact-driven
+agents will be introduced by the architecture migration, not through compatibility aliases.
+"""
+
+__all__: list[str] = []

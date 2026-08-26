@@ -1,4 +1,11 @@
 import { apiRequest } from '../request'
+import * as projectMock from '@/mocks/projectPipeline'
+
+const useProjectMock = import.meta.env.VITE_PROJECT_DATA_SOURCE !== 'api'
+
+function buildRunApiPending<T>(): Promise<T> {
+  return Promise.reject(new Error('新 BuildRun 接口尚未接入，请使用 mock 数据源'))
+}
 
 export type Project = {
   id: number
@@ -173,6 +180,8 @@ export type ProjectStartResult = {
 }
 
 export function createProject(token: string, payload: ProjectCreatePayload) {
+  if (useProjectMock) return Promise.resolve(projectMock.createProject(payload))
+
   // Always creates a new project row; callers must not reuse by prompt/name.
   return apiRequest<Project>('/api/v1/projects', {
     method: 'POST',
@@ -182,6 +191,8 @@ export function createProject(token: string, payload: ProjectCreatePayload) {
 }
 
 export function listProjects(token: string) {
+  if (useProjectMock) return Promise.resolve(projectMock.listProjects())
+
   return apiRequest<Project[]>('/api/v1/projects', {
     method: 'GET',
     token,
@@ -189,6 +200,8 @@ export function listProjects(token: string) {
 }
 
 export function getProject(token: string, id: number) {
+  if (useProjectMock) return Promise.resolve(projectMock.getProject(id))
+
   return apiRequest<Project>(`/api/v1/projects/${id}`, {
     method: 'GET',
     token,
@@ -196,34 +209,31 @@ export function getProject(token: string, id: number) {
 }
 
 export function startProject(token: string, id: number, payload: ProjectStartPayload = {}) {
-  return apiRequest<ProjectStartResult>(`/api/v1/projects/${id}/start`, {
-    method: 'POST',
-    token,
-    body: payload,
-  })
+  if (useProjectMock) return Promise.resolve(projectMock.startProject(id, payload))
+
+  void token
+  return buildRunApiPending<ProjectStartResult>()
 }
 
 export function approveProjectSpec(token: string, id: number, payload: ProjectApproveSpecPayload) {
-  return apiRequest<Project>(`/api/v1/projects/${id}/approve-spec`, {
-    method: 'POST',
-    token,
-    body: payload,
-  })
+  if (useProjectMock) return Promise.resolve(projectMock.approveProjectSpec(id, payload))
+
+  void token
+  return buildRunApiPending<Project>()
 }
 
 export function buildProject(token: string, id: number) {
-  return apiRequest<Project>(`/api/v1/projects/${id}/build`, {
-    method: 'POST',
-    token,
-  })
+  if (useProjectMock) return Promise.resolve(projectMock.buildProject(id))
+
+  void token
+  return buildRunApiPending<Project>()
 }
 
 export function editProjectWebsite(token: string, id: number, payload: ProjectWebsiteEditPayload) {
-  return apiRequest<Project>(`/api/v1/projects/${id}/website`, {
-    method: 'PATCH',
-    token,
-    body: payload,
-  })
+  if (useProjectMock) return Promise.resolve(projectMock.editProjectWebsite(id, payload))
+
+  void token
+  return buildRunApiPending<Project>()
 }
 
 export function suggestProjectElementEdit(
@@ -231,11 +241,10 @@ export function suggestProjectElementEdit(
   id: number,
   payload: ProjectElementAiEditPayload,
 ) {
-  return apiRequest<ProjectElementAiReply>(`/api/v1/projects/${id}/website/element-suggestion`, {
-    method: 'POST',
-    token,
-    body: payload,
-  })
+  if (useProjectMock) return Promise.resolve(projectMock.suggestProjectElementEdit(id, payload))
+
+  void token
+  return buildRunApiPending<ProjectElementAiReply>()
 }
 
 export function reviseProjectWebsite(
@@ -243,9 +252,8 @@ export function reviseProjectWebsite(
   id: number,
   payload: ProjectWebsiteRevisePayload,
 ) {
-  return apiRequest<ProjectWebsiteReviseReply>(`/api/v1/projects/${id}/website/revise`, {
-    method: 'POST',
-    token,
-    body: payload,
-  })
+  if (useProjectMock) return Promise.resolve(projectMock.reviseProjectWebsite(id, payload))
+
+  void token
+  return buildRunApiPending<ProjectWebsiteReviseReply>()
 }

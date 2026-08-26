@@ -1,5 +1,10 @@
 # ForgeAI Backend Agent Guide
 
+> **Architecture (source of truth):** [docs/architecture.md](../../docs/architecture.md)
+> **Doc priority & direction:** [AGENTS.md](../../AGENTS.md)
+> **Implement agents/runtime:** [.agents/skills/forgeai-architecture/SKILL.md](../../.agents/skills/forgeai-architecture/SKILL.md)
+> **Current phase:** [docs/ROADMAP.md](../../docs/ROADMAP.md)
+
 Rules in this file apply when working under `apps/backend/`.
 
 ## Stack
@@ -20,9 +25,10 @@ Rules in this file apply when working under `apps/backend/`.
 
 - Return responses through the shared `ApiResponse` / `success(...)` helpers unless there is a clear exception.
 - Raise `AppException` subclasses (`BusinessException`, `NotFoundException`, …) for expected failures; let the global handlers format them.
-- Preserve project status transitions (draft → PRD / spec → approval → build → validation / repair → completed or failed). Do not invent silent status jumps.
-- Generated websites are the three-file prototype (`index.html` / `style.css` / `script.js`) unless the approved spec and platform explicitly support more.
-- Treat generated HTML/JS as untrusted content at the product boundary; do not weaken preview isolation assumptions when changing editor or builder output.
+- **Target product:** dynamic full-stack apps via artifact pool (`app_spec` → `system_design` → `code`). See root AGENTS.md.
+- **Legacy (until migrated):** static three-file websites and draft → prd → approve → build flow still exist in code; do not extend for new features.
+- Preserve existing status transitions for legacy paths; new orchestrator code uses draft → building → ready / failed per ROADMAP.
+- Treat generated app output as untrusted at the preview boundary; keep iframe/proxy isolation when changing preview or runtime.
 - Keep frontend/backend schema fields aligned. If you rename or reshape API fields, update both sides or document the break.
 
 ## Data and migrations
