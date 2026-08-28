@@ -2,7 +2,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, NotFoundException
-from app.models.project import Project
+from app.models.project import Project, ProjectStatus
 from app.models.user import User
 from app.schemas.project import ProjectCreate
 
@@ -23,7 +23,7 @@ def create_project(db: Session, user: User, payload: ProjectCreate) -> Project:
         name=(payload.name or _name_from_prompt(prompt)).strip()[:200],
         description=payload.description,
         prompt=prompt,
-        status="draft",
+        status=ProjectStatus.DRAFT.value,
     )
     db.add(project)
     db.commit()

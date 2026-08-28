@@ -1,15 +1,19 @@
 ---
-description: Pointer for backend agent/orchestrator work
+description: Guidance for backend orchestration, generation, runtime, and tools
 globs: apps/backend/app/agents/**,apps/backend/app/orchestrator/**,apps/backend/app/runtime/**,apps/backend/app/tools/**,app_template/**
 alwaysApply: false
 ---
 
-# Backend agents
+# Backend architecture work
 
-Design: [docs/architecture.md](../../docs/architecture.md)
+Use [architecture.md](../../docs/architecture.md) for durable invariants and
+[the architecture Skill](../../.agents/skills/forgeai-architecture/SKILL.md) for change guidance.
+Read [the artifact reference](../../.agents/skills/forgeai-architecture/reference.md) only when an
+artifact producer, consumer, meaning, or compatibility contract is affected.
 
-Checklist: [.agents/skills/forgeai-architecture/SKILL.md](../../.agents/skills/forgeai-architecture/SKILL.md)
+Derive current routes, states, stages, schemas, storage, and agent behavior from the implementation
+and tests. Work on the current approved increment without prebuilding a fixed later sequence.
 
-Schemas: [.agents/skills/forgeai-architecture/reference.md](../../.agents/skills/forgeai-architecture/reference.md)
-
-Legacy static agents (`website_builder`, etc.) — do not extend; migrate per ROADMAP.
+Review changed files first, then their direct callers, imports, contracts, persistence, runtime and
+security boundaries, and related tests. Expand only when a shared or cross-cutting impact justifies
+it; do not rescan the entire backend for each task.

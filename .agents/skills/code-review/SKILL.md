@@ -1,52 +1,67 @@
 ---
 name: code-review
-description: Review ForgeAI code changes for correctness, regressions, security, and missing tests. Use when asked to review a diff, branch, commit, PR, or current working tree; do not implement fixes unless explicitly requested.
+description: >-
+  Review ForgeAI diffs, commits, branches, pull requests, or working-tree changes
+  for correctness, regressions, security, and missing tests without implementing fixes.
 ---
 
 # ForgeAI Code Review
 
-Read-only unless user asks for fixes.
+Review is read-only unless the user explicitly asks for fixes.
 
-## Scope
+## Establish the review scope
 
-Identify whether changes are **legacy** (static website) or **target** (BuildRun, artifacts, runtime). Apply matching criteria.
+1. Start from the user request and the actual diff, commit, branch, or changed-file list.
+2. Read the changed lines and enough surrounding code to understand their behavior.
+3. Identify the direct impact surface before opening unrelated modules.
 
-Read [docs/architecture.md](../../../docs/architecture.md) for target design.
+Do not perform a full-repository audit or reread every convention by default.
 
-## Target code — check for
+## Follow direct impact
 
-1. BuildRun pins artifact versions (no "read latest" mid-run)
-2. Workspace → revision promote (no in-place overwrite of active revision)
-3. User changes cascade from PM spec update
-4. Repair budget respected (≤5 Dev calls, ≤3 QA runs per run)
-5. Tool sandbox: path scope, no shell escape, whitelist commands
-6. Preview isolation for untrusted generated code
-7. `/build-runs` vs legacy `/build` not mixed in same handler
-8. Pydantic artifact schemas match [reference.md](../forgeai-architecture/reference.md)
+Trace a change where it can realistically propagate:
 
-## Legacy code — check for
+- imports, callers, and shared helpers;
+- API producers and consumers;
+- Pydantic models, TypeScript types, serializers, and validation;
+- SQLAlchemy models, migrations, queries, and existing rows;
+- authentication, authorization, path, process, and preview boundaries;
+- concurrency, run state, artifact provenance, and revision activation;
+- tests that cover the changed behavior.
 
-1. Do not break existing static flow until migration completes
-2. Status transitions: draft → prd → approve → build → completed
-3. `generated_files` JSON integrity, iframe preview isolation
-4. Do not require BuildRun infrastructure from legacy-only changes
+Expand the review farther only when the change affects a shared primitive or public contract,
+crosses package boundaries, changes persistent data, touches security or concurrency, or reveals
+evidence of a broader defect.
 
-## Always check
+## Apply ForgeAI invariants when relevant
 
-- Auth boundaries, UTF-8, defensive JSON parsing
-- Frontend/backend contract alignment
-- Tests for changed behavior
-- Alembic single-head if migrations touched
+Use [architecture.md](../../../docs/architecture.md) and the
+[artifact contract](../forgeai-architecture/reference.md) for the parts of the change they govern.
+Check that active work has coherent inputs, outputs remain traceable, failed work cannot destroy the
+last usable revision, generated code stays isolated, ownership is enforced, and contracts remain
+aligned.
 
-## Verify (read-only)
+Do not reject an implementation merely because it differs from an old route, stage list, retry
+count, agent layout, or storage path. Those details are valid only when the current code or accepted
+requirement depends on them.
 
-```bash
-pnpm check
-uv run --directory apps/backend python -m unittest discover -s tests -v
-```
+## Verify proportionately
 
-## Findings format
+Prefer the smallest command that can disprove or confirm the changed behavior. Add package-level or
+repository-level checks when the impact is shared or cross-cutting. If migrations change, inspect
+migration ancestry and upgrade behavior. If an API contract changes, check both sides. Never hide
+checks that were not run or could not run.
 
-Severity (P0–P3), title, file:line, scenario, impact, why current code fails.
+## Findings
 
-If no defects: say so + note untested areas.
+Report only actionable defects caused or exposed by the reviewed change. For each finding include:
+
+- severity from P0 to P3;
+- concise title;
+- file and tight line range;
+- triggering scenario;
+- concrete impact;
+- why the current code permits the failure.
+
+Order findings by severity. If there are no findings, say so and note material untested areas or
+remaining uncertainty.

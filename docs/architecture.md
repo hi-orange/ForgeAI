@@ -1,210 +1,127 @@
 # ForgeAI Architecture
 
-**This file is the single source of truth for system design.** If other docs conflict, this wins.
+**This file is the source of truth for ForgeAI product direction and cross-module invariants.**
 
-Quick links: [AGENTS.md](../AGENTS.md) (direction) · [reference.md](../.agents/skills/forgeai-architecture/reference.md) (artifact schemas) · [ROADMAP.md](ROADMAP.md) (current phase)
+It intentionally does not prescribe a permanent delivery sequence or orchestration script, an
+exhaustive API list, or a final directory layout. The code, schemas, migrations, and tests define
+the current implementation. When an implementation detail changes without changing the product
+direction or an invariant below, this document does not need to be expanded into a step-by-step
+plan.
 
----
+Quick links: [project guide](../AGENTS.md) ·
+[artifact contract](../.agents/skills/forgeai-architecture/reference.md)
 
-## What ForgeAI is
+## Product goal
 
-User describes an app in natural language → ForgeAI delivers a **runnable** FastAPI + Vue + SQLite app → user keeps chatting to refine it.
+ForgeAI is a conversational full-stack app builder.
 
-Agents do not chat with each other. They read and write **structured artifacts** (like MetaGPT documents).
+A user describes an application, receives a runnable app, and continues the conversation to refine
+its behavior and interface. Generated applications currently target FastAPI, Vue, and SQLite, while
+the generation strategy and internal implementation may evolve.
 
----
+## Core concepts
 
-## Components
+| Concept | Responsibility |
+|---|---|
+| Project | Owns the conversation, generated application, and user-visible state |
+| BuildRun | Gives a long-running build or update a traceable identity and observable outcome |
+| Artifact | Records versioned intent, design, code identity, or validation evidence |
+| Revision | Represents a recoverable version of generated source code |
+| Runtime | Starts and exposes a generated revision for preview or use |
 
-| Part | Path | Job |
-|------|------|-----|
-| API | `apps/backend/app/api/v1/` | HTTP: projects, build-runs, chat, preview |
-| Orchestrator | `app/orchestrator/` | Run SOP, lock BuildRun, schedule agents |
-| Artifact pool | `app/orchestrator/artifact_pool.py` | Store versioned JSON artifacts |
-| Agents | `app/agents/` | pm, architect, developer, qa |
-| Runtime | `app/runtime/` | Start/stop preview, reverse proxy |
-| Tools | `app/tools/` | Safe file I/O, run server, smoke test |
-| Template | `app_template/` | Fixed scaffold; Dev fills business files |
-| Storage | `storage/projects/{id}/` | Workspaces, revisions, artifact files |
+These responsibilities are stable. Their class names, database fields, modules, and storage
+locations are implementation details.
 
----
+## Architecture invariants
 
-## Four agents
+### Work is observable and traceable
 
-| Agent | Writes | Never does |
-|-------|--------|------------|
-| PM | `app_spec` | Code, design |
-| Architect | `system_design` | Code |
-| Developer | `code` (generate / update / repair) | Change spec without PM |
-| QA | `test_report` | Code |
+- Long-running generation and update work has a durable run identity.
+- A run exposes enough state to understand whether it is waiting, active, successful, or failed.
+- Inputs, outputs, errors, and the resulting revision can be traced back to that run.
+- Concurrent requests for the same project have deterministic behavior; they must not silently
+  corrupt or mix work.
 
-User changes **always** start with PM updating `app_spec`, then cascade down.
+### Inputs and outputs do not drift during a run
 
----
+- Once execution begins, the run uses explicitly identified input versions.
+- Published outputs record which inputs produced them.
+- A newer conversation message cannot silently replace an input already being used by active work.
 
-## Artifact flow
+The exact point at which inputs are pinned and the way pending requests are queued or rejected may
+change with the implementation.
 
-```
-app_spec (PM) → system_design (Architect) → code (Developer) → test_report (QA)
-```
+### Artifacts preserve responsibility boundaries
 
-Artifact schemas: [reference.md](../.agents/skills/forgeai-architecture/reference.md)
+ForgeAI currently uses four semantic artifact types:
 
----
+| Artifact | Meaning |
+|---|---|
+| app_spec | Product intent and user-visible behavior |
+| system_design | Technical decisions derived from a specific product intent |
+| code | Identity and provenance of generated source |
+| test_report | Validation evidence for a specific code result |
 
-## Four design decisions (fixed)
+Their dependency is semantic: product intent informs design, design informs code, and validation
+describes a code result. This does not require a permanent number of agents, processes, model calls,
+or executor stages.
 
-### 1. BuildRun locks versions
+A requested product behavior change must be reflected in product intent before downstream outputs
+claim to implement it. A repair that only makes existing intent work does not need to invent a new
+product requirement.
 
-Each build/update gets a `run_id`. All agents in that run read **pinned artifact versions**, not "latest".
+### Revisions remain recoverable
 
-```
-BuildRun run_abc:
-  input:  app_spec v2
-  output: system_design v2, code rev 3, test_report for run_abc
-```
+- Active generated source is not edited destructively in place.
+- Work is isolated until it is suitable to become a new revision.
+- Published revisions retain their identity and provenance.
+- A failed attempt does not destroy the last usable revision.
 
-If user sends a new message while a run is active, queue it or reject — do not mix versions mid-run.
+The promotion mechanism and physical storage strategy may change while preserving these properties.
 
-### 2. Workspace → immutable revision
+### Generated code is untrusted
 
-Code is never edited in place on the active revision.
+- File access, commands, processes, network access, and preview exposure are restricted to the
+  intended project and operation.
+- Paths are resolved and checked before access.
+- Runtime resources are bounded and can be stopped or cleaned up.
+- Generated applications do not inherit ForgeAI platform privileges by default.
 
-```
-storage/projects/{id}/
-  runs/{run_id}/workspace/     ← Dev writes here during run
-  revisions/3/                 ← promoted after QA pass (immutable)
-  active.json                  ← { "revision": 3 }
-```
+### Ownership and contracts stay coherent
 
-Success: copy workspace → new revision, update `active.json`. Failure: discard workspace.
+- Project and run operations enforce the existing user ownership boundary.
+- Public contract changes are updated across producers, consumers, types, and tests.
+- Persistent data changes use explicit migrations and preserve a valid upgrade path.
 
-### 3. Runtime (Phase 1)
+## Details that may evolve
 
-Host processes, two ports per project:
+The following are deliberately not frozen here:
 
-- Backend: `uvicorn` on allocated port
-- Frontend: `vite preview` on allocated port
-- ForgeAI proxies `/preview/{project_id}/` → frontend port
-
-Generated code is **untrusted**. Preview runs in isolated ports; idle 10 min → stop. No arbitrary shell for agents — see Tools below.
-
-### 4. Async builds
-
-Long builds do not block HTTP:
-
-```
-POST /projects/{id}/build-runs  → { run_id, status: "queued" }
-GET  /projects/{id}/build-runs/{run_id}  → { status, stage, error? }
-```
-
-Stages: `pm` → `architect` → `developer` → `qa` → `runtime` → `ready` | `failed`
-
-Legacy `POST /projects/{id}/build` (static site) is **frozen**. New pipeline uses `/build-runs` only.
-
----
-
-## SOP: first build
-
-```
-1. Create BuildRun (lock inputs)
-2. PM      → app_spec        → publish
-3. Architect → system_design → publish (reads locked app_spec)
-4. Developer → workspace     → smoke self-check (≤2 fixes)
-5. QA      → test_report     → if fail: Dev repair (see budget)
-6. Promote workspace → revision N, set active
-7. Runtime.start(revision N)
-8. BuildRun status = ready
-```
-
-## SOP: user change (chat)
-
-Same as build, but Developer mode = `update`, inputs include previous revision as base.
-
-Always step 2 = PM updates spec first. No Dev-only patches for feature changes.
-
----
-
-## Repair budget (one rule)
-
-Per BuildRun: **at most 5 Developer LLM calls** total (generate/update + all repairs).
-
-QA runs at most **3 times** (first check + 2 re-checks after repair). Dev self-check during generate counts toward the 5.
-
----
-
-## BuildRun state
-
-| Status | Meaning |
-|--------|---------|
-| `queued` | Waiting |
-| `running` | Agent stage in progress (`stage` field names current agent) |
-| `ready` | Revision promoted, preview up |
-| `failed` | Stopped; workspace discarded; error stored |
-
-Project status for UI: `draft` | `building` | `ready` | `failed` (maps from active BuildRun).
-
----
-
-## Tools (security)
-
-| Rule | Detail |
-|------|--------|
-| Scope | Current project's `runs/{run_id}/workspace/` only |
-| Paths | Resolve and reject `..` escapes |
-| Commands | Whitelist: start server, smoke test, read/write listed files |
-| Limits | Timeout 120s, log cap 64KB, kill orphan processes on run end |
-
----
-
-## Data model (target)
-
-```
-Project          id, user_id, name, prompt, status, active_revision
-BuildRun         id, project_id, run_id, status, stage, locked_*_version, error
-ProjectArtifact  id, project_id, type, version, run_id, content_path
-ChatMessage      id, project_id, role, content, run_id?, created_at
-```
-
-Pydantic schemas live in `app/schemas/artifacts/` (Phase 1 task).
-
----
-
-## API (target)
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/projects` | Create |
-| POST | `/projects/{id}/build-runs` | Start build SOP |
-| GET | `/projects/{id}/build-runs/{run_id}` | Poll status |
-| POST | `/projects/{id}/chat` | User message → update SOP |
-| GET | `/projects/{id}/preview` | Proxy to running app |
-
-Legacy (frozen): `/start`, `/approve-spec`, `/build` (static website).
-
----
-
-## Legacy migration
-
-| Old | New |
-|-----|-----|
-| `ProductManagerAgent` | `agents/pm.py` |
-| `WebsiteBuilderAgent` | `agents/developer.py` |
-| `WebsiteQualityAgent` | `agents/qa.py` |
-| `SiteReviserAgent` | `developer.update` |
-| `generated_files` column | `revisions/{n}/` + code artifact |
-| Static iframe srcdoc | `/preview/{id}/` proxy |
-
-Do not add features to legacy paths.
-
----
-
-## Why these choices
-
-| Choice | Reason |
-|--------|--------|
-| Document-driven | Spec is checkable; agents don't drift via chat |
-| BuildRun pin | Prevents v2 spec + v1 design mismatches |
-| Immutable revisions | Rollback, eval, audit |
-| Async build-runs | Builds take minutes; don't hold HTTP |
-| Template scaffold | Dev fills business only; quality stable |
+- API routes and payload fields
+- database columns and status or stage names
+- the number, names, prompts, and ordering of agents or services
+- retry limits, model-call budgets, and scheduling strategy
+- artifact serialization and storage layout
+- generated app templates and runtime or isolation technology
+- package, module, and file organization
+
+Choose these details from the current requirement and existing code. Update this document only when
+the product direction, a responsibility boundary, or an invariant changes. Avoid documenting
+unimplemented future work as though it were already decided.
+
+## Delivery approach
+
+Work in small, user-approved increments. Reuse the current implementation, make the smallest
+coherent change, verify the behavior affected by that change, and decide later work after the
+current result is understood. ForgeAI does not use a permanently fixed phase-by-phase project plan.
+
+## Impact-based review
+
+Review starts from the current change set, not from an automatic scan of the entire repository.
+Trace the changed code into the places it can directly affect, such as callers, imports, API
+consumers, schemas, migrations, shared types, security boundaries, concurrency behavior, and tests.
+
+Expand the review only when the change touches a shared primitive or public contract, crosses
+packages, changes persistent data, affects security or concurrency, or when evidence points to a
+broader issue. Verification follows the same rule: targeted checks first, broader suites when the
+impact justifies them.

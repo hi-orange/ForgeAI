@@ -1057,6 +1057,7 @@ function downloadAllGeneratedFiles() {
 const statusLabel = computed(() => {
   const map: Record<string, string> = {
     draft: '草稿',
+    available: '可用',
     running: '构建中',
     prd_ready: '规格已完成',
     spec_approved: '规格已批准',

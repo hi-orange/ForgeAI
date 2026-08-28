@@ -1,14 +1,23 @@
 ---
-description: ForgeAI doc pointers and hard constraints
+description: ForgeAI product direction and change-scope rules
 alwaysApply: true
 ---
 
 # ForgeAI
 
-Dynamic full-stack app builder — **not** static HTML generator.
+ForgeAI is a conversational full-stack app builder: conversation produces a runnable application
+that can be refined through later conversation.
 
-**Docs (conflict → top wins):** `docs/architecture.md` → `AGENTS.md` → `reference.md` → `SKILL.md` → `ROADMAP.md`
+Document priority is docs/architecture.md, AGENTS.md, the artifact reference, then the architecture
+Skill. Architecture defines durable goals and invariants; current code, schemas, migrations, and
+tests define present implementation details.
 
-**Hard rules:** spec → design → code → test; user changes start at PM; new pipeline uses `/build-runs`; Dev repairs, QA reports only.
+Work only on the current user-approved, coherent increment. Do not infer or document a permanently
+fixed project sequence, route set, stage list, agent count, retry budget, or directory layout.
 
-**Before agent/runtime work:** read `docs/architecture.md` and `.agents/skills/forgeai-architecture/SKILL.md`.
+Review starts from the current change and its direct callers, consumers, contracts, persistence,
+security or runtime boundaries, and tests. Expand only when the impact or evidence is broader; do
+not scan the whole repository by default.
+
+Before architecture-sensitive backend work, read the relevant parts of docs/architecture.md and
+.agents/skills/forgeai-architecture/SKILL.md.

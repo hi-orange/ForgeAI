@@ -46,6 +46,11 @@ class NotFoundException(AppException):
         super().__init__(msg, code=404, status_code=404)
 
 
+class ConflictException(AppException):
+    def __init__(self, msg: str = "资源状态冲突") -> None:
+        super().__init__(msg, code=409, status_code=409)
+
+
 def _detail_to_msg(detail: Any) -> str:
     if isinstance(detail, str):
         return detail

@@ -10,7 +10,6 @@ Monorepo: Vue frontend + FastAPI backend (pnpm + Turborepo).
 |-----|---------|
 | [AGENTS.md](AGENTS.md) | AI/human project guide |
 | [docs/architecture.md](docs/architecture.md) | System design (source of truth) |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Current implementation phase |
 
 ## Setup
 
@@ -29,6 +28,8 @@ pnpm dev
 pnpm check
 ```
 
-## Status
+## Development
 
-Migrating from legacy static-website generator to dynamic app builder. See [ROADMAP.md](docs/ROADMAP.md) — **Phase 1** in progress.
+[architecture.md](docs/architecture.md) records the durable product direction and safety
+constraints. Implementation details evolve through small, verified changes instead of a fixed
+end-to-end sequence. See [AGENTS.md](AGENTS.md) for contribution and review scope.

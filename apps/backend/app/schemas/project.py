@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.project import ProjectStatus
+
 
 class ProjectCreate(BaseModel):
     """Each home submission creates a distinct project row."""
@@ -19,6 +21,6 @@ class ProjectOut(BaseModel):
     name: str
     description: str | None = None
     prompt: str | None = None
-    status: str
+    status: ProjectStatus
     created_at: datetime
     updated_at: datetime

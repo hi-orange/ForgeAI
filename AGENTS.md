@@ -2,32 +2,51 @@
 
 ## Product
 
-**ForgeAI = conversational full-stack app builder** (FastAPI + Vue + SQLite).
+**ForgeAI is a conversational full-stack app builder.**
 
-User talks → runnable app → keeps talking to refine. Not a static website generator.
+The user describes an app, receives a runnable application, and keeps talking to refine it.
+Generated applications currently target FastAPI, Vue, and SQLite.
 
-## Document priority
+## Document responsibilities
 
-Read in this order. **On conflict, higher wins:**
+Read in this order when the files are relevant. On conflict, the higher item wins:
 
-1. [docs/architecture.md](docs/architecture.md) — system design (single source of truth)
-2. [AGENTS.md](AGENTS.md) — this file (direction + rules)
-3. [.agents/skills/forgeai-architecture/reference.md](.agents/skills/forgeai-architecture/reference.md) — artifact schemas
-4. [.agents/skills/forgeai-architecture/SKILL.md](.agents/skills/forgeai-architecture/SKILL.md) — how to implement
-5. [docs/ROADMAP.md](docs/ROADMAP.md) — what phase we are in
+1. [docs/architecture.md](docs/architecture.md) — durable product direction and invariants
+2. [AGENTS.md](AGENTS.md) — repository-wide working rules
+3. [.agents/skills/forgeai-architecture/reference.md](.agents/skills/forgeai-architecture/reference.md) — artifact meanings and compatibility rules
+4. [.agents/skills/forgeai-architecture/SKILL.md](.agents/skills/forgeai-architecture/SKILL.md) — implementation guidance
 
-Package guides: [apps/backend/AGENTS.md](apps/backend/AGENTS.md) · [apps/frontend/AGENTS.md](apps/frontend/AGENTS.md)
+The runtime models, migrations, and tests are the source of truth for current field names and
+implementation details. Package-specific rules live in
+[apps/backend/AGENTS.md](apps/backend/AGENTS.md) and
+[apps/frontend/AGENTS.md](apps/frontend/AGENTS.md).
 
-## Hard rules
+## Working rules
 
-- Artifacts: `app_spec` → `system_design` → `code` → `test_report`
-- User changes: PM updates spec first, then cascade (never Dev-only for features)
-- New builds use `POST /build-runs`, not legacy static `/build`
-- Dev owns generate/update/repair; QA only reports issues
-- Check ROADMAP phase before coding — do not skip ahead
+- Implement only the current user-approved, coherent change. Do not prebuild a speculative sequence
+  of future work.
+- Reuse existing modules and conventions before adding new abstractions.
+- Preserve run traceability, stable inputs during execution, recoverable revisions, ownership
+  boundaries, and isolation of generated code.
+- A user-visible behavior change must be represented in product intent before derived design and
+  code claim to implement it.
+- Treat architecture as stable constraints, not as a script that fixes routes, stages, agent count,
+  retry budgets, or file layout forever.
+- Preserve unrelated local changes.
 
-## Before merging
+## Review and verification
 
-- [ ] Matches [architecture.md](docs/architecture.md)?
-- [ ] Reuses existing modules?
-- [ ] Backend lint + typecheck + tests pass?
+- Start with the current diff or the files changed for the task.
+- Trace direct impact through callers, imports, API consumers, schemas and shared types, database
+  migrations, security boundaries, concurrency behavior, and related tests.
+- Expand to a wider review only when the change is cross-cutting, affects a public contract or
+  shared primitive, changes persistent data, touches security or concurrency, or reveals evidence
+  of a broader problem.
+- Run targeted checks first. Add package-level or repository-level checks when the impact warrants
+  them, and report checks that were not run.
+
+## Before finishing
+
+- [ ] The result matches the requested scope and architecture invariants.
+- [ ] Direct consumers and affected contracts were considered.
+- [ ] Relevant checks pass, or remaining failures and untested areas are stated clearly.
