@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, NotFoundException
 from app.models.project import Project, ProjectStatus
+from app.models.project_message import ProjectMessage, ProjectMessageSender
 from app.models.user import User
 from app.schemas.project import ProjectCreate
 
@@ -26,6 +27,16 @@ def create_project(db: Session, user: User, payload: ProjectCreate) -> Project:
         status=ProjectStatus.DRAFT.value,
     )
     db.add(project)
+    db.flush()
+    db.add(
+        ProjectMessage(
+            project_id=project.id,
+            sequence=1,
+            sender=ProjectMessageSender.USER.value,
+            content=prompt,
+            client_message_id=f"project:{project.id}:initial",
+        )
+    )
     db.commit()
     db.refresh(project)
     return project
