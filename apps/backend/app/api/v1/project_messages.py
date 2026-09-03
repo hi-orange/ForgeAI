@@ -4,7 +4,9 @@ from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentUser, DbSession
 from app.schemas.project_message import ProjectMessageCreate, ProjectMessageOut
+from app.schemas.project_message_classification import ProjectMessageClassificationOut
 from app.schemas.response import ApiResponse, success
+from app.services import project_manager as project_manager_service
 from app.services import project_message as project_message_service
 
 router = APIRouter(prefix="/projects/{project_id}/messages", tags=["project-messages"])
@@ -42,3 +44,41 @@ def list_project_messages(
         limit=limit,
     )
     return success([ProjectMessageOut.model_validate(message) for message in messages])
+
+
+@router.post(
+    "/{message_id}/classification",
+    response_model=ApiResponse[ProjectMessageClassificationOut],
+)
+def classify_project_message(
+    project_id: int,
+    message_id: int,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    classification = project_manager_service.classify_user_message(
+        db,
+        current_user,
+        project_id,
+        message_id,
+    )
+    return success(ProjectMessageClassificationOut.model_validate(classification))
+
+
+@router.get(
+    "/{message_id}/classification",
+    response_model=ApiResponse[ProjectMessageClassificationOut],
+)
+def get_project_message_classification(
+    project_id: int,
+    message_id: int,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    classification = project_manager_service.get_user_message_classification(
+        db,
+        current_user,
+        project_id,
+        message_id,
+    )
+    return success(ProjectMessageClassificationOut.model_validate(classification))

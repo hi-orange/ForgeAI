@@ -31,7 +31,7 @@ def chat_completion(
     json_output: bool = False,
 ) -> str:
     if not settings.deepseek_api_key:
-        raise BusinessException("未配置 DEEPSEEK_API_KEY，无法调用 Product Manager Agent")
+        raise BusinessException("未配置 DEEPSEEK_API_KEY，无法调用大模型")
 
     url = f"{settings.deepseek_base_url.rstrip('/')}/v1/chat/completions"
     headers = {
