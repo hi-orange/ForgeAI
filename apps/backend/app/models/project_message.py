@@ -43,21 +43,42 @@ class ProjectMessage(Base):
             "client_message_id",
             name="uq_project_message_project_client_message_id",
         ),
+        {"comment": "项目内用户可见的对话消息"},
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+        autoincrement=True,
+        comment="内部自增主键",
+    )
     project_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("project.id", ondelete="CASCADE"),
         nullable=False,
+        comment="所属项目 ID",
     )
-    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
-    sender: Mapped[str] = mapped_column(String(16), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    client_message_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    sequence: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="项目内从 1 递增的对话序号，用于排序与增量拉取",
+    )
+    sender: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="发送方：user 或 assistant",
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False, comment="消息正文")
+    client_message_id: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        comment="前端幂等键；同项目内唯一，防止重试重复写入",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=func.now(),
         server_default=func.now(),
         nullable=False,
+        comment="创建时间",
     )

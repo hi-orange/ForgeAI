@@ -77,34 +77,57 @@ class BuildRun(Base):
         UniqueConstraint("project_id", "active_slot", name="uq_build_run_project_active_slot"),
         UniqueConstraint("run_id", name="uq_build_run_run_id"),
         Index("ix_build_run_project_status", "project_id", "status"),
+        {"comment": "一次构建任务工单"},
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+        autoincrement=True,
+        comment="内部自增主键；对外请用 run_id",
+    )
     project_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("project.id", ondelete="CASCADE"),
         nullable=False,
+        comment="所属项目 ID",
     )
-    run_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        comment="对外任务标识，形如 run_<uuid>",
+    )
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default=BuildRunStatus.QUEUED.value,
         server_default=BuildRunStatus.QUEUED.value,
+        comment="queued/running/succeeded/failed",
     )
-    stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stage: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="running 时的当前阶段；queued 时为空",
+    )
+    error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="失败时的错误信息",
+    )
     active_slot: Mapped[int | None] = mapped_column(
         SmallInteger,
         nullable=True,
         default=1,
         server_default="1",
+        comment="占用项目构建名额时为 1；终态为 NULL",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=func.now(),
         server_default=func.now(),
         nullable=False,
+        comment="创建时间",
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -112,4 +135,5 @@ class BuildRun(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+        comment="最后更新时间",
     )
