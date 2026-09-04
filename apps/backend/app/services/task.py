@@ -7,6 +7,7 @@ from app.models.configuration_item import ConfigurationItemType
 from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
 from app.models.task import Task, TaskRecipient, TaskStatus
+from app.models.task_result import TaskResult
 from app.models.user import User
 from app.services import plan as plan_service
 from app.services import project as project_service
@@ -31,6 +32,16 @@ def get_user_task(db: Session, user: User, project_id: int, task_id: str) -> Tas
     if task is None:
         raise NotFoundException("任务不存在")
     return task
+
+
+def get_user_task_result(db: Session, user: User, project_id: int, task_id: str) -> TaskResult:
+    """读取任务已经登记的产出关联；不查找模糊的最新成果。"""
+
+    get_user_task(db, user, project_id, task_id)
+    result = db.get(TaskResult, task_id)
+    if result is None:
+        raise NotFoundException("任务尚未登记产出")
+    return result
 
 
 def claim_product_manager_task(

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,13 +34,14 @@ def _lock_project(db: Session, project_id: int) -> Project:
     return project
 
 
-def _get_build_run(db: Session, project_id: int, run_id: str) -> BuildRun:
-    build_run = db.scalar(
-        select(BuildRun).where(
-            BuildRun.project_id == project_id,
-            BuildRun.run_id == run_id,
-        )
+def _get_build_run(db: Session, project_id: int, run_id: str, *, lock: bool = False) -> BuildRun:
+    statement = select(BuildRun).where(
+        BuildRun.project_id == project_id,
+        BuildRun.run_id == run_id,
     )
+    if lock:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    build_run = db.scalar(statement)
     if build_run is None:
         raise NotFoundException("构建任务不存在")
     return build_run
@@ -72,10 +73,13 @@ def _load_upstream_items(
 
     items = list(
         db.scalars(
-            select(ConfigurationItem).where(
+            select(ConfigurationItem)
+            .where(
                 ConfigurationItem.project_id == project_id,
                 ConfigurationItem.item_id.in_(item_ids),
             )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         ).all()
     )
     items_by_id = {item.item_id: item for item in items}
@@ -124,13 +128,18 @@ def _next_version(
     project_id: int,
     semantic_type: ConfigurationItemType,
 ) -> int:
+    # 已持有项目锁；用当前读取避开 MySQL 可重复读事务里的旧版本快照。
     value = db.scalar(
-        select(func.coalesce(func.max(ConfigurationItem.version), 0) + 1).where(
+        select(ConfigurationItem.version)
+        .where(
             ConfigurationItem.project_id == project_id,
             ConfigurationItem.semantic_type == semantic_type.value,
         )
+        .order_by(ConfigurationItem.version.desc())
+        .limit(1)
+        .with_for_update()
     )
-    return int(value or 1)
+    return int(value or 0) + 1
 
 
 def _unusable_reason(
@@ -157,17 +166,21 @@ def _unusable_reason(
     return ";".join(reasons) or None
 
 
-def register_configuration_item(
+def stage_configuration_item(
     db: Session,
     *,
     project_id: int,
     producer_run_id: str,
     submission: ConfigurationItemRegistration,
 ) -> ConfigurationItem:
-    """校验并登记一个新版本；旧运行的晚到结果只会以 unusable 状态留档。"""
+    """在调用方事务中校验并写入新版本，但不提交、不回滚。
+
+    调用方必须负责事务结束；晚到结果仍只写为 unusable，不绕过既有成果规则。
+    """
 
     _lock_project(db, project_id)
-    build_run = _get_build_run(db, project_id, producer_run_id)
+    submission = ConfigurationItemRegistration.model_validate(submission.model_dump())
+    build_run = _get_build_run(db, project_id, producer_run_id, lock=True)
     upstream_items = _load_upstream_items(db, project_id, submission.upstream_item_ids)
     _validate_upstream_types(submission.semantic_type, upstream_items)
     payload, content_hash = _normalize_payload(submission.payload)
@@ -192,11 +205,30 @@ def register_configuration_item(
         unusable_at=datetime.now(UTC).replace(tzinfo=None) if unusable_reason else None,
     )
     db.add(item)
+    db.flush()
+    return item
+
+
+def register_configuration_item(
+    db: Session,
+    *,
+    project_id: int,
+    producer_run_id: str,
+    submission: ConfigurationItemRegistration,
+) -> ConfigurationItem:
+    """独立登记并提交；保留现有调用方的行为。"""
+
     try:
+        item = stage_configuration_item(
+            db, project_id=project_id, producer_run_id=producer_run_id, submission=submission
+        )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         raise ConflictException("ConfigurationItem 版本登记冲突，请重试") from exc
+    except Exception:
+        db.rollback()
+        raise
 
     db.refresh(item)
     return item
