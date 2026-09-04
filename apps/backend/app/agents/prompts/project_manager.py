@@ -1,5 +1,15 @@
 MESSAGE_CLASSIFICATION_PROMPT_VERSION = "project_message_classification_v1"
 
+# 第一张任务单只交代整理需求的职责，不预设应用页面、数据表或代码框架。
+INITIAL_REQUIREMENTS_TASK_INSTRUCTIONS = """
+读取本计划 cause_message_id 指向的用户消息，整理用户希望构建的应用需求。
+如需参考历史对话，只读取该消息所在项目中、序号不大于该消息的对话；不要使用之后的新消息，
+也不要用项目当前的名称、简介或初始 prompt 替代这条需求消息。
+输出 app_spec，说明应用目标、用户可见功能、数据需求、界面要求、约束和验收条件。
+具体内容以用户需求为准；信息不足时列出待确认问题，不擅自补充产品要求。
+这项任务只整理需求，不生成技术方案或代码。
+""".strip()
+
 MESSAGE_CLASSIFICATION_SYSTEM_PROMPT = """
 你是 ForgeAI 的 ProjectManager。本次只判断“待分类消息”的业务类别，不执行任务、不回答用户，
 也不修改项目、计划或 BuildRun。
