@@ -88,14 +88,14 @@ def _validate_inputs(db: Session, project_id: int, payload: PlanCreate) -> None:
         raise ConflictException("Task 输入不能引用 unusable 的 ConfigurationItem")
 
 
-def save_plan(
+def stage_plan(
     db: Session,
     user: User,
     project_id: int,
     run_id: str,
     payload: PlanCreate,
 ) -> Plan:
-    """原子保存 Plan 和全部 Task；同一运行同一版本幂等，不启动任务或切换当前计划。"""
+    """在调用方事务中写入整份计划，调用方负责提交和回滚。"""
 
     project_service.get_user_project(db, user, project_id)
     # 调用方可能修改已校验对象中的 list；落库前再验证一次并复制输入。
@@ -131,22 +131,45 @@ def save_plan(
         )
         for position, task in enumerate(payload.tasks, start=1)
     ]
+    _lock_project(db, project_id)
+    existing = _find_version(db, project_id, run_id, payload.version, lock=True)
+    if existing is not None:
+        return _replay(existing, definition_hash)
+    _validate_source(db, project_id, run_id, payload.cause_message_id)
+    _validate_inputs(db, project_id, payload)
+    db.add(plan)
+    db.flush()
+    db.add_all(tasks)
+    db.flush()
+    return plan
+
+
+def save_plan(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    payload: PlanCreate,
+) -> Plan:
+    """独立提交 Plan 和全部 Task；同一运行同一版本幂等。"""
+
+    project_service.get_user_project(db, user, project_id)
+    payload = PlanCreate.model_validate(payload.model_dump())
+    existing = _find_version(db, project_id, run_id, payload.version)
+    if existing is not None:
+        canonical = json.dumps(payload.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+        return _replay(existing, hashlib.sha256(canonical.encode("utf-8")).hexdigest())
     try:
-        _lock_project(db, project_id)
-        existing = _find_version(db, project_id, run_id, payload.version, lock=True)
-        if existing is not None:
-            return _replay(existing, definition_hash)
-        _validate_source(db, project_id, run_id, payload.cause_message_id)
-        _validate_inputs(db, project_id, payload)
-        db.add(plan)
-        # 不配置会隐式写入数据的 ORM 级联；先插入父表，全部任务仍处于同一事务。
-        db.flush()
-        db.add_all(tasks)
+        plan = stage_plan(db, user, project_id, run_id, payload)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         existing = _find_version(db, project_id, run_id, payload.version)
         if existing is not None:
+            canonical = json.dumps(
+                payload.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+            )
+            definition_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
             return _replay(existing, definition_hash)
         raise ConflictException("Plan / Task 保存冲突，请重试") from exc
     except Exception:

@@ -19,6 +19,7 @@ from app.models.configuration_item import (
 from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
 from app.models.project_message import ProjectMessage, ProjectMessageSender
+from app.models.requirement_clarification import RequirementClarification
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_result import TaskResult
 from app.models.user import User
@@ -30,8 +31,9 @@ from app.schemas.product_manager import (
     ProductManagerResult,
     RequirementMessage,
 )
-from app.services import configuration_manager
+from app.services import configuration_manager, task_execution
 from app.services import project as project_service
+from app.services.requirement_inputs import load_previous_app_spec
 
 
 def _load_task(
@@ -74,9 +76,9 @@ def _require_running_task(task: Task, plan: Plan, run: BuildRun, message: Projec
         task.recipient != TaskRecipient.PRODUCT_MANAGER.value
         or task.expected_output_type != ConfigurationItemType.APP_SPEC.value
         or task.depends_on_task_ids
-        or task.input_configuration_item_ids
+        or len(task.input_configuration_item_ids) > 1
     ):
-        raise BusinessException("当前只支持无上游输入的 ProductManager / app_spec 任务")
+        raise BusinessException("当前只支持无任务依赖、最多一个原需求输入的 ProductManager 任务")
     if message.sender != ProjectMessageSender.USER.value:
         raise BusinessException("需求任务必须引用原始用户消息")
 
@@ -92,6 +94,17 @@ def _load_running_task(
 def _prepare_input(
     db: Session, task: Task, message: ProjectMessage, *, lock: bool = False
 ) -> ProductManagerInput:
+    previous = load_previous_app_spec(db, task, lock=lock)
+    if previous is not None:
+        # 补充任务只读准确的原文档和本次回答，不混入两者之间的其他对话。
+        return ProductManagerInput(
+            task_instructions=task.instructions,
+            source_message=RequirementMessage.model_validate(message),
+            recent_messages=[],
+            context_truncated=False,
+            previous_app_spec=previous,
+            previous_item_id=task.input_configuration_item_ids[0],
+        )
     statement = (
         select(ProjectMessage)
         .where(
@@ -127,6 +140,8 @@ def generate_task_app_spec(
     project_id: int,
     run_id: str,
     task_id: str,
+    *,
+    execution_id: str | None = None,
 ) -> ProductManagerResult:
     """读取已领取任务，返回有来源的 app_spec 草稿；不领取、登记成果或完成任务。
 
@@ -138,8 +153,10 @@ def generate_task_app_spec(
     try:
         with Session(bind=db.get_bind(), autoflush=False) as reader:
             task, plan, message = _load_running_task(reader, user, project_id, run_id, task_id)
+            task_execution.require_execution(reader, task_id, execution_id)
             payload = _prepare_input(reader, task, message)
             plan_id, cause_message_id = plan.plan_id, plan.cause_message_id
+            input_item_ids = list(task.input_configuration_item_ids)
     except ValidationError as exc:
         raise BusinessException("ProductManager 需求输入不符合要求") from exc
 
@@ -150,6 +167,7 @@ def generate_task_app_spec(
     # 这里只拒绝已经失去资格的草稿；真正发布时还需要 ConfigurationManager 的事务检查。
     with Session(bind=db.get_bind(), autoflush=False) as reader:
         _load_running_task(reader, user, project_id, run_id, task_id)
+        task_execution.require_execution(reader, task_id, execution_id)
     return ProductManagerResult(
         project_id=project_id,
         build_run_id=run_id,
@@ -162,6 +180,8 @@ def generate_task_app_spec(
         model=model,
         prompt_version=APP_SPEC_PROMPT_VERSION,
         app_spec=app_spec,
+        input_configuration_item_ids=input_item_ids,
+        execution_id=execution_id,
     )
 
 
@@ -186,9 +206,11 @@ def complete_task_app_spec(
         raise BusinessException("ProductManager 提交结果不符合要求") from exc
     if (result.project_id, result.build_run_id, result.task_id) != (project_id, run_id, task_id):
         raise BusinessException("提交结果不属于指定的项目、构建或任务")
-    canonical = json.dumps(
-        result.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    content = result.model_dump(mode="json", exclude={"execution_id"})
+    if not result.input_configuration_item_ids:
+        # 保持迁移前初始结果的哈希不变。
+        content.pop("input_configuration_item_ids")
+    canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     result_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     try:
@@ -211,6 +233,11 @@ def complete_task_app_spec(
         task, plan, run, message = _load_task(db, user, project_id, run_id, task_id, lock=True)
         if result.plan_id != plan.plan_id or result.cause_message_id != plan.cause_message_id:
             raise BusinessException("提交结果与任务的原计划或原需求不一致")
+        if result.input_configuration_item_ids != task.input_configuration_item_ids:
+            raise BusinessException("提交结果与任务的原需求版本不一致")
+        execution = task_execution.latest_execution(db, task_id, lock=True)
+        if execution is not None and execution.execution_id != result.execution_id:
+            raise ConflictException("执行编号已失效，不能提交旧执行的结果")
 
         saved = db.scalar(
             select(TaskResult)
@@ -237,6 +264,9 @@ def complete_task_app_spec(
             # 重放只返回原成果，即使运行已结束、成果后来不可用，也不重置任何状态。
         else:
             _require_running_task(task, plan, run, message)
+            execution = task_execution.require_execution(
+                db, task_id, result.execution_id, lock=True
+            )
             other_running_plan = db.scalar(
                 select(Plan.plan_id)
                 .where(
@@ -265,7 +295,7 @@ def complete_task_app_spec(
                     semantic_type=ConfigurationItemType.APP_SPEC,
                     schema_version=result.schema_version,
                     payload=result.app_spec.model_dump(mode="json"),
-                    upstream_item_ids=[],
+                    upstream_item_ids=list(result.input_configuration_item_ids),
                 ),
             )
             if item.state != ConfigurationItemState.USABLE.value:
@@ -282,6 +312,14 @@ def complete_task_app_spec(
                 )
             )
             task.status = TaskStatus.SUCCEEDED.value
+            if execution is not None:
+                execution.status = "succeeded"
+                execution.active_slot = None
+                execution.finished_at = task_execution.utc_now()
+            if result.app_spec.open_questions:
+                db.add(
+                    RequirementClarification(configuration_item_id=item.item_id, task_id=task_id)
+                )
             db.flush()
             statuses = list(
                 db.scalars(

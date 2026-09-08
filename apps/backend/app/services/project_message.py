@@ -3,12 +3,54 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictException
+from app.models.project import Project
 from app.models.project_message import ProjectMessage, ProjectMessageSender
 from app.models.user import User
 from app.schemas.project_message import ProjectMessageCreate
 from app.services import project as project_service
 
 MAX_SEQUENCE_RETRIES = 5
+
+
+def stage_user_project_message(
+    db: Session,
+    user: User,
+    project_id: int,
+    payload: ProjectMessageCreate,
+) -> ProjectMessage:
+    """在调用方事务内追加消息；供回答与新计划一起原子提交。"""
+
+    project_service.get_user_project(db, user, project_id)
+    payload = ProjectMessageCreate.model_validate(payload.model_dump())
+    db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    existing = db.scalar(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.client_message_id == payload.client_message_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if existing is not None:
+        return _validate_idempotent_replay(existing, payload.content)
+    last = db.scalar(
+        select(ProjectMessage.sequence)
+        .where(ProjectMessage.project_id == project_id)
+        .order_by(ProjectMessage.sequence.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    message = ProjectMessage(
+        project_id=project_id,
+        sequence=(last or 0) + 1,
+        sender="user",
+        content=payload.content,
+        client_message_id=payload.client_message_id,
+    )
+    db.add(message)
+    db.flush()
+    return message
 
 
 def _find_by_client_message_id(

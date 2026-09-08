@@ -292,7 +292,7 @@ class TaskClaimTests(unittest.TestCase):
                 with self.subTest(upstream_status=status):
                     upstream.status = status
                     db.commit()
-                    with self.assertRaisesRegex(BusinessException, "无上游任务"):
+                    with self.assertRaisesRegex(BusinessException, "无任务依赖"):
                         self._claim(db, task_id=dependent.task_id)
                     self.assertEqual(db.get(Task, dependent.id).status, "pending")
                     self._assert_states()
@@ -315,7 +315,7 @@ class TaskClaimTests(unittest.TestCase):
                 db, tasks=[self._task_definition(input_configuration_item_ids=[item.item_id])]
             )
             task = self._tasks(db, plan)[0]
-            with self.assertRaisesRegex(BusinessException, "无成果输入"):
+            with self.assertRaisesRegex(BusinessException, "关联不正确"):
                 self._claim(db, task_id=task.task_id)
             self.assertEqual(db.get(Task, task.id).input_configuration_item_ids, [item.item_id])
             self._assert_states()

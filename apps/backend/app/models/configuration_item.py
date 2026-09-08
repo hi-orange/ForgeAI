@@ -180,8 +180,13 @@ def _guard_configuration_item_update(
     _connection: object,
     target: ConfigurationItem,
 ) -> None:
-    """正文不可覆盖，生命周期只能从 usable 单向变为 unusable。"""
+    """在 ORM UPDATE 发出前拦截非法变更。
 
+    已登记成果的身份与正文（见 _IMMUTABLE_FIELDS）不可原地覆盖，需要新版本；
+    允许的唯一生命周期变更是 usable → unusable，且必须同时写入原因与时间。
+    """
+
+    # inspect 拿到各字段相对加载时的变更历史；这里的 state 不是业务字段 target.state。
     state = sqlalchemy_inspect(target)
     changed_content = [
         field_name
@@ -191,10 +196,12 @@ def _guard_configuration_item_update(
     if changed_content:
         raise ValueError("已登记的 ConfigurationItem 内容不可修改；请创建新版本")
 
+    # 生命周期三件套都没动则放行（内容已在上面拦过）。
     lifecycle_fields = ("state", "unusable_reason", "unusable_at")
     if not any(state.attrs[field_name].history.has_changes() for field_name in lifecycle_fields):
         return
 
+    # history.deleted 是改之前的旧值；有变动则只许 usable→unusable 且原因、时间齐全。
     state_history = state.attrs.state.history
     previous_state = state_history.deleted[0] if state_history.deleted else None
     if (

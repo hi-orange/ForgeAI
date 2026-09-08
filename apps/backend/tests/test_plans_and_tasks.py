@@ -23,6 +23,7 @@ from app.models.configuration_item import ConfigurationItem, ConfigurationItemTy
 from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
 from app.models.project_message import ProjectMessage
+from app.models.requirement_clarification import RequirementClarification
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.user import User
 from app.schemas.plan import PlanCreate, PlanOut
@@ -566,10 +567,12 @@ class PlanTaskTests(unittest.TestCase):
         self.assertEqual(migration.down_revision, "7c1f3e9a4d2b")
         # 只移除新增空表，保留夹具中的现有用户、项目、消息和正式成果。
         with self.engine.begin() as connection:
+            RequirementClarification.__table__.drop(connection)
             Task.__table__.drop(connection)
             Plan.__table__.drop(connection)
             migration.op = Operations(MigrationContext.configure(connection))
             migration.upgrade()
+            RequirementClarification.__table__.create(connection)
             self.assertEqual(
                 compare_metadata(MigrationContext.configure(connection), Base.metadata), []
             )
@@ -578,6 +581,7 @@ class PlanTaskTests(unittest.TestCase):
             self.assertEqual(self._tasks(db, plan.plan_id)[0].status, "pending")
         with self.engine.begin() as connection:
             migration.op = Operations(MigrationContext.configure(connection))
+            RequirementClarification.__table__.drop(connection)
             migration.downgrade()
             self.assertNotIn("plan", inspect(connection).get_table_names())
             self.assertNotIn("task", inspect(connection).get_table_names())
@@ -586,6 +590,7 @@ class PlanTaskTests(unittest.TestCase):
                 connection.scalar(select(func.count()).select_from(ConfigurationItem)), 3
             )
             migration.upgrade()
+            RequirementClarification.__table__.create(connection)
             self.assertEqual(
                 compare_metadata(MigrationContext.configure(connection), Base.metadata), []
             )

@@ -41,3 +41,15 @@ MESSAGE_CLASSIFICATION_SYSTEM_PROMPT = """
 只返回一个 JSON 对象，不要使用 Markdown：
 {"category":"inquiry|stop|product_change|implementation_repair","decision_summary":"一句简短依据"}
 """.strip()
+CLARIFICATION_TASK_INSTRUCTIONS = (
+    "根据任务明确引用的原 app_spec 和本计划 cause_message_id 对应的用户补充回答，"
+    "整理一份完整的新 app_spec。保留未被修改的要求，只消除已得到明确回答的问题；"
+    "仍有歧义则继续列出 open_questions。不要使用更新的消息或自动选择最新成果。"
+)
+
+DESIGN_TASK_INSTRUCTIONS = (
+    "根据任务 input_configuration_item_ids 明确引用的 app_spec 制定 system_design，"
+    "说明实现该需求所需的技术方案、模块职责、数据和接口设计。"
+    "保留原需求的权限边界、约束和验收要求，不擅自新增业务功能。"
+    "不得改用最新成果或后来的消息，不修改原需求，不生成应用代码。"
+)

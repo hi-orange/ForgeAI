@@ -11,6 +11,7 @@ from app.models.task_result import TaskResult
 from app.models.user import User
 from app.services import plan as plan_service
 from app.services import project as project_service
+from app.services.requirement_inputs import load_previous_app_spec
 
 
 def list_user_plan_tasks(db: Session, user: User, project_id: int, plan_id: str) -> list[Task]:
@@ -51,9 +52,9 @@ def claim_product_manager_task(
     run_id: str,
     task_id: str,
 ) -> Task:
-    """领取指定的初始需求任务，不执行模型，也不重放已领取的任务。
+    """领取指定的初始或补充需求任务，不执行模型，也不重放已领取的任务。
 
-    当前仅支持无上游任务、无成果输入的 ProductManager / app_spec 任务。
+    补充任务必须明确关联原 app_spec 和用户回答。
     返回的 Task 仍通过原 plan_id 引用 Plan.cause_message_id，不另选最新需求。
     本入口提交领取事务；崩溃后的重新派发与执行恢复不在本步处理。
     """
@@ -119,8 +120,7 @@ def claim_product_manager_task(
             raise ConflictException("任务已被领取或已结束，不能重复领取")
         if plan.status not in (PlanStatus.PENDING.value, PlanStatus.RUNNING.value):
             raise ConflictException("计划已结束，不能领取其中的任务")
-        if task.depends_on_task_ids or task.input_configuration_item_ids:
-            raise BusinessException("当前只支持领取无上游任务、无成果输入的初始需求任务")
+        load_previous_app_spec(db, task, lock=True)
 
         other_running_plan = db.scalar(
             select(Plan.plan_id)

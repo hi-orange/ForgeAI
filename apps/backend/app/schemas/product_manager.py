@@ -32,9 +32,13 @@ class ProductManagerInput(BaseModel):
     source_message: RequirementMessage
     recent_messages: list[RequirementMessage] = Field(max_length=MAX_HISTORY_MESSAGES)
     context_truncated: bool
+    previous_app_spec: AppSpec | None = None
+    previous_item_id: str | None = Field(default=None, min_length=1, max_length=40)
 
     @model_validator(mode="after")
     def validate_message_window(self) -> Self:
+        if (self.previous_app_spec is None) != (self.previous_item_id is None):
+            raise ValueError("原需求正文和成果编号必须同时提供")
         if self.source_message.sender != "user":
             raise ValueError("触发需求必须来自用户")
         ids = [message.id for message in self.recent_messages] + [self.source_message.id]
@@ -74,6 +78,8 @@ class ProductManagerResult(BaseModel):
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)
     ]
     app_spec: AppSpec
+    input_configuration_item_ids: list[str] = Field(default_factory=list, max_length=1)
+    execution_id: str | None = Field(default=None, min_length=1, max_length=40)
 
     @model_validator(mode="after")
     def validate_source_ids(self) -> Self:
