@@ -2,7 +2,8 @@
   <div
     class="workbench"
     :class="{
-      'atoms-mode': generatedFiles,
+      'atoms-mode': true,
+      'has-generated': Boolean(generatedFiles),
       'design-mode': designMode,
       'chat-collapsed': chatCollapsed,
     }"
@@ -67,28 +68,48 @@
 
           <div v-if="showPlanCard && !generatedFiles" class="plan-card">
             <p class="plan-intro">
-              请从这些核心功能和页面设计中，选择您希望优先实现或进一步讨论的部分。
+              我整理好了这次构建的内容。勾选要实现的部分，也可以直接编辑或新增。
             </p>
+            <label v-if="editingPlan" class="plan-goal-editor">
+              <span>项目目标</span>
+              <input v-model="planGoal" type="text" maxlength="2000" />
+            </label>
             <ul class="plan-list">
-              <li v-for="item in planItems" :key="item.id">
+              <li v-for="(item, index) in planItems" :key="item.id">
                 <label>
                   <input
                     v-model="item.checked"
                     type="checkbox"
                     :disabled="planApproved || approving"
                   />
-                  <span>{{ item.label }}</span>
+                  <span v-if="!editingPlan">{{ index + 1 }}. {{ item.label }}</span>
+                  <input
+                    v-else
+                    v-model="item.label"
+                    class="plan-item-editor"
+                    type="text"
+                    maxlength="2000"
+                  />
                 </label>
               </li>
             </ul>
+            <form class="add-requirement" @submit.prevent="addRequirement">
+              <input
+                v-model="newRequirement"
+                type="text"
+                maxlength="2000"
+                placeholder="＋ 新增一项需求…"
+              />
+              <button type="submit" :disabled="!newRequirement.trim()">添加</button>
+            </form>
             <div class="plan-actions">
               <button
                 type="button"
                 class="btn ghost"
                 :disabled="planApproved || approving"
-                @click="resetPlan"
+                @click="editingPlan = !editingPlan"
               >
-                调整计划
+                {{ editingPlan ? '完成编辑' : '编辑计划' }}
               </button>
               <button
                 type="button"
@@ -428,6 +449,9 @@ const followUp = ref('')
 const planApproved = ref(false)
 const approveError = ref<string | null>(null)
 const planItems = reactive<PlanItem[]>([])
+const editingPlan = ref(false)
+const newRequirement = ref('')
+const planGoal = ref('')
 const previewMode = ref<PreviewMode>('desktop')
 const workspaceView = ref<WorkspaceView>('viewer')
 const chatCollapsed = ref(false)
@@ -1145,6 +1169,9 @@ function extractPlanItems(prd: string): PlanItem[] {
 
 function rebuildPlan(prd: string | null | undefined) {
   planItems.splice(0, planItems.length, ...extractPlanItems(prd || ''))
+  planGoal.value = websiteSpec.value?.product.summary || project.value?.prompt || ''
+  editingPlan.value = false
+  newRequirement.value = ''
   planApproved.value = project.value?.status === 'spec_approved'
   approveError.value = null
 }
@@ -1154,6 +1181,19 @@ function resetPlan() {
     item.checked = true
   })
   planApproved.value = false
+}
+
+function addRequirement() {
+  const label = newRequirement.value.trim()
+  if (!label || planItems.length >= 20) return
+  planItems.push({
+    id: `custom-${Date.now()}`,
+    pageId: null,
+    sectionId: null,
+    label,
+    checked: true,
+  })
+  newRequirement.value = ''
 }
 
 async function approvePlan() {

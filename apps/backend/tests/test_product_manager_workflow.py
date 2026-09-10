@@ -30,13 +30,61 @@ def valid_spec(*, open_questions: list[str] | None = None) -> dict[str, object]:
     return {
         "goal": "让用户记录自己的阅读进度",
         "target_users": ["个人用户"],
-        "features": ["新增和查看读书记录", "导出自己的记录"],
-        "data_requirements": ["书名", "阅读状态"],
-        "interface_requirements": ["提供读书记录列表"],
-        "constraints": ["数据仅本人可见"],
-        "acceptance_criteria": ["用户可以新增记录并在列表中看到它"],
+        "features": [
+            {"id": "feat_records", "text": "新增和查看读书记录"},
+            {"id": "feat_export", "text": "导出自己的记录"},
+        ],
+        "data_requirements": [
+            {"id": "data_title", "text": "书名"},
+            {"id": "data_status", "text": "阅读状态"},
+        ],
+        "interface_requirements": [
+            {"id": "ui_list", "text": "提供读书记录列表"},
+        ],
+        "constraints": [
+            {"id": "con_private", "text": "数据仅本人可见"},
+        ],
+        "acceptance_criteria": [
+            {
+                "id": "ac_add",
+                "text": "用户可以新增记录并在列表中看到它",
+                "source_ids": ["feat_records"],
+            },
+            {
+                "id": "ac_export",
+                "text": "导出后下载的文件包含用户已有的全部图书记录",
+                "source_ids": ["feat_export"],
+            },
+        ],
         "open_questions": open_questions or [],
     }
+
+
+def approval_payload(spec: dict[str, object] | None = None, **overrides) -> dict[str, object]:
+    spec = spec or valid_spec()
+    selected = [
+        {"id": item["id"], "text": item["text"], "kind": "feature"}
+        for item in spec["features"]  # type: ignore[index]
+    ]
+    selected.extend(
+        {"id": item["id"], "text": item["text"], "kind": "data"}
+        for item in spec["data_requirements"]  # type: ignore[index]
+    )
+    selected.extend(
+        {"id": item["id"], "text": item["text"], "kind": "interface"}
+        for item in spec["interface_requirements"]  # type: ignore[index]
+    )
+    selected.extend(
+        {"id": item["id"], "text": item["text"], "kind": "constraint"}
+        for item in spec["constraints"]  # type: ignore[index]
+    )
+    payload = {
+        "client_message_id": "test-approval",
+        "goal": spec["goal"],
+        "selected": selected,
+    }
+    payload.update(overrides)
+    return payload
 
 
 class ProductManagerWorkflowFixture(unittest.TestCase):
@@ -162,13 +210,13 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
 
 
 class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
-    def test_runs_full_graph_and_returns_ready_for_design(self):
+    def test_runs_requirements_graph_and_waits_for_approval(self):
         result = self._run()
 
         self.assertEqual(result.project_id, self.project.id)
         self.assertEqual(result.build_run_id, self.run.run_id)
         self.assertEqual(result.cause_message_id, self.message.id)
-        self.assertEqual(result.outcome, ProductManagerWorkflowOutcome.READY_FOR_DESIGN)
+        self.assertEqual(result.outcome, ProductManagerWorkflowOutcome.AWAITING_APPROVAL)
         self.assertEqual(result.open_questions, [])
         self._assert_published(result)
         self.chat.assert_called_once()
@@ -179,7 +227,7 @@ class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
             json.dumps(sent, ensure_ascii=False),
         )
 
-    def test_open_questions_take_the_user_input_branch_after_publishing(self):
+    def test_open_questions_still_wait_for_checklist_approval(self):
         questions = ["导出文件需要 CSV 还是 JSON？"]
         self.chat.return_value = json.dumps(
             valid_spec(open_questions=questions), ensure_ascii=False
@@ -187,7 +235,7 @@ class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
 
         result = self._run()
 
-        self.assertEqual(result.outcome, ProductManagerWorkflowOutcome.NEEDS_USER_INPUT)
+        self.assertEqual(result.outcome, ProductManagerWorkflowOutcome.AWAITING_APPROVAL)
         self.assertEqual(result.open_questions, questions)
         self._assert_published(result)
 
@@ -278,6 +326,7 @@ class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
                 "complete_app_spec",
                 "load_saved_app_spec",
                 "needs_user_input",
+                "awaiting_approval",
                 "ready_for_design",
                 "assign_design_task",
             },
@@ -287,6 +336,7 @@ class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
         self.assertIn(("ensure_plan", "claim_task", True), edges)
         self.assertIn(("ensure_plan", "load_saved_app_spec", True), edges)
         self.assertIn(("load_saved_app_spec", "needs_user_input", True), edges)
+        self.assertIn(("load_saved_app_spec", "awaiting_approval", True), edges)
         self.assertIn(("load_saved_app_spec", "ready_for_design", True), edges)
         self.assertIn(("ready_for_design", "assign_design_task", False), edges)
 

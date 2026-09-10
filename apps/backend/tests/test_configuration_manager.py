@@ -202,16 +202,31 @@ class ConfigurationManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(BusinessException, "system_design 必须引用 app_spec"):
                 self._register(db, ConfigurationItemType.SYSTEM_DESIGN, {"backend": "FastAPI"})
 
+            design = self._register(
+                db,
+                ConfigurationItemType.SYSTEM_DESIGN,
+                {"backend": "FastAPI"},
+                [spec.item_id],
+            )
+            code = self._register(
+                db,
+                ConfigurationItemType.CODE,
+                {"manifest": []},
+                [design.item_id],
+            )
             with self.assertRaisesRegex(
                 BusinessException,
-                "code 的直接上游必须全部是 system_design",
+                "code 的直接上游只能是 app_spec 或 system_design",
             ):
                 self._register(
                     db,
                     ConfigurationItemType.CODE,
-                    {"manifest": []},
-                    [spec.item_id],
+                    {"manifest": ["other"]},
+                    [code.item_id],
                 )
+
+            with self.assertRaisesRegex(BusinessException, "test_report 必须引用 code"):
+                self._register(db, ConfigurationItemType.TEST_REPORT, {"passed": True})
 
             for invalid_id in ("ci_missing", foreign_spec.item_id):
                 with (

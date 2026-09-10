@@ -1,4 +1,3 @@
-from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -9,14 +8,20 @@ from app.models.plan import Plan
 from app.models.task import Task
 from app.models.task_result import TaskResult
 from app.models.user import User
-from app.schemas.app_spec import APP_SPEC_SCHEMA_VERSION, AppSpec
 from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowOutcome,
     ProductManagerWorkflowResult,
 )
 from app.schemas.requirements import RequirementsStatus
 from app.services import project as project_service
-from app.services.design_handoff import find_pending_design_task, load_design_source
+from app.services.design_handoff import (
+    APPROVAL_VERSION,
+    ENGINEERING_TASK_KEY,
+    LEGACY_DESIGN_TASK_KEY,
+    find_pending_engineering_task,
+    load_approved_app_spec,
+)
+from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import latest_execution, utc_now
 
 
@@ -43,26 +48,40 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
     if plan is None:
         return result
     tasks = list(db.scalars(select(Task).where(Task.plan_id == plan.plan_id)).all())
-    if len(tasks) == 1 and tasks[0].recipient == "SolutionArchitect":
-        design_task = tasks[0]
-        if plan.status != "pending" or design_task.status != "pending":
+    delivery_task = tasks[0] if len(tasks) == 1 else None
+    if delivery_task is not None and delivery_task.recipient in (
+        "SoftwareEngineer",
+        "SolutionArchitect",
+    ):
+        if plan.status != "pending" or delivery_task.status != "pending":
             result.state = "stopped"
             return result
-        if len(design_task.input_configuration_item_ids) != 1:
-            raise ConflictException("设计任务没有固定唯一的需求输入")
-        source_item, source_task, source_plan, spec = load_design_source(
+        if len(delivery_task.input_configuration_item_ids) != 1:
+            raise ConflictException("工程交付任务没有固定唯一的需求输入")
+        if delivery_task.recipient == "SoftwareEngineer":
+            if (
+                delivery_task.task_key,
+                delivery_task.expected_output_type,
+            ) != (ENGINEERING_TASK_KEY, "code"):
+                raise ConflictException("工程交付任务定义不符合约定")
+        elif (
+            delivery_task.task_key,
+            delivery_task.expected_output_type,
+        ) != (LEGACY_DESIGN_TASK_KEY, "system_design"):
+            raise ConflictException("设计任务定义不符合约定")
+        source_item, source_task, source_plan, spec = load_approved_app_spec(
             db,
             project_id,
             run.run_id,
-            design_task.input_configuration_item_ids[0],
+            delivery_task.input_configuration_item_ids[0],
         )
-        verified = find_pending_design_task(db, source_plan, source_item.item_id)
-        if verified is None or verified.task_id != design_task.task_id:
-            raise ConflictException("设计任务与需求来源不一致")
+        verified = find_pending_engineering_task(db, source_plan, source_item.item_id)
+        if verified is None or verified.task_id != delivery_task.task_id:
+            raise ConflictException("工程交付任务与需求来源不一致")
         result.state = "design_pending"
         result.plan_id, result.task_id, result.message_id = (
             plan.plan_id,
-            design_task.task_id,
+            delivery_task.task_id,
             source_plan.cause_message_id,
         )
         result.app_spec = spec
@@ -76,8 +95,19 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             outcome=ProductManagerWorkflowOutcome.READY_FOR_DESIGN,
             open_questions=[],
             design_plan_id=plan.plan_id,
-            design_task_id=design_task.task_id,
+            design_task_id=delivery_task.task_id,
         )
+        source_result = db.get(TaskResult, source_task.task_id)
+        if (
+            delivery_task.task_key == LEGACY_DESIGN_TASK_KEY
+            and source_result is not None
+            and source_result.prompt_version != APPROVAL_VERSION
+        ):
+            # A pre-approval legacy assignment is historical work, not user consent.
+            result.state = "awaiting_approval"
+            result.plan_id, result.task_id = source_plan.plan_id, source_task.task_id
+            result.result.outcome = ProductManagerWorkflowOutcome.AWAITING_APPROVAL
+            result.result.design_plan_id = result.result.design_task_id = None
         return result
     if len(tasks) != 1 or tasks[0].recipient != "ProductManager":
         result.state = "stopped"
@@ -103,22 +133,21 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
         )
         if (
             item is None
-            or (item.semantic_type, item.state, item.schema_version)
-            != ("app_spec", "usable", APP_SPEC_SCHEMA_VERSION)
+            or (item.semantic_type, item.state) != ("app_spec", "usable")
             or plan.status != "succeeded"
         ):
             raise ConflictException("需求成果已不可用或关联不完整")
-        try:
-            spec = AppSpec.model_validate(item.payload)
-        except ValidationError as exc:
-            raise ConflictException("需求正文不符合要求") from exc
+        spec = read_app_spec(item)
         result.app_spec = spec
-        outcome = (
-            ProductManagerWorkflowOutcome.NEEDS_USER_INPUT
-            if spec.open_questions
-            else ProductManagerWorkflowOutcome.READY_FOR_DESIGN
-        )
-        result.state = "needs_user_input" if spec.open_questions else "ready_for_design"
+        if saved is not None and saved.prompt_version == APPROVAL_VERSION:
+            outcome = ProductManagerWorkflowOutcome.READY_FOR_DESIGN
+            result.state = "ready_for_design"
+        elif spec.features:
+            outcome = ProductManagerWorkflowOutcome.AWAITING_APPROVAL
+            result.state = "awaiting_approval"
+        else:
+            outcome = ProductManagerWorkflowOutcome.NEEDS_USER_INPUT
+            result.state = "needs_user_input"
         result.result = ProductManagerWorkflowResult(
             project_id=project_id,
             build_run_id=run.run_id,

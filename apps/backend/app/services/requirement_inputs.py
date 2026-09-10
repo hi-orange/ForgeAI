@@ -11,6 +11,18 @@ from app.models.task_result import TaskResult
 from app.schemas.app_spec import APP_SPEC_SCHEMA_VERSION, AppSpec
 
 
+def read_app_spec(item: ConfigurationItem) -> AppSpec:
+    """Read supported persisted versions without changing their payload or identity."""
+    if item.state != "usable" or item.semantic_type != "app_spec":
+        raise ConflictException("需求成果已不可用")
+    if item.schema_version not in (1, APP_SPEC_SCHEMA_VERSION):
+        raise ConflictException("需求版本暂不支持")
+    try:
+        return AppSpec.model_validate(item.payload)
+    except ValidationError as exc:
+        raise ConflictException("需求正文不符合要求") from exc
+
+
 def load_previous_app_spec(db: Session, task: Task, *, lock: bool = False) -> AppSpec | None:
     """只接受绑定了补充回答的准确旧需求；任意传一个成果编号不能伪装成补充任务。"""
 
@@ -41,11 +53,4 @@ def load_previous_app_spec(db: Session, task: Task, *, lock: bool = False) -> Ap
     if row is None:
         raise BusinessException("原需求与本次补充任务的关联不正确")
     item = row[0]
-    if item.state != "usable" or item.semantic_type != "app_spec":
-        raise ConflictException("原需求已不可用")
-    if item.schema_version != APP_SPEC_SCHEMA_VERSION:
-        raise ConflictException("原需求版本暂不支持")
-    try:
-        return AppSpec.model_validate(item.payload)
-    except ValidationError as exc:
-        raise ConflictException("原需求正文不符合要求") from exc
+    return read_app_spec(item)

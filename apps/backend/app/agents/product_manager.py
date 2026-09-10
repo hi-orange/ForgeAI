@@ -41,7 +41,7 @@ def _parse_app_spec(raw: str) -> AppSpec:
             parse_constant=_reject_non_json_number,
         )
         return AppSpec.model_validate(payload)
-    except (ValueError, TypeError, RecursionError) as exc:
+    except (ValidationError, ValueError, TypeError, RecursionError) as exc:
         # 不把模型原文放进对外错误或日志，以免回显用户的需求内容。
         raise BusinessException("ProductManager 返回的 app_spec 格式异常") from exc
 

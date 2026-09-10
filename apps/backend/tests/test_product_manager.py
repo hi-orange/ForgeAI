@@ -34,17 +34,31 @@ from app.services import task as task_service
 
 
 def valid_spec(**overrides):
-    return {
+    base = {
         "goal": "记录个人阅读情况",
         "target_users": ["个人读者"],
-        "features": ["记录书名和阅读状态", "导出自己的阅读记录"],
-        "data_requirements": ["书名、阅读状态"],
+        "features": [
+            {"id": "feat_track", "text": "记录书名和阅读状态"},
+            {"id": "feat_export", "text": "导出自己的阅读记录"},
+        ],
+        "data_requirements": [
+            {"id": "data_book", "text": "书名、阅读状态"},
+        ],
         "interface_requirements": [],
-        "constraints": ["不提供公开分享"],
-        "acceptance_criteria": ["用户可以保存记录并导出自己的阅读记录"],
+        "constraints": [
+            {"id": "con_no_share", "text": "不提供公开分享"},
+        ],
+        "acceptance_criteria": [
+            {
+                "id": "ac_save",
+                "text": "用户可以保存记录并导出自己的阅读记录",
+                "source_ids": ["feat_track", "feat_export"],
+            }
+        ],
         "open_questions": ["导出文件使用什么格式？"],
-        **overrides,
     }
+    base.update(overrides)
+    return base
 
 
 def model_input(**overrides) -> ProductManagerInput:
@@ -70,7 +84,8 @@ class ProductManagerAgentTests(unittest.TestCase):
         ) as chat:
             result = product_manager_agent.generate_app_spec(payload)
         self.assertIsInstance(result, AppSpec)
-        self.assertEqual(result.constraints, ["不提供公开分享"])
+        self.assertEqual([item.text for item in result.constraints], ["不提供公开分享"])
+        self.assertEqual(result.constraints[0].id, "con_no_share")
         chat.assert_called_once()
         request = chat.call_args.kwargs
         self.assertEqual(request["temperature"], 0.0)
@@ -100,7 +115,10 @@ class ProductManagerAgentTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
 
     def test_accepts_plain_json_and_complete_fences_without_changing_language(self):
-        spec = valid_spec(goal="Track reading — 読書記録", constraints=["No public sharing"])
+        spec = valid_spec(
+            goal="Track reading — 読書記録",
+            constraints=[{"id": "con_en", "text": "No public sharing"}],
+        )
         raw = json.dumps(spec, ensure_ascii=False)
         for wrapped in (raw, f"```json\n{raw}\n```", f"```\n{raw}\n```", f" \n{raw}\n "):
             with (
@@ -126,17 +144,25 @@ class ProductManagerAgentTests(unittest.TestCase):
             AppSpec.model_validate(valid_spec(acceptance_criteria=[], open_questions=[]))
 
     def test_schema_normalizes_text_but_rejects_blank_wrong_missing_or_extra_fields(self):
-        spec = AppSpec.model_validate(valid_spec(goal="  阅读记录  ", features=[" 导出记录 "]))
+        spec = AppSpec.model_validate(
+            valid_spec(
+                goal="  阅读记录  ",
+                features=[{"id": "feat_export", "text": " 导出记录 "}],
+                acceptance_criteria=[
+                    {"id": "ac_export", "text": "可以导出", "source_ids": ["feat_export"]}
+                ],
+            )
+        )
         self.assertEqual(spec.goal, "阅读记录")
-        self.assertEqual(spec.features, ["导出记录"])
+        self.assertEqual(spec.features[0].text, "导出记录")
         for fields in (
             {"goal": "   "},
             {"goal": 123},
             {"goal": "x" * 2001},
             {"features": "不是列表"},
             {"features": [False]},
-            {"features": [" "]},
-            {"features": ["x"] * 51},
+            {"features": [{"id": "feat_x", "text": " "}]},
+            {"features": [{"id": f"feat_{i}", "text": "x"} for i in range(51)]},
             {"open_questions": None},
             {"plan_id": "invented"},
             {"schema_version": 99},
@@ -144,6 +170,31 @@ class ProductManagerAgentTests(unittest.TestCase):
         ):
             with self.subTest(fields=fields), self.assertRaises(ValidationError):
                 AppSpec.model_validate(valid_spec(**fields))
+        coerced = AppSpec.model_validate(
+            valid_spec(
+                features=[
+                    {"id": "feat_dup", "text": "a"},
+                    {"id": "feat_dup", "text": "b"},
+                ],
+                acceptance_criteria=[{"id": "ac_1", "text": "ok", "source_ids": []}],
+            )
+        )
+        self.assertEqual(len({item.id for item in coerced.features}), 2)
+        legacy = AppSpec.model_validate(
+            {
+                "goal": "招聘网站",
+                "target_users": ["企业 HR"],
+                "features": ["发布职位", "投递简历"],
+                "data_requirements": ["职位信息"],
+                "interface_requirements": ["职位列表页"],
+                "constraints": ["仅企业可管理自己的职位"],
+                "acceptance_criteria": ["企业可以发布职位并在列表中看到"],
+                "open_questions": [],
+            }
+        )
+        self.assertEqual([item.text for item in legacy.features], ["发布职位", "投递简历"])
+        self.assertTrue(all(item.id for item in legacy.features))
+        self.assertTrue(legacy.acceptance_criteria[0].source_ids)
         for field in valid_spec():
             with self.subTest(missing=field), self.assertRaises(ValidationError):
                 AppSpec.model_validate(

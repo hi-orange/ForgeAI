@@ -13,7 +13,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
-from test_product_manager_workflow import ProductManagerWorkflowFixture, valid_spec
+from test_product_manager_workflow import (
+    ProductManagerWorkflowFixture,
+    approval_payload,
+    valid_spec,
+)
 
 from app.api.deps import get_current_user
 from app.api.v1.router import api_router
@@ -36,7 +40,9 @@ from app.models.task_result import TaskResult
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.schemas.product_manager import ProductManagerResult
 from app.schemas.project_message import ProjectMessageCreate
+from app.schemas.requirements import RequirementsApproval
 from app.services import product_manager, project_manager, task, task_execution
+from app.services.requirement_approval import approve_requirements
 from app.services.requirements import get_requirements_status
 
 
@@ -67,7 +73,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             with self.assertRaises(ConflictException):
                 old_work.result(timeout=20)
         self.assertEqual(self._status().result, recovered)
-        self.assertEqual(self._status().state, "design_pending")
+        self.assertEqual(self._status().state, "awaiting_approval")
         self.assertEqual(self._counts()[3], 1)
 
     def test_answer_model_failure_resumes_same_followup_without_saving_answer_again(self):
@@ -91,8 +97,10 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
                 followup.cause_message_id,
                 recovery_execution_id=progress.execution_id,
             )
-        self.assertEqual(self._counts()[:3], (counts[0], counts[1] + 1, counts[2] + 1))
+        self.assertEqual(self._counts()[:3], counts[:3])
+        self.assertEqual(self._counts()[3:5], (counts[3] + 1, counts[4] + 1))
         self.assertEqual(result.plan_id, followup.plan_id)
+        self.assertEqual(result.outcome, "awaiting_approval")
 
     def test_invalid_or_invalidated_upstream_cannot_be_published(self):
         first = self._questions()
@@ -201,7 +209,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
 
     def test_multiple_rounds_use_exact_old_spec_and_answer_and_keep_history(self):
         first = self._questions(["导出格式？", "是否需要提醒？"])
-        self.assertEqual(self._status().state, "needs_user_input")
+        self.assertEqual(self._status().state, "awaiting_approval")
         second_plan = self._answer(first.configuration_item_id)
         self.assertEqual(self._status().state, "pending")
         self.chat.return_value = json.dumps(valid_spec(open_questions=["是否需要提醒？"]))
@@ -216,7 +224,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         third_plan = self._answer(second.configuration_item_id, "不需要提醒", "answer-2")
         self.chat.return_value = json.dumps(valid_spec())
         third = self._execute_plan(third_plan)
-        self.assertEqual(self._status().state, "design_pending")
+        self.assertEqual(self._status().state, "awaiting_approval")
         self.assertEqual(self._status().result, third)
         self.assertEqual(self.chat.call_count, 3)
         with self.session_factory() as db:
@@ -229,9 +237,8 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             self.assertTrue(all(item.state == "usable" for item in items))
             self.assertEqual(items[0].payload["open_questions"], ["导出格式？", "是否需要提醒？"])
             plans = db.scalars(select(Plan).order_by(Plan.version)).all()
-            self.assertEqual([plan.version for plan in plans], [1, 2, 3, 4])
-            self.assertEqual(plans[-1].plan_id, third.design_plan_id)
-            for plan in plans[:-1]:
+            self.assertEqual([plan.version for plan in plans], [1, 2, 3])
+            for plan in plans:
                 result = db.scalar(
                     select(TaskResult).join(Task).where(Task.plan_id == plan.plan_id)
                 )
@@ -251,16 +258,27 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
                 self._answer(result.configuration_item_id, content, key)
         self.assertEqual(self._counts(), counts)
 
-    def test_answer_requires_owned_question_bearing_current_result(self):
+    def test_answer_rejects_outsider_missing_and_approved_sources(self):
         result = self._run()
         counts = self._counts()
-        with self.assertRaises(ConflictException):
-            self._answer(result.configuration_item_id)
         with self.assertRaises(NotFoundException):
             self._answer(result.configuration_item_id, user=self.outsider)
         with self.assertRaises(NotFoundException):
             self._answer("ci_missing")
-        self.assertEqual(self._counts(), counts)
+        with self.session_factory() as db:
+            approve_requirements(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                result.configuration_item_id,
+                RequirementsApproval.model_validate(
+                    approval_payload(client_message_id="approve-then-block-answer")
+                ),
+            )
+        with self.assertRaises(ConflictException):
+            self._answer(result.configuration_item_id)
+        self.assertEqual(self._counts()[:3], (counts[0] + 1, counts[1] + 1, counts[2] + 1))
 
     def test_answer_transaction_rolls_back_message_plan_and_tasks_together(self):
         result = self._questions()
@@ -276,7 +294,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         finally:
             event.remove(RequirementClarification, "before_update", fail)
         self.assertEqual(self._counts(), counts)
-        self.assertEqual(self._status().state, "needs_user_input")
+        self.assertEqual(self._status().state, "awaiting_approval")
         self._answer(result.configuration_item_id)
 
     def test_legacy_question_result_can_receive_an_answer(self):
@@ -342,7 +360,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             finally:
                 release.set()
             future.result(timeout=20)
-        self.assertEqual(self._status().state, "design_pending")
+        self.assertEqual(self._status().state, "awaiting_approval")
 
     def test_expired_execution_is_fenced_and_needs_explicit_recovery(self):
         _, pending = self._create_plan()
@@ -398,7 +416,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
                 db, self.owner, self.project.id, self.run.run_id, pending.task_id, fresh
             )
             self.assertEqual(db.get(TaskExecution, old.execution_id).status, "superseded")
-        self.assertEqual(self._status().state, "ready_for_design")
+        self.assertEqual(self._status().state, "awaiting_approval")
 
     def test_recovery_reuses_persisted_draft_after_publication_failure(self):
         with patch.object(
@@ -528,25 +546,42 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         replay = self.client.post(f"{self.execute}/{item_id}/answers", json=answer)
         self.assertEqual(response.json(), replay.json())
         current = self.client.get(f"{self.base}/requirements").json()["data"]
-        self.assertEqual(current["state"], "design_pending")
-        self.assertEqual(current["task_id"], response.json()["data"]["design_task_id"])
-        self.assertEqual(current["plan_id"], response.json()["data"]["design_plan_id"])
+        self.assertEqual(current["state"], "awaiting_approval")
         self.assertEqual(
             current["result"]["configuration_item_id"],
             response.json()["data"]["configuration_item_id"],
         )
         self.assertEqual(current["app_spec"], valid_spec())
+        approval = self.client.post(
+            f"{self.execute}/{current['result']['configuration_item_id']}/approval",
+            json=approval_payload(client_message_id="api-approval"),
+        )
+        self.assertEqual(approval.status_code, 200, approval.text)
+        self.assertEqual(approval.json()["data"]["state"], "design_pending")
+        replay_approval = self.client.post(
+            f"{self.execute}/{current['result']['configuration_item_id']}/approval",
+            json=approval_payload(client_message_id="api-approval"),
+        )
+        self.assertEqual(replay_approval.status_code, 200, replay_approval.text)
+        self.assertEqual(replay_approval.json(), approval.json())
         self.assertEqual(self.chat.call_count, 2)
 
-    def test_http_retries_dispatch_from_saved_requirements_without_another_model_call(self):
+    def test_http_retries_dispatch_from_approved_requirements_without_another_model_call(self):
+        first = self.client.post(self.execute, json={"message_id": self.message.id})
+        self.assertEqual(first.status_code, 200, first.text)
+        item_id = first.json()["data"]["configuration_item_id"]
         with (
             self.assertLogs("forgeai", level="ERROR"),
-            patch.object(
-                project_manager, "create_design_task", side_effect=RuntimeError("dispatch failed")
+            patch(
+                "app.api.v1.requirements.create_engineering_delivery_task",
+                side_effect=RuntimeError("dispatch failed"),
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
-                self.client.post(self.execute, json={"message_id": self.message.id})
+                self.client.post(
+                    f"{self.execute}/{item_id}/approval",
+                    json=approval_payload(client_message_id="dispatch-approval"),
+                )
         waiting = self.client.get(f"{self.base}/requirements")
         self.assertEqual(waiting.status_code, 200)
         saved = waiting.json()["data"]

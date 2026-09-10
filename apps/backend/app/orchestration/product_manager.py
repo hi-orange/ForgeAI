@@ -15,7 +15,7 @@ from app.models.plan import Plan, PlanStatus
 from app.models.requirement_clarification import RequirementClarification
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.user import User
-from app.schemas.app_spec import APP_SPEC_SCHEMA_VERSION, AppSpec
+from app.schemas.app_spec import AppSpec
 from app.schemas.product_manager import ProductManagerResult
 from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowInput,
@@ -28,7 +28,8 @@ from app.services import plan as plan_service
 from app.services import product_manager as product_manager_service
 from app.services import project_manager as project_manager_service
 from app.services import task as task_service
-from app.services.design_handoff import find_pending_design_task
+from app.services.design_handoff import APPROVAL_VERSION, find_pending_engineering_task
+from app.services.requirement_inputs import read_app_spec
 
 logger = logging.getLogger("forgeai")
 
@@ -55,6 +56,7 @@ class _WorkflowOutputState(TypedDict):
 
 
 class _WorkflowState(_WorkflowInputState, total=False):
+    approved: bool
     design_plan_id: str
     design_task_id: str
     plan_id: NotRequired[str]
@@ -71,7 +73,7 @@ class _WorkflowState(_WorkflowInputState, total=False):
 
 SessionFactory = Callable[[], Session]
 TaskRoute = Literal["claim_task", "start_execution", "load_saved_app_spec"]
-QuestionRoute = Literal["needs_user_input", "ready_for_design"]
+QuestionRoute = Literal["needs_user_input", "awaiting_approval", "ready_for_design"]
 
 
 def _get_user(db: Session, user_id: int) -> User:
@@ -171,8 +173,13 @@ class _ProductManagerNodes:
             identity_db.expunge(user)
         try:
             with self._session_factory() as db:
-                if state.get("saved_draft") is not None:
-                    result = ProductManagerResult.model_validate(state["saved_draft"])
+                saved_draft = state.get("saved_draft")
+                if saved_draft is not None:
+                    draft = dict(saved_draft)
+                    if draft.get("schema_version") == 1:
+                        # Only an unpublished draft is upgraded; saved artifacts stay immutable.
+                        draft["schema_version"] = 2
+                    result = ProductManagerResult.model_validate(draft)
                     result.execution_id = state["execution_id"]
                 else:
                     result = product_manager_service.generate_task_app_spec(
@@ -213,7 +220,12 @@ class _ProductManagerNodes:
     def _fail_execution(self, state: _WorkflowState) -> None:
         try:
             with self._session_factory() as db:
-                task_execution.fail_execution(db, state["task_id"], state["execution_id"])
+                task_execution.fail_execution(
+                    db,
+                    state["task_id"],
+                    state["execution_id"],
+                    error="需求整理未完成，可重试恢复；已保存的需求版本不受影响。",
+                )
         except Exception:
             logger.error("Could not mark execution failed: %s", state["execution_id"])
 
@@ -270,11 +282,10 @@ class _ProductManagerNodes:
                 or task.status != TaskStatus.SUCCEEDED.value
                 or item.producer_run_id != state["build_run_id"]
                 or item.semantic_type != ConfigurationItemType.APP_SPEC.value
-                or item.schema_version != APP_SPEC_SCHEMA_VERSION
                 or item.state != ConfigurationItemState.USABLE.value
             ):
                 raise ConflictException("已完成的需求任务与当前工作流状态不一致")
-            app_spec = _validated_app_spec(item.payload)
+            app_spec = read_app_spec(item)
             latest_plan_id = db.scalar(
                 select(Plan.plan_id)
                 .where(Plan.build_run_id == state["build_run_id"])
@@ -282,7 +293,7 @@ class _ProductManagerNodes:
                 .limit(1)
             )
             if latest_plan_id != plan.plan_id:
-                design_task = find_pending_design_task(db, plan, item.item_id)
+                design_task = find_pending_engineering_task(db, plan, item.item_id)
                 if (
                     app_spec.open_questions
                     or design_task is None
@@ -292,14 +303,23 @@ class _ProductManagerNodes:
             return {
                 "configuration_item_id": item.item_id,
                 "app_spec": app_spec.model_dump(mode="json"),
+                "approved": result.prompt_version == APPROVAL_VERSION,
             }
 
     @staticmethod
     def route_questions(state: _WorkflowState) -> QuestionRoute:
         app_spec = _validated_app_spec(state.get("app_spec"))
-        if app_spec.open_questions:
-            return "needs_user_input"
-        return "ready_for_design"
+        if state.get("approved"):
+            return "ready_for_design"
+        return "awaiting_approval" if app_spec.features else "needs_user_input"
+
+    @staticmethod
+    def awaiting_approval(state: _WorkflowState) -> dict[str, object]:
+        app_spec = _validated_app_spec(state.get("app_spec"))
+        return {
+            "outcome": ProductManagerWorkflowOutcome.AWAITING_APPROVAL,
+            "open_questions": list(app_spec.open_questions),
+        }
 
     @staticmethod
     def needs_user_input(state: _WorkflowState) -> dict[str, object]:
@@ -319,7 +339,7 @@ class _ProductManagerNodes:
 
     def assign_design_task(self, state: _WorkflowState) -> dict[str, object]:
         with self._session_factory() as db:
-            task = project_manager_service.create_design_task(
+            task = project_manager_service.create_engineering_delivery_task(
                 db,
                 _get_user(db, state["user_id"]),
                 state["project_id"],
@@ -352,6 +372,7 @@ def build_product_manager_workflow(
     builder.add_node("complete_app_spec", nodes.complete_app_spec)
     builder.add_node("load_saved_app_spec", nodes.load_saved_app_spec)
     builder.add_node("needs_user_input", nodes.needs_user_input)
+    builder.add_node("awaiting_approval", nodes.awaiting_approval)
     builder.add_node("ready_for_design", nodes.ready_for_design)
     builder.add_node("assign_design_task", nodes.assign_design_task)
 
@@ -374,10 +395,12 @@ def build_product_manager_workflow(
         nodes.route_questions,
         {
             "needs_user_input": "needs_user_input",
+            "awaiting_approval": "awaiting_approval",
             "ready_for_design": "ready_for_design",
         },
     )
     builder.add_edge("needs_user_input", END)
+    builder.add_edge("awaiting_approval", END)
     builder.add_edge("ready_for_design", "assign_design_task")
     builder.add_edge("assign_design_task", END)
     return builder.compile(name="forgeai_product_manager")

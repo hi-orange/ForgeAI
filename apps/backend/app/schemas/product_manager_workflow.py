@@ -13,6 +13,7 @@ class ProductManagerWorkflowOutcome(StrEnum):
     """产品需求阶段结束后，调用方下一步应采取的动作。"""
 
     NEEDS_USER_INPUT = "needs_user_input"
+    AWAITING_APPROVAL = "awaiting_approval"
     READY_FOR_DESIGN = "ready_for_design"
 
 

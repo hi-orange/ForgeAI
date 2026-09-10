@@ -22,8 +22,12 @@ from app.schemas.configuration_item import ConfigurationItemRegistration
 
 _REQUIRED_UPSTREAM_TYPE = {
     ConfigurationItemType.SYSTEM_DESIGN: ConfigurationItemType.APP_SPEC,
-    ConfigurationItemType.CODE: ConfigurationItemType.SYSTEM_DESIGN,
     ConfigurationItemType.TEST_REPORT: ConfigurationItemType.CODE,
+}
+
+_CODE_UPSTREAM_TYPES = {
+    ConfigurationItemType.APP_SPEC.value,
+    ConfigurationItemType.SYSTEM_DESIGN.value,
 }
 
 
@@ -97,6 +101,13 @@ def _validate_upstream_types(
             item.semantic_type != ConfigurationItemType.APP_SPEC.value for item in upstream_items
         ):
             raise BusinessException("app_spec 只能引用此前的 app_spec")
+        return
+
+    if semantic_type == ConfigurationItemType.CODE:
+        if not upstream_items:
+            raise BusinessException("code 必须引用 app_spec 或 system_design")
+        if any(item.semantic_type not in _CODE_UPSTREAM_TYPES for item in upstream_items):
+            raise BusinessException("code 的直接上游只能是 app_spec 或 system_design")
         return
 
     required_type = _REQUIRED_UPSTREAM_TYPE[semantic_type]

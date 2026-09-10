@@ -179,7 +179,7 @@ class TaskCompletionTests(unittest.TestCase):
                 commit.assert_called_once_with()
             self.assertEqual(item.payload, self.draft.app_spec.model_dump(mode="json"))
             self.assertEqual(
-                (item.semantic_type, item.version, item.schema_version), ("app_spec", 1, 1)
+                (item.semantic_type, item.version, item.schema_version), ("app_spec", 1, 2)
             )
             self.assertEqual(
                 (item.project_id, item.producer_run_id), (self.project.id, self.run.run_id)

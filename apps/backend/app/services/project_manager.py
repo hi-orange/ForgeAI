@@ -1,4 +1,3 @@
-from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -6,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.agents import project_manager as project_manager_agent
 from app.agents.prompts.project_manager import (
     CLARIFICATION_TASK_INSTRUCTIONS,
-    DESIGN_TASK_INSTRUCTIONS,
+    ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
     INITIAL_REQUIREMENTS_TASK_INSTRUCTIONS,
     MESSAGE_CLASSIFICATION_PROMPT_VERSION,
 )
@@ -24,14 +23,21 @@ from app.models.requirement_clarification import RequirementClarification
 from app.models.task import Task, TaskRecipient
 from app.models.task_result import TaskResult
 from app.models.user import User
-from app.schemas.app_spec import APP_SPEC_SCHEMA_VERSION, AppSpec
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.task import TaskCreate
 from app.services import plan as plan_service
 from app.services import project as project_service
-from app.services.design_handoff import find_pending_design_task, load_design_source
+from app.services.design_handoff import (
+    APPROVAL_VERSION,
+    ENGINEERING_TASK_KEY,
+    cancel_legacy_design_task,
+    find_pending_engineering_task,
+    load_approved_app_spec,
+    prepare_requirements_followup,
+)
 from app.services.project_message import stage_user_project_message
+from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import lock_run
 
 # 喂给模型的上下文上限：条数与总字符，避免 prompt 过长。
@@ -39,13 +45,21 @@ MAX_CONTEXT_MESSAGES = 20
 MAX_CONTEXT_CHARS = 8000
 
 
-def create_design_task(db: Session, user: User, project_id: int, run_id: str, item_id: str) -> Task:
-    """需求就绪后原子派工；仅创建 pending 计划和任务，不领取或调用模型。"""
+def create_engineering_delivery_task(
+    db: Session, user: User, project_id: int, run_id: str, item_id: str
+) -> Task:
+    """批准后原子安排工程交付；仅创建 pending 计划和任务，不领取或调用模型。
+
+    主结果约定为 code。必要的设计与验证可作为附属产物登记到同一任务。
+    未开始的旧 SolutionArchitect 设计任务会被取消并转换为工程交付，转换幂等。
+    """
     try:
         run = lock_run(db, user, project_id, run_id)
         if (run.status, run.stage, run.active_slot) != ("running", "pm", 1):
-            raise ConflictException("当前构建不能进行需求到设计的交接")
-        _, _, source_plan, _ = load_design_source(db, project_id, run_id, item_id, lock=True)
+            raise ConflictException("当前构建不能进行需求到工程交付的交接")
+        _, source_task, source_plan, _ = load_approved_app_spec(
+            db, project_id, run_id, item_id, lock=True
+        )
         latest = db.scalar(
             select(Plan)
             .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
@@ -54,28 +68,72 @@ def create_design_task(db: Session, user: User, project_id: int, run_id: str, it
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if latest is None or latest.version not in (source_plan.version, source_plan.version + 1):
+        if latest is None or latest.version < source_plan.version:
             raise ConflictException("需求已进入其他后续计划，请刷新进度")
-        existing = find_pending_design_task(db, source_plan, item_id, lock=True)
+        existing = find_pending_engineering_task(db, source_plan, item_id, lock=True)
         if existing is not None:
-            db.commit()
-            db.refresh(existing)
-            return existing
+            if existing.task_key == ENGINEERING_TASK_KEY:
+                engineering_plan = db.scalar(
+                    select(Plan).where(Plan.plan_id == existing.plan_id).with_for_update()
+                )
+                assert engineering_plan is not None
+                blocking = db.scalar(
+                    select(Plan.plan_id)
+                    .where(
+                        Plan.project_id == project_id,
+                        Plan.build_run_id == run_id,
+                        Plan.version > engineering_plan.version,
+                        Plan.status.in_(("pending", "running", "succeeded")),
+                    )
+                    .limit(1)
+                )
+                if blocking is not None:
+                    raise ConflictException("需求已进入其他后续计划，请刷新进度")
+                db.commit()
+                db.refresh(existing)
+                return existing
+            cancel_legacy_design_task(db, existing)
+            db.flush()
+        else:
+            blocking = db.scalar(
+                select(Plan.plan_id)
+                .where(
+                    Plan.project_id == project_id,
+                    Plan.build_run_id == run_id,
+                    Plan.version > source_plan.version,
+                    Plan.status.in_(("pending", "running", "succeeded")),
+                )
+                .limit(1)
+            )
+            if blocking is not None:
+                raise ConflictException("需求已进入其他后续计划，请刷新进度")
+        source_result = db.get(TaskResult, source_task.task_id)
+        if source_result is None or source_result.prompt_version != APPROVAL_VERSION:
+            raise ConflictException("请先勾选并批准需求计划")
+        next_version = (
+            db.scalar(
+                select(Plan.version)
+                .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
+                .order_by(Plan.version.desc())
+                .limit(1)
+            )
+            or source_plan.version
+        ) + 1
         plan = plan_service.stage_plan(
             db,
             user,
             project_id,
             run_id,
             PlanCreate(
-                version=source_plan.version + 1,
+                version=next_version,
                 cause_message_id=source_plan.cause_message_id,
                 tasks=[
                     TaskCreate(
-                        task_key="system_design",
-                        recipient=TaskRecipient.SOLUTION_ARCHITECT,
-                        title="根据已确认需求制定技术设计",
-                        instructions=DESIGN_TASK_INSTRUCTIONS,
-                        expected_output_type=ConfigurationItemType.SYSTEM_DESIGN,
+                        task_key=ENGINEERING_TASK_KEY,
+                        recipient=TaskRecipient.SOFTWARE_ENGINEER,
+                        title="根据已批准需求交付应用代码",
+                        instructions=ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
+                        expected_output_type=ConfigurationItemType.CODE,
                         input_configuration_item_ids=[item_id],
                     )
                 ],
@@ -88,10 +146,15 @@ def create_design_task(db: Session, user: User, project_id: int, run_id: str, it
         return task
     except IntegrityError as exc:
         db.rollback()
-        raise ConflictException("设计派工保存冲突，请重试") from exc
+        raise ConflictException("工程交付派工保存冲突，请重试") from exc
     except Exception:
         db.rollback()
         raise
+
+
+def create_design_task(db: Session, user: User, project_id: int, run_id: str, item_id: str) -> Task:
+    """兼容旧调用名；现安排工程交付任务。"""
+    return create_engineering_delivery_task(db, user, project_id, run_id, item_id)
 
 
 def _get_project_message(db: Session, project_id: int, message_id: int) -> ProjectMessage:
@@ -340,18 +403,15 @@ def create_clarification_plan(
             raise NotFoundException("待补充的需求不存在或不属于当前构建")
         item, old_task, old_plan = row
         if (
-            (item.semantic_type, item.state, item.schema_version)
-            != ("app_spec", "usable", APP_SPEC_SCHEMA_VERSION)
+            (item.semantic_type, item.state) != ("app_spec", "usable")
             or old_task.status != "succeeded"
             or old_plan.status != "succeeded"
         ):
             raise ConflictException("只有已完成的可用需求能够接受补充回答")
-        try:
-            spec = AppSpec.model_validate(item.payload)
-        except ValidationError as exc:
-            raise ConflictException("原需求正文不符合要求") from exc
-        if not spec.open_questions:
-            raise ConflictException("这版需求没有待确认问题")
+        read_app_spec(item)
+        source_result = db.get(TaskResult, old_task.task_id)
+        if source_result is not None and source_result.prompt_version == APPROVAL_VERSION:
+            raise ConflictException("需求已批准，请刷新进度")
         clarification = db.scalar(
             select(RequirementClarification)
             .where(RequirementClarification.configuration_item_id == item_id)
@@ -380,15 +440,7 @@ def create_clarification_plan(
                 raise ConflictException("补充计划关联异常")
             db.commit()
             return replay
-        latest_plan_id = db.scalar(
-            select(Plan.plan_id)
-            .where(Plan.build_run_id == run_id, Plan.project_id == project_id)
-            .order_by(Plan.version.desc())
-            .limit(1)
-            .with_for_update()
-        )
-        if latest_plan_id != old_plan.plan_id:
-            raise ConflictException("这版需求已被后续计划替代，请刷新后回答")
+        next_version = prepare_requirements_followup(db, old_plan, item_id)
         message = stage_user_project_message(db, user, project_id, answer)
         original = db.get(ProjectMessage, old_plan.cause_message_id)
         if original is None or message.sequence <= original.sequence:
@@ -399,7 +451,7 @@ def create_clarification_plan(
             project_id,
             run_id,
             PlanCreate(
-                version=old_plan.version + 1,
+                version=next_version,
                 cause_message_id=message.id,
                 tasks=[
                     TaskCreate(

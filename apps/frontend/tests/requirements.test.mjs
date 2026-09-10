@@ -58,6 +58,85 @@ function deferred() {
   return { promise, resolve }
 }
 
+function approvalState() {
+  return progress('awaiting_approval', {
+    result: { configuration_item_id: 'ci-proposal', open_questions: [] },
+    app_spec: {
+      goal: '查看记录', target_users: ['访客'],
+      features: [{ id: 'feat_read', text: '登录后查看记录' }],
+      data_requirements: [], interface_requirements: [], constraints: [], open_questions: [],
+      acceptance_criteria: [{ id: 'ac_read', text: '未登录时拒绝访问记录', source_ids: ['feat_read'] }],
+    },
+  })
+}
+
+test('unchanged approved scope keeps existing acceptance without extra input', async () => {
+  const f = await fixture(approvalState())
+  await f.mount()
+  assert.equal(f.view.needsAcceptance(f.view.planItems.value[0]), false)
+  await f.view.approve()
+  const selected = f.api.approveRequirements.mock.calls[0].arguments[4].selected
+  assert.equal(selected[0].id, 'feat_read')
+  assert.equal('acceptance' in selected[0], false)
+  f.unmount()
+})
+
+test('editing a feature requires current acceptance and preserves retry identity', async () => {
+  const f = await fixture(approvalState())
+  await f.mount()
+  const item = f.view.planItems.value[0]
+  item.label = '匿名查看记录'
+  assert.equal(f.view.needsAcceptance(item), true)
+  await f.view.approve()
+  assert.equal(f.api.approveRequirements.mock.callCount(), 0)
+  assert.match(f.view.error.value, /怎样才算完成/)
+  item.acceptance = '无需登录即可看到记录列表'
+  f.api.approveRequirements.mock.mockImplementation(async () => { throw new Error('network failed') })
+  await f.view.approve()
+  await f.view.approve()
+  const first = f.api.approveRequirements.mock.calls[0].arguments[4]
+  const retry = f.api.approveRequirements.mock.calls[1].arguments[4]
+  assert.equal(first.selected[0].text, '匿名查看记录')
+  assert.equal(first.selected[0].acceptance, item.acceptance)
+  assert.equal(first.client_message_id, retry.client_message_id)
+  item.acceptance = '首页直接展示记录列表'
+  await f.view.approve()
+  const changed = f.api.approveRequirements.mock.calls[2].arguments[4]
+  assert.notEqual(changed.client_message_id, first.client_message_id)
+  f.unmount()
+})
+
+test('new feature requires acceptance but unchecked features do not block approval', async () => {
+  const f = await fixture(approvalState())
+  await f.mount()
+  f.view.addPlanItem('搜索记录')
+  const added = f.view.planItems.value[1]
+  assert.equal(f.view.needsAcceptance(added), true)
+  await f.view.approve()
+  assert.equal(f.api.approveRequirements.mock.callCount(), 0)
+  added.checked = false
+  await f.view.approve()
+  assert.equal(f.api.approveRequirements.mock.calls[0].arguments[4].selected.length, 1)
+  f.unmount()
+})
+
+test('removing part of a joint criterion requests acceptance for the remaining feature', async () => {
+  const state = approvalState()
+  state.app_spec.features.push({ id: 'feat_export', text: '导出记录' })
+  state.app_spec.acceptance_criteria[0].source_ids.push('feat_export')
+  const f = await fixture(state)
+  await f.mount()
+  assert.equal(f.view.needsAcceptance(f.view.planItems.value[0]), false)
+  f.view.planItems.value[1].checked = false
+  assert.equal(f.view.needsAcceptance(f.view.planItems.value[0]), true)
+  await f.view.approve()
+  assert.equal(f.api.approveRequirements.mock.callCount(), 0)
+  f.view.planItems.value[0].acceptance = '登录后显示记录列表'
+  await f.view.approve()
+  assert.equal(f.api.approveRequirements.mock.calls[0].arguments[4].selected.length, 1)
+  f.unmount()
+})
+
 async function fixture(state = progress()) {
   const mounted = [],
     unmounted = [],
@@ -78,6 +157,9 @@ async function fixture(state = progress()) {
     }),
     answerRequirements: mock.fn(async () => {
       state = progress('ready_for_design')
+    }),
+    approveRequirements: mock.fn(async () => {
+      state = progress('design_pending')
     }),
   }
   const { useRequirements } = await loadModule(
@@ -116,15 +198,33 @@ async function fixture(state = progress()) {
   }
 }
 
-test('mount and refresh read progress without starting a paid operation', async () => {
+test('mount submits the home prompt once and starts requirement planning', async () => {
   const f = await fixture()
   await f.mount()
-  assert.equal(f.view.text.value, '做一个读书记录应用')
-  await f.view.refresh()
-  assert.equal(f.api.executeRequirements.mock.callCount(), 0)
+  assert.equal(f.view.text.value, '')
+  assert.equal(f.api.createRequirementMessage.mock.callCount(), 1)
+  assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 1)
+  assert.equal(f.api.createRequirementsRun.mock.callCount(), 0)
+  assert.equal(f.api.executeRequirements.mock.callCount(), 1)
   assert.equal(f.api.answerRequirements.mock.callCount(), 0)
-  assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 0)
   assert.equal(f.timers.size, 0)
+  f.unmount()
+})
+
+test('mount executes the stored home message without posting a duplicate', async () => {
+  const f = await fixture()
+  f.api.getRequirementMessages.mock.mockImplementation(async () => [
+    { id: 1, sequence: 1, sender: 'user', content: '做一个读书记录应用' },
+  ])
+  await f.mount()
+  assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
+  assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 1)
+  assert.equal(f.api.classifyRequirementMessage.mock.calls[0].arguments[2], 1)
+  assert.equal(f.api.createRequirementsRun.mock.callCount(), 0)
+  assert.equal(f.api.executeRequirements.mock.callCount(), 1)
+  assert.deepEqual(Array.from(f.api.executeRequirements.mock.calls[0].arguments), [
+    'test-token', 7, 'run-1', 1,
+  ])
   f.unmount()
 })
 

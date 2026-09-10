@@ -102,16 +102,17 @@ def start_execution(
             raise NotFoundException("任务不存在")
         task, plan = row
         if (
-            (run.status, run.stage, run.active_slot) != ("running", "pm", 1)
+            run.status != "running"
+            or run.active_slot != 1
             or task.status != "running"
             or plan.status != "running"
         ):
-            raise ConflictException("当前需求任务没有执行资格")
+            raise ConflictException("当前任务没有执行资格")
         current = latest_execution(db, task_id, lock=True)
         now = utc_now()
         if current is not None:
             if current.status == "running" and current.expires_at > now:
-                raise ConflictException("需求任务正在处理，请勿重复启动")
+                raise ConflictException("任务正在处理，请勿重复启动")
             if current.execution_id != recovery_execution_id or current.status == "succeeded":
                 raise ConflictException("请使用当前执行编号显式恢复任务")
             if current.status == "running":
@@ -141,7 +142,13 @@ def start_execution(
         raise
 
 
-def fail_execution(db: Session, task_id: str, execution_id: str) -> None:
+def fail_execution(
+    db: Session,
+    task_id: str,
+    execution_id: str,
+    *,
+    error: str = "任务未完成，可重试恢复；已保存的成果不受影响。",
+) -> None:
     # 只结束自己的执行；旧执行的异常不能把恢复后的执行标记为失败。
     db.execute(
         update(TaskExecution)
@@ -155,7 +162,7 @@ def fail_execution(db: Session, task_id: str, execution_id: str) -> None:
             status="failed",
             active_slot=None,
             finished_at=utc_now(),
-            error="需求整理未完成，可重试恢复；已保存的需求版本不受影响。",
+            error=error,
         )
     )
     db.commit()

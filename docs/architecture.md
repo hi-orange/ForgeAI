@@ -19,6 +19,21 @@ A user describes an application, receives a runnable app, and continues the conv
 its behavior and interface. Generated applications currently target FastAPI, Vue, and SQLite, while
 the generation strategy and internal implementation may evolve.
 
+## Requirement approval experience
+
+The project workspace keeps conversation on the left and the application preview on the right.
+After the user requests a build, propose a short, actionable feature checklist. Users can select,
+edit, or add requirements and approve the plan in one step. Use reasonable defaults for ordinary
+product details; ask questions only when the application goal cannot be understood. A proposal
+must wait for explicit approval before downstream work starts. Persist the approved selection as
+a new product-intent version, with traceability to its proposal.
+
+Approval preserves acceptance clauses only for unchanged selected features. Edited, added, or
+uncovered features require an explicit observable acceptance condition in the checklist before
+dispatch; approval must not invent one or carry over contradictory proposal text. Legacy v1
+requirements are read through a stable in-memory adapter; new approvals are v2 artifacts linked to
+the unchanged original. An old automatic design assignment does not substitute for user approval.
+
 ## Core concepts
 
 | Concept | Responsibility |

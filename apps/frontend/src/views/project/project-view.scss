@@ -12,10 +12,14 @@
 
 .workbench.atoms-mode {
   grid-template-columns: clamp(360px, 28vw, 500px) minmax(0, 1fr);
-  grid-template-rows: 2.35rem minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 0.5rem;
   padding: 0.5rem;
   background: #f4f4f5;
+}
+
+.workbench.atoms-mode.has-generated {
+  grid-template-rows: 2.35rem minmax(0, 1fr);
 }
 
 .workbench.atoms-mode .chat-pane,
@@ -271,6 +275,13 @@
   font-size: 0.88rem;
   line-height: 1.5;
 }
+
+.plan-goal-editor { display: block; margin: 0 0 .7rem; color: #64748b; font-size: .78rem; }
+.plan-goal-editor input { display: block; width: 100%; box-sizing: border-box; margin-top: .3rem; padding: .55rem .65rem; border: 1px solid #dbe3ef; border-radius: .55rem; font: inherit; }
+.plan-item-editor { flex: 1; min-width: 0; padding: .35rem .5rem; border: 1px solid #dbe3ef; border-radius: .45rem; font: inherit; }
+.add-requirement { display: flex; gap: .45rem; margin-top: .7rem; padding: .35rem .1rem; }
+.add-requirement input { flex: 1; min-width: 0; border: 0; border-bottom: 1px solid #e2e8f0; padding: .5rem .2rem; font: inherit; outline: 0; }
+.add-requirement button { border: 0; background: transparent; color: #2563eb; font-weight: 700; cursor: pointer; }
 
 .plan-list {
   list-style: none;

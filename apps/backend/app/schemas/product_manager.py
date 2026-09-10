@@ -72,7 +72,7 @@ class ProductManagerResult(BaseModel):
         min_length=1, max_length=MAX_HISTORY_MESSAGES + 1
     )
     context_truncated: bool
-    schema_version: Literal[1] = APP_SPEC_SCHEMA_VERSION
+    schema_version: Literal[2] = APP_SPEC_SCHEMA_VERSION
     model: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
     prompt_version: Annotated[
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)

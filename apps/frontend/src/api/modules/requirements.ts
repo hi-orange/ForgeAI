@@ -1,13 +1,22 @@
 import { apiRequest } from '../request'
 
+export type RequirementItem = {
+  id: string
+  text: string
+}
+
+export type AcceptanceCriterion = RequirementItem & {
+  source_ids: string[]
+}
+
 export type AppSpec = {
   goal: string
   target_users: string[]
-  features: string[]
-  data_requirements: string[]
-  interface_requirements: string[]
-  constraints: string[]
-  acceptance_criteria: string[]
+  features: RequirementItem[]
+  data_requirements: RequirementItem[]
+  interface_requirements: RequirementItem[]
+  constraints: RequirementItem[]
+  acceptance_criteria: AcceptanceCriterion[]
   open_questions: string[]
 }
 
@@ -18,7 +27,7 @@ export type RequirementsResult = {
   plan_id: string
   task_id: string
   configuration_item_id: string
-  outcome: 'needs_user_input' | 'ready_for_design'
+  outcome: 'needs_user_input' | 'awaiting_approval' | 'ready_for_design'
   open_questions: string[]
   design_plan_id: string | null
   design_task_id: string | null
@@ -37,6 +46,7 @@ export type RequirementsStatus = {
     | 'retry_available'
     | 'stopped'
     | 'needs_user_input'
+    | 'awaiting_approval'
     | 'ready_for_design'
     | 'design_pending'
   execution_id: string | null
@@ -52,6 +62,32 @@ export type RequirementMessage = {
   sender: string
   content: string
   client_message_id: string | null
+}
+
+export type RequirementApprovalSelection = {
+  id: string
+  text: string
+  kind: 'feature' | 'data' | 'interface' | 'constraint'
+  acceptance?: string
+}
+
+export type RequirementApproval = {
+  goal: string
+  selected: RequirementApprovalSelection[]
+  client_message_id: string
+}
+
+export function approveRequirements(
+  token: string,
+  id: number,
+  runId: string,
+  itemId: string,
+  payload: RequirementApproval,
+) {
+  return apiRequest<RequirementsStatus>(
+    `/api/v1/projects/${id}/build-runs/${runId}/requirements/${itemId}/approval`,
+    { method: 'POST', token, body: payload },
+  )
 }
 
 export function getRequirementsProject(token: string, id: number) {
