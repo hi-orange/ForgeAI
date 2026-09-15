@@ -19,9 +19,13 @@ from app.db.database import Base
 class ProjectMessageCategory(StrEnum):
     """ProjectManager 对用户消息作出的唯一分类。"""
 
+    # 询问进度/解释/确认等，不改变应用行为
     INQUIRY = "inquiry"
+    # 明确要求停止、取消或终止当前构建/修改
     STOP = "stop"
+    # 首次提出应用，或新增/删除/改变用户可见行为与验收
     PRODUCT_CHANGE = "product_change"
+    # 只修复已确认意图下的现有实现，不新增产品要求
     IMPLEMENTATION_REPAIR = "implementation_repair"
 
 
@@ -57,7 +61,10 @@ class ProjectMessageClassification(Base):
     category: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        comment="inquiry/stop/product_change/implementation_repair",
+        comment=(
+            "inquiry=询问不改行为；stop=停止构建；"
+            "product_change=产品变更；implementation_repair=修已有实现"
+        ),
     )
     decision_summary: Mapped[str] = mapped_column(
         Text,
