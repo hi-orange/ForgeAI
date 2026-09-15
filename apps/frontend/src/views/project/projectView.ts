@@ -7,7 +7,8 @@ export type PlanItem = {
 }
 
 export type PreviewMode = 'desktop' | 'tablet' | 'mobile'
-export type WorkspaceView = 'viewer' | 'overview' | 'editor' | 'files'
+/** Workbench center mode strip. Mock site workbench uses viewer/overview/editor/files. */
+export type WorkspaceView = 'viewer' | 'overview' | 'editor' | 'files' | 'design' | 'cloud' | 'more'
 export type CanvasView = 'preview' | 'spec'
 export type EditorFileKey = 'index.html' | 'style.css' | 'script.js'
 export type EditorTab = 'visual' | 'library' | 'theme'

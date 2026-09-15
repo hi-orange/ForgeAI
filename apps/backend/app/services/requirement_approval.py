@@ -121,7 +121,9 @@ def approve_requirements(
     result_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     try:
         run = lock_run(db, user, project_id, run_id)
-        if (run.status, run.stage, run.active_slot) != ("running", "pm", 1):
+        if run.status != "running" or run.active_slot != 1:
+            raise ConflictException("当前构建不能批准需求")
+        if run.stage not in ("pm", "developer"):
             raise ConflictException("当前构建不能批准需求")
         row = db.execute(
             select(ConfigurationItem, Task, Plan)
@@ -164,6 +166,8 @@ def approve_requirements(
             approved_id = approved.configuration_item_id
             db.commit()
             return approved_id
+        if run.stage != "pm":
+            raise ConflictException("当前构建不能批准需求")
         next_version = prepare_requirements_followup(db, source_plan, item_id)
         previous_result = db.get(TaskResult, source_task.task_id)
         if previous_result is not None and previous_result.prompt_version == APPROVAL_VERSION:

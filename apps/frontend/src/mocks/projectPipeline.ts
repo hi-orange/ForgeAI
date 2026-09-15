@@ -247,7 +247,7 @@ export function editProjectWebsite(id: number, payload: ProjectWebsiteEditPayloa
   return saveProject({
     ...current,
     generated_files: JSON.stringify(files),
-    website_revision: current.website_revision + 1,
+    website_revision: (current.website_revision ?? 0) + 1,
     updated_at: new Date().toISOString(),
   })
 }

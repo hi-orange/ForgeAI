@@ -33,6 +33,14 @@ export type RequirementsResult = {
   design_task_id: string | null
 }
 
+export type EngineeringActivity = {
+  id: string
+  name: string
+  label: string
+  detail: string
+  ok: boolean
+}
+
 export type RequirementsStatus = {
   project_id: number
   run_id: string | null
@@ -49,11 +57,17 @@ export type RequirementsStatus = {
     | 'awaiting_approval'
     | 'ready_for_design'
     | 'design_pending'
+    | 'engineering_running'
+    | 'engineering_generated'
   execution_id: string | null
   execution_expires_at: string | null
   error: string | null
   result: RequirementsResult | null
   app_spec: AppSpec | null
+  workspace_ready?: boolean
+  code_ready?: boolean
+  workspace_path?: string | null
+  activities?: EngineeringActivity[]
 }
 
 export type RequirementMessage = {
@@ -75,6 +89,13 @@ export type RequirementApproval = {
   goal: string
   selected: RequirementApprovalSelection[]
   client_message_id: string
+}
+
+export function continueEngineering(token: string, id: number, runId: string) {
+  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/build-runs/${runId}/engineering`, {
+    method: 'POST',
+    token,
+  })
 }
 
 export function approveRequirements(

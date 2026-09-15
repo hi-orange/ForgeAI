@@ -1,0 +1,80 @@
+import type { EngineeringActivity } from '@/api/modules/requirements'
+
+const labels: Record<string, string> = {
+  list_files: '查看目录',
+  read_file: '读取文件',
+  search_code: '搜索代码',
+  apply_patch: '写入文件',
+  run_check: '运行检查',
+  complete_work_item: '完成当前功能',
+  report_blocked: '构建暂停',
+  model: '暂时无法继续',
+  error: '操作失败',
+}
+export function timelineSteps(events: EngineeringActivity[]): EngineeringActivity[] {
+  const rows = new Map<string, EngineeringActivity>()
+  for (const event of events) {
+    const key = event.operation_id || event.id
+    rows.set(key, { ...rows.get(key), ...event })
+  }
+  return [...rows.values()]
+    .filter((step) => step.name !== 'model' || !step.ok)
+    .map((step) => ({
+      ...step,
+      label: labels[step.name] || step.label,
+      path: step.path || (['read_file', 'apply_patch'].includes(step.name) ? step.detail : null),
+    }))
+}
+
+export type BuildGroup = {
+  id: string
+  title: string
+  workItemId: string
+  steps: EngineeringActivity[]
+}
+
+/** Narration starts a step; consecutive tools share its collapsed card.
+ * Old checkpoints without narration group by work item instead of repeating model calls.
+ */
+export function buildGroups(events: EngineeringActivity[]): BuildGroup[] {
+  const annotated: EngineeringActivity[] = []
+  let legacyTitle = '正在构建应用'
+  for (const event of events) {
+    if (['start', 'model'].includes(event.name) && event.ok && event.detail)
+      legacyTitle = event.detail
+    annotated.push({
+      ...event,
+      work_item_title: event.work_item_title || legacyTitle,
+      work_item_id: event.work_item_id || legacyTitle,
+    })
+  }
+  const groups: BuildGroup[] = []
+  for (const step of timelineSteps(annotated)) {
+    if (step.name === 'start') continue
+    let group = groups.at(-1)
+    const title = step.name === 'summary' ? step.detail : step.work_item_title!
+    if (
+      !group ||
+      group.workItemId !== step.work_item_id ||
+      (step.name === 'summary' && group.title !== title)
+    ) {
+      // A fallback work-item title can be replaced by the first actual narration.
+      if (group && !group.steps.length && group.workItemId === step.work_item_id)
+        group.title = title
+      else {
+        group = { id: step.id, title, workItemId: step.work_item_id!, steps: [] }
+        groups.push(group)
+      }
+    }
+    if (step.name !== 'summary') group.steps.push(step)
+  }
+  return groups
+}
+
+export function isNearThreadBottom(element: {
+  scrollHeight: number
+  scrollTop: number
+  clientHeight: number
+}) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 80
+}

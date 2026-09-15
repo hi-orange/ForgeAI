@@ -1,6 +1,6 @@
 <template>
-  <RequirementsWorkbench v-if="useApi" :key="String(route.params.id)" />
-  <ProjectWorkbench v-else />
+  <ProjectWorkbench v-if="useMock" />
+  <RequirementsWorkbench v-else :key="String(route.params.id)" />
 </template>
 
 <script setup lang="ts">
@@ -9,5 +9,6 @@ import ProjectWorkbench from './ProjectWorkbench.vue'
 import RequirementsWorkbench from './RequirementsWorkbench.vue'
 
 const route = useRoute()
-const useApi = import.meta.env.VITE_PROJECT_DATA_SOURCE === 'api'
+/** Demo UI only when explicitly opted in. Default is the real requirements workbench. */
+const useMock = import.meta.env.VITE_PROJECT_DATA_SOURCE === 'mock'
 </script>

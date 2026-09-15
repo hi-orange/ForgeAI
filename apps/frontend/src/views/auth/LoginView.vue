@@ -1,17 +1,17 @@
 <template>
   <AuthLayout
-    headline="Build AI Agents with Confidence"
-    tagline="Create. Automate. Scale."
-    description="A modern platform for designing intelligent workflows."
+    headline="自信构建 AI Agent"
+    tagline="创建 · 自动化 · 扩展"
+    description="面向智能工作流的现代构建平台。"
   >
     <header class="intro">
-      <h2>Welcome back</h2>
-      <p>Sign in to continue building intelligent workflows</p>
+      <h2>欢迎回来</h2>
+      <p>登录以继续构建智能工作流</p>
     </header>
 
     <form class="auth-form" @submit.prevent="onSubmit">
       <label>
-        <span>Email</span>
+        <span>邮箱</span>
         <div class="field">
           <span class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -24,12 +24,13 @@
             type="email"
             autocomplete="email"
             placeholder="you@example.com"
+            :disabled="auth.loading"
           />
         </div>
       </label>
 
       <label>
-        <span>Password</span>
+        <span>密码</span>
         <div class="field">
           <span class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -41,12 +42,14 @@
             v-model="form.password"
             :type="showPassword ? 'text' : 'password'"
             autocomplete="current-password"
-            placeholder="Enter your password"
+            placeholder="请输入密码"
+            :disabled="auth.loading"
           />
           <button
             type="button"
             class="eye"
-            :aria-label="showPassword ? 'Hide password' : 'Show password'"
+            :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+            :disabled="auth.loading"
             @click="showPassword = !showPassword"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -59,22 +62,22 @@
 
       <div class="row">
         <label class="remember">
-          <input v-model="form.remember" type="checkbox" />
-          <span>Remember me</span>
+          <input v-model="form.remember" type="checkbox" :disabled="auth.loading" />
+          <span>记住我</span>
         </label>
-        <a class="forgot" href="#" @click.prevent>Forgot password?</a>
+        <a class="forgot" href="#" @click.prevent="onForgotPassword">忘记密码？</a>
       </div>
 
       <p v-if="localError" class="error" role="alert">{{ localError }}</p>
 
       <button type="submit" class="primary" :disabled="auth.loading">
-        {{ auth.loading ? 'Signing in…' : 'Sign In' }}
+        {{ auth.loading ? '登录中…' : '登录' }}
       </button>
     </form>
 
     <p class="switch">
-      Don't have an account?
-      <RouterLink :to="{ name: 'register' }">Sign up</RouterLink>
+      还没有账号？
+      <RouterLink :to="{ name: 'register' }">立即注册</RouterLink>
     </p>
   </AuthLayout>
 </template>
@@ -85,34 +88,49 @@ import { useRouter } from 'vue-router'
 
 import AuthLayout from '@/layouts/AuthLayout.vue'
 import { useAuthStore } from '@/stores'
+import { readRememberedEmail } from '@/stores/modules/auth'
 
 const router = useRouter()
 const auth = useAuthStore()
 
 const form = reactive({
-  email: '',
+  email: readRememberedEmail(),
   password: '',
-  remember: true,
+  remember: auth.rememberMe,
 })
 const showPassword = ref(false)
 const localError = ref<string | null>(null)
 
+function safeRedirect(raw: unknown): string {
+  if (typeof raw !== 'string') return '/'
+  if (!raw.startsWith('/') || raw.startsWith('//')) return '/'
+  return raw
+}
+
+function onForgotPassword() {
+  localError.value = '暂未开放找回密码，请联系管理员重置'
+}
+
 async function onSubmit() {
   localError.value = null
-  if (!form.email.trim() || !form.password) {
+  const email = form.email.trim()
+  if (!email || !form.password) {
     localError.value = '请输入邮箱和密码'
+    return
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    localError.value = '请输入有效的邮箱地址'
     return
   }
 
   try {
     await auth.login({
-      email: form.email.trim(),
+      email,
       password: form.password,
+      remember: form.remember,
     })
-    const redirect =
-      typeof router.currentRoute.value.query.redirect === 'string'
-        ? router.currentRoute.value.query.redirect
-        : '/'
+    form.password = ''
+    const redirect = safeRedirect(router.currentRoute.value.query.redirect)
     await router.replace(redirect)
   } catch {
     localError.value = auth.error ?? '登录失败'
@@ -180,6 +198,11 @@ label > span {
   cursor: pointer;
 }
 
+.eye:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .icon svg,
 .eye svg {
   width: 1.1rem;
@@ -207,6 +230,11 @@ input:focus {
   box-shadow: 0 0 0 3px rgba(47, 107, 255, 0.15);
 }
 
+input:disabled {
+  background: #f8fafc;
+  cursor: not-allowed;
+}
+
 .row {
   display: flex;
   align-items: center;
@@ -221,12 +249,14 @@ input:focus {
   color: #475569;
   font-size: 0.9rem;
   font-weight: 500;
+  cursor: pointer;
 }
 
 .remember input {
   width: 1rem;
   height: 1rem;
   accent-color: #2f6bff;
+  cursor: pointer;
 }
 
 .forgot {

@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.agents import product_manager as product_manager_agent
 from app.core.exceptions import ConflictException, NotFoundException
+from app.core.settings import settings
 from app.db.database import Base
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
@@ -90,6 +91,8 @@ def approval_payload(spec: dict[str, object] | None = None, **overrides) -> dict
 class ProductManagerWorkflowFixture(unittest.TestCase):
     def setUp(self) -> None:
         directory = self.enterContext(TemporaryDirectory(prefix="forgeai-pm-workflow-test-"))
+        self.workspace_root = self.enterContext(TemporaryDirectory(prefix="forgeai-ws-"))
+        self.enterContext(patch.object(settings, "runtime_data_root", self.workspace_root))
         self.engine = create_engine(
             f"sqlite+pysqlite:///{Path(directory) / 'workflow.db'}",
             connect_args={"check_same_thread": False, "timeout": 10},
@@ -110,6 +113,9 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
                 "chat_completion",
                 return_value=json.dumps(valid_spec(), ensure_ascii=False),
             )
+        )
+        self.engineer = self.enterContext(
+            patch("app.services.engineering_run.start_claimed_engineering", return_value={})
         )
         with self.session_factory() as db:
             self.owner = User(

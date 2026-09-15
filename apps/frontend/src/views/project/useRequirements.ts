@@ -114,7 +114,9 @@ export function useRequirements(projectId: number) {
     () =>
       status.value?.state === 'pending' ||
       status.value?.state === 'retry_available' ||
-      status.value?.state === 'ready_for_design',
+      status.value?.state === 'ready_for_design' ||
+      (status.value?.state === 'engineering_running' &&
+        (Boolean(status.value.error) || !status.value.activities?.length)),
   )
 
   function token() {
@@ -124,8 +126,16 @@ export function useRequirements(projectId: number) {
 
   function schedule() {
     clearTimeout(timer)
-    if (!disposed && (busy.value || status.value?.state === 'running')) {
-      timer = setTimeout(() => void refresh(), 2500)
+    if (
+      !disposed &&
+      (busy.value ||
+        status.value?.state === 'running' ||
+        status.value?.state === 'engineering_running')
+    ) {
+      timer = setTimeout(
+        () => void refresh(),
+        status.value?.state === 'engineering_running' ? 1200 : 2500,
+      )
     }
   }
 
@@ -223,7 +233,12 @@ export function useRequirements(projectId: number) {
 
   async function resume() {
     const current = status.value
-    if (!current?.run_id || !current.message_id || !canResume.value) return
+    if (!current?.run_id || !canResume.value) return
+    if (current.state === 'engineering_running') {
+      await perform(() => api.continueEngineering(token(), projectId, current.run_id!))
+      return
+    }
+    if (!current.message_id) return
     await perform(() =>
       api.executeRequirements(
         token(),

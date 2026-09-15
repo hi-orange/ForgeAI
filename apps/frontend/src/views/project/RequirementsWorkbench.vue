@@ -1,31 +1,22 @@
 <template>
   <main class="workbench" :class="{ 'chat-collapsed': chatCollapsed }">
-    <header class="project-bar">
-      <div class="project-title">
-        <RouterLink to="/" title="返回首页"><ForgeLogo :size="23" /></RouterLink>
+    <ProjectTopbar
+      :name="name"
+      :workspace-view="workspaceView"
+      :chat-collapsed="chatCollapsed"
+      :history-open="historyOpen"
+      :mode-tabs="modeTabs"
+      @update:workspace-view="setWorkspaceView"
+      @toggle-chat="chatCollapsed = !chatCollapsed"
+      @toggle-history="historyOpen = !historyOpen"
+      @share="shareProject"
+      @publish="publishProject"
+    >
+      <template #brand>
+        <RouterLink to="/" title="返回首页"><ForgeLogo :size="22" /></RouterLink>
         <strong>{{ name }}</strong>
-        <button
-          class="icon-button"
-          type="button"
-          :title="chatCollapsed ? '展开对话' : '收起对话'"
-          :aria-expanded="!chatCollapsed"
-          @click="chatCollapsed = !chatCollapsed"
-        >
-          <WorkbenchIcon :name="chatCollapsed ? 'chat-expand' : 'chat-collapse'" />
-        </button>
-      </div>
-      <nav class="workspace-tabs" aria-label="工作区">
-        <button type="button" :class="{ active: view === 'viewer' }" @click="view = 'viewer'">
-          <WorkbenchIcon name="app-viewer" /> 应用查看器
-        </button>
-        <button type="button" :class="{ active: view === 'plan' }" @click="view = 'plan'">
-          <WorkbenchIcon name="overview-grid" /> 计划
-        </button>
-      </nav>
-      <button type="button" class="refresh-button" :disabled="refreshing" @click="refresh">
-        <WorkbenchIcon name="refresh" /> 刷新进度
-      </button>
-    </header>
+      </template>
+    </ProjectTopbar>
 
     <aside v-show="!chatCollapsed" class="chat-pane" aria-label="项目对话">
       <div ref="thread" class="chat-thread">
@@ -45,11 +36,25 @@
             <span class="avatar">F</span><strong>Forge</strong><span>产品助手</span>
           </div>
           <p class="agent-status" role="status">
-            <span class="status-dot" :class="{ working: busy || status?.state === 'running' }" />{{
-              stateLabel
-            }}
+            <span
+              class="status-dot"
+              :class="{
+                working:
+                  busy || status?.state === 'running' || status?.state === 'engineering_running',
+              }"
+            />{{ stateLabel }}
           </p>
           <p class="intro">{{ agentText }}</p>
+          <ol v-if="status?.activities?.length" class="tool-trace">
+            <li
+              v-for="(step, index) in status.activities"
+              :key="step.id + '-' + index"
+              :class="{ failed: !step.ok }"
+            >
+              <span class="tool-label">{{ step.label }}</span>
+              <span v-if="step.detail" class="tool-detail">{{ step.detail }}</span>
+            </li>
+          </ol>
         </article>
 
         <section v-if="canApprove" class="approval-card" aria-labelledby="plan-heading">
@@ -141,14 +146,23 @@
           <p>
             {{
               status?.error ||
-              (status?.state === 'ready_for_design'
-                ? '计划已批准，点击继续处理。'
-                : '上次处理尚未完成，可以继续。')
+              (status?.state === 'engineering_running'
+                ? '构建似乎还没有开始写入文件，可以继续。'
+                : status?.state === 'ready_for_design'
+                  ? '计划已批准，点击继续处理。'
+                  : '上次处理尚未完成，可以继续。')
             }}
           </p>
           <button class="secondary" type="button" :disabled="busy" @click="resume">继续处理</button>
         </div>
-        <details v-if="status?.state === 'design_pending'" class="approved-card">
+        <details
+          v-if="
+            status?.state === 'design_pending' ||
+            status?.state === 'engineering_running' ||
+            status?.state === 'engineering_generated'
+          "
+          class="approved-card"
+        >
           <summary>
             <WorkbenchIcon name="check" /> 计划已批准 ·
             {{ status.app_spec?.features.length }} 项功能
@@ -185,50 +199,79 @@
       </form>
     </aside>
 
-    <section class="canvas-pane" aria-label="应用预览">
-      <div class="canvas-toolbar">
-        <span>{{ view === 'viewer' ? '预览' : '构建计划' }}</span>
-        <div class="preview-address">
-          <WorkbenchIcon name="home" /> Home <WorkbenchIcon name="chevron-down" />
-        </div>
-        <button type="button" :aria-expanded="consoleOpen" @click="consoleOpen = !consoleOpen">
-          <WorkbenchIcon name="console" /> 控制台
-        </button>
-      </div>
-      <div v-if="view === 'plan' && status?.app_spec" class="plan-overview">
-        <span class="eyebrow">{{ canApprove ? '待批准的建议' : '当前计划' }}</span>
-        <h1>{{ planGoal }}</h1>
-        <ul>
-          <li v-for="item in planItems.filter((entry) => entry.checked)" :key="item.id">
-            <WorkbenchIcon name="check" />{{ item.label }}
-          </li>
-        </ul>
-        <p v-if="canApprove">在左侧勾选、编辑或新增需求，批准后继续。</p>
-      </div>
-      <div v-else class="preview-empty">
-        <div class="preview-illustration" aria-hidden="true">
-          <div class="mini-sidebar"><i /><i /><i /></div>
-          <div class="mini-page">
-            <div class="mini-nav"><i /><i /></div>
-            <div class="mini-hero" />
-            <div class="mini-cards"><i /><i /><i /></div>
+    <section class="canvas-pane" :aria-label="canvasLabel">
+      <WorkspaceEditorPane
+        v-if="workspaceView === 'editor'"
+        :project-id="projectId"
+        :ready="Boolean(status?.code_ready)"
+        @download="downloadWorkspaceHint"
+      />
+      <div v-else-if="workspaceView === 'design'" class="design-surface">
+        <div class="canvas-toolbar">
+          <span>设计 / 预览</span>
+          <div class="preview-address">
+            <WorkbenchIcon name="home" /> Home <WorkbenchIcon name="chevron-down" />
           </div>
-          <span class="preview-spark">✦</span>
+          <button type="button" :disabled="refreshing" @click="refresh">
+            <WorkbenchIcon name="refresh" /> 刷新
+          </button>
+          <button type="button" :aria-expanded="consoleOpen" @click="consoleOpen = !consoleOpen">
+            <WorkbenchIcon name="console" /> 控制台
+          </button>
         </div>
-        <span class="eyebrow">从想法到应用</span>
-        <h1>{{ previewTitle }}</h1>
-        <p>{{ previewDescription }}</p>
-        <div class="progress-steps">
-          <span class="done">描述想法</span><i /><span
-            :class="{ done: canApprove || status?.state === 'design_pending' }"
-            >确认计划</span
-          ><i /><span>应用预览</span>
+        <div v-if="showPlanOverview" class="plan-overview">
+          <span class="eyebrow">{{ canApprove ? '待批准的建议' : '当前计划' }}</span>
+          <h1>{{ planGoal }}</h1>
+          <ul>
+            <li v-for="item in planItems.filter((entry) => entry.checked)" :key="item.id">
+              <WorkbenchIcon name="check" />{{ item.label }}
+            </li>
+          </ul>
+          <p v-if="canApprove">在左侧勾选、编辑或新增需求，批准后继续。</p>
         </div>
+        <div v-else class="preview-empty">
+          <div class="preview-illustration" aria-hidden="true">
+            <div class="mini-sidebar"><i /><i /><i /></div>
+            <div class="mini-page">
+              <div class="mini-nav"><i /><i /></div>
+              <div class="mini-hero" />
+              <div class="mini-cards"><i /><i /><i /></div>
+            </div>
+            <span class="preview-spark">✦</span>
+          </div>
+          <span class="eyebrow">从想法到应用</span>
+          <h1>{{ previewTitle }}</h1>
+          <p>{{ previewDescription }}</p>
+          <p v-if="status?.code_ready && status.workspace_path" class="workspace-path">
+            工作区已写入磁盘：<code>{{ status.workspace_path }}</code>
+          </p>
+          <div class="progress-steps">
+            <span class="done">描述想法</span><i /><span
+              :class="{
+                done:
+                  canApprove ||
+                  status?.state === 'design_pending' ||
+                  status?.state === 'engineering_running' ||
+                  status?.state === 'engineering_generated',
+              }"
+              >确认计划</span
+            ><i /><span :class="{ done: status?.code_ready }">生成应用</span><i /><span
+              >在线预览</span
+            >
+          </div>
+          <p v-if="status?.code_ready" class="preview-note">
+            切换到顶栏「编辑器」可浏览已写入的前后端源码。在线预览网关尚未接入。
+          </p>
+        </div>
+        <aside v-if="consoleOpen" class="console">
+          <strong>运行详情</strong>
+          <pre>{{ JSON.stringify(status, null, 2) }}</pre>
+        </aside>
       </div>
-      <aside v-if="consoleOpen" class="console">
-        <strong>运行详情</strong>
-        <pre>{{ JSON.stringify(status, null, 2) }}</pre>
-      </aside>
+      <div v-else class="mode-placeholder">
+        <h2>{{ placeholderTitle }}</h2>
+        <p>{{ placeholderDescription }}</p>
+      </div>
     </section>
   </main>
 </template>
@@ -237,10 +280,14 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import ForgeLogo from '@/components/ForgeLogo.vue'
+import type { WorkspaceView } from './projectView'
+import ProjectTopbar, { type TopbarModeTab } from './components/ProjectTopbar.vue'
 import WorkbenchIcon from './components/WorkbenchIcon.vue'
+import WorkspaceEditorPane from './components/WorkspaceEditorPane.vue'
 import { useRequirements } from './useRequirements'
 
 const route = useRoute()
+const projectId = Number(route.params.id)
 const {
   name,
   status,
@@ -261,16 +308,24 @@ const {
   submit,
   resume,
   approve,
-} = useRequirements(Number(route.params.id))
+} = useRequirements(projectId)
 const chatCollapsed = ref(false)
 const consoleOpen = ref(false)
 const editing = ref(false)
 const newRequirement = ref('')
-const view = ref<'viewer' | 'plan'>('viewer')
+const historyOpen = ref(false)
+const workspaceView = ref<WorkspaceView>('design')
 const thread = ref<HTMLElement | null>(null)
 const featureCount = computed(
   () => planItems.value.filter((item) => item.kind === 'feature').length,
 )
+const modeTabs: TopbarModeTab[] = [
+  { id: 'design', icon: 'paintbrush', label: '设计' },
+  { id: 'editor', icon: 'editor-code', label: '编辑器' },
+  { id: 'cloud', icon: 'cloud-upload', label: '云' },
+  { id: 'files', icon: 'folder', label: '文件' },
+  { id: 'more', icon: 'more-dots', label: '更多' },
+]
 const labels = {
   not_started: '准备开始',
   pending: '等待处理',
@@ -280,7 +335,9 @@ const labels = {
   needs_user_input: '补充一个想法',
   awaiting_approval: '构建计划已准备好',
   ready_for_design: '计划已批准',
-  design_pending: '计划已批准，等待后续处理',
+  design_pending: '计划已批准，正在开始构建',
+  engineering_running: '正在根据获批需求编写代码',
+  engineering_generated: '业务代码已写入工作区',
 }
 function kindLabel(kind: string) {
   return (
@@ -288,37 +345,94 @@ function kindLabel(kind: string) {
     kind
   )
 }
+const postApproval = computed(
+  () =>
+    status.value?.state === 'design_pending' ||
+    status.value?.state === 'engineering_running' ||
+    status.value?.state === 'engineering_generated',
+)
 const stateLabel = computed(() =>
   busy.value ? '正在处理…' : status.value ? labels[status.value.state] : '正在加载项目…',
 )
 const agentText = computed(() => {
   if (canApprove.value) return '我整理了一份初步计划。选择你想要的功能，随时补充自己的想法。'
-  if (status.value?.state === 'design_pending') return '你的选择已保存，后续工作将按这份计划进行。'
+  if (postApproval.value) {
+    if (status.value?.state === 'engineering_generated') {
+      return '已按获批需求改写工作区源码。可在「编辑器」查看；正式验收与预览仍未标记为完成。'
+    }
+    if (status.value?.state === 'engineering_running') {
+      return status.value.activities?.length
+        ? '正在按获批需求读写工作区。下面是逐步操作。'
+        : '正在根据获批需求构建应用，读写文件会出现在这条对话里。'
+    }
+    return '计划已批准，正在开始构建应用。'
+  }
   if (busy.value || status.value?.state === 'running')
     return '我正在把你的想法整理成可选择的功能和页面。'
   return '告诉我你想做什么，我会先整理一份简洁的构建计划。'
 })
 const previewTitle = computed(() =>
-  status.value?.state === 'design_pending'
-    ? '构建计划已确认'
+  postApproval.value
+    ? status.value?.code_ready
+      ? '应用代码已写入'
+      : '正在构建你的应用'
     : canApprove.value
       ? '你的应用，即将从这里开始'
       : '把想法变成看得见的应用',
 )
 const previewDescription = computed(() =>
-  status.value?.state === 'design_pending'
-    ? '需求已交给工程交付任务。当前版本尚未接入代码生成，暂时没有可预览的应用。'
+  postApproval.value
+    ? status.value?.state === 'engineering_generated'
+      ? '已按获批需求写入工作区代码。未跑完整验收，也尚未登记可用版本。'
+      : status.value?.state === 'engineering_running'
+        ? status.value.activities?.length
+          ? '对话里可以看到正在读取和写入的文件。'
+          : '正在根据获批需求编写业务代码，操作会显示在左侧对话中。'
+        : '需求已交给工程任务，正在开始构建。'
     : canApprove.value
       ? '在左侧选择需要的功能，编辑计划或补充需求，然后批准构建。'
       : '描述你的想法，确认核心功能，应用生成后将在这里预览。',
 )
+const showPlanOverview = computed(() => Boolean(status.value?.app_spec) && canApprove.value)
+const canvasLabel = computed(() => {
+  if (workspaceView.value === 'editor') return '代码编辑器'
+  if (workspaceView.value === 'design') return '设计预览'
+  return '工作区'
+})
+const placeholderTitle = computed(() => {
+  if (workspaceView.value === 'cloud') return 'Atoms 云'
+  if (workspaceView.value === 'files') return '文件与资源'
+  return '更多工具'
+})
+const placeholderDescription = computed(() => {
+  if (workspaceView.value === 'cloud') return '应用数据库、用户与环境管理将在后续接入。'
+  if (workspaceView.value === 'files') return '资源库与上传能力尚未接入；源码请使用「编辑器」。'
+  return 'Terminal 等工具入口将放在这里。'
+})
+
+function setWorkspaceView(view: WorkspaceView) {
+  workspaceView.value = view
+}
+function shareProject() {
+  void navigator.clipboard?.writeText(window.location.href)
+}
+function publishProject() {
+  window.alert('发布尚未接入。当前仅支持工作区源码浏览。')
+}
+function downloadWorkspaceHint() {
+  window.alert(
+    status.value?.workspace_path
+      ? `工作区位于：\n${status.value.workspace_path}\n\n打包下载接口尚未接入。`
+      : '工作区尚未准备好。',
+  )
+}
 function addRequirement() {
   if (!newRequirement.value.trim() || featureCount.value >= 50) return
   addPlanItem(newRequirement.value)
   newRequirement.value = ''
 }
 watch(
-  () => [messages.value.length, status.value?.state],
+  () => [messages.value.length, status.value?.state, status.value?.activities?.length],
   async () => {
     await nextTick()
     thread.value?.scrollTo({ top: thread.value.scrollHeight, behavior: 'smooth' })
@@ -508,9 +622,41 @@ summary:focus-visible {
   }
 }
 .intro {
-  margin: 0 0 26px 39px;
+  margin: 0 0 12px 39px;
   line-height: 1.9;
   color: #787b8b;
+}
+.tool-trace {
+  margin: 0 0 26px 39px;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+  li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    color: #5d6478;
+    font-size: 13px;
+  }
+  .tool-label {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: #3d4aa8;
+    background: #e8ebff;
+    border-radius: 999px;
+    padding: 2px 8px;
+  }
+  .tool-detail {
+    color: #6a7084;
+    word-break: break-all;
+  }
+  .failed .tool-label {
+    color: #9b2c2c;
+    background: #fde8e8;
+  }
 }
 .approval-card {
   padding: 16px 8px 8px;
@@ -707,6 +853,32 @@ summary:focus-visible {
   overflow: hidden;
   background: white;
 }
+.design-surface {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.mode-placeholder {
+  flex: 1;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 32px;
+  text-align: center;
+  color: #71717a;
+  h2 {
+    margin: 0;
+    color: #27272a;
+    font-size: 1.15rem;
+    font-weight: 600;
+  }
+  p {
+    margin: 0;
+    max-width: 28rem;
+    line-height: 1.7;
+  }
+}
 .canvas-toolbar {
   display: flex;
   justify-content: space-between;
@@ -755,6 +927,28 @@ summary:focus-visible {
     line-height: 1.9;
     margin: 0;
   }
+}
+.workspace-path {
+  max-width: min(640px, 90%);
+  margin-top: 14px;
+  font-size: 12px;
+  color: #59617e;
+  word-break: break-all;
+  code {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: #f3f4f8;
+    font-size: 11px;
+  }
+}
+.preview-note {
+  max-width: 420px;
+  margin-top: 16px;
+  font-size: 12px;
+  color: #8a6d3b;
+  line-height: 1.7;
 }
 .eyebrow {
   font-size: 11px;

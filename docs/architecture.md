@@ -34,6 +34,24 @@ dispatch; approval must not invent one or carry over contradictory proposal text
 requirements are read through a stable in-memory adapter; new approvals are v2 artifacts linked to
 the unchanged original. An old automatic design assignment does not substitute for user approval.
 
+## Progressive engineering experience
+
+After approval, engineering proceeds through small changes in an isolated workspace. The agent
+reads files, implements database migrations, backend APIs and frontend consumers, and receives
+real execution results to repair failures. The conversation shows ordered work summaries and
+tool starts, results and errors; refreshing preserves this history. File changes refresh the
+source viewer. The workspace template is browsable as soon as it exists, clearly distinguished
+from business code. Build activity is grouped into collapsible steps with a compact current-step
+view; internal model calls do not flood the conversation. Reading earlier steps must not force
+the conversation back to the bottom. Successful writes update the source viewer from real files.
+A completion request must run platform-controlled engineering checks against the
+current source before a work item can be marked checked. Passing migration, startup and build
+checks is not a claim of full business acceptance or a published, previewable revision.
+
+Generated code runs only in a restricted execution environment. An unavailable environment pauses
+work with an actionable reason. Explicit continuation retains frozen inputs, files and history,
+starts a new execution attempt, and preserves the previous attempt's usage and outcome.
+
 ## Core concepts
 
 | Concept | Responsibility |
