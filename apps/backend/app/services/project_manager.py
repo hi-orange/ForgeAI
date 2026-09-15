@@ -32,11 +32,11 @@ from app.services.engineering import (
     load_approved_app_spec,
     prepare_requirements_followup,
 )
-from app.services.message_classification import (
+from app.services.project_message import stage_user_project_message
+from app.services.project_message_classification import (
     get_stored_classification,
     require_project_message,
 )
-from app.services.project_message import stage_user_project_message
 from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import lock_run
 
