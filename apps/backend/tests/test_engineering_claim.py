@@ -22,8 +22,8 @@ from app.schemas.app_spec import AppSpec
 from app.schemas.requirements import RequirementsApproval
 from app.services import product_manager, project_manager
 from app.services import task as task_service
-from app.services.design_handoff import APPROVAL_VERSION
-from app.services.engineering_claim import (
+from app.services.engineering import (
+    APPROVAL_VERSION,
     INPUT_SNAPSHOT_KIND,
     TOOL_STRATEGY_VERSION,
     approved_spec_digest,

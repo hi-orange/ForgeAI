@@ -41,7 +41,7 @@ from app.models.project_message_classification import (
 )
 from app.models.user import User
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
-from app.services import project_manager as project_manager_service
+from app.services import message_classification as message_classification_service
 
 
 class ProjectManagerClassificationTests(unittest.TestCase):
@@ -164,7 +164,7 @@ class ProjectManagerClassificationTests(unittest.TestCase):
         )
 
         with patch.object(
-            project_manager_service.project_manager_agent,
+            message_classification_service.project_manager_agent,
             "classify_message",
             return_value=decision,
         ) as classify:
@@ -215,7 +215,7 @@ class ProjectManagerClassificationTests(unittest.TestCase):
         )
 
         with patch.object(
-            project_manager_service.project_manager_agent,
+            message_classification_service.project_manager_agent,
             "classify_message",
             return_value=decision,
         ) as classify:
@@ -389,24 +389,26 @@ class ProjectManagerClassificationTests(unittest.TestCase):
 
         with (
             patch.object(
-                project_manager_service.project_service,
+                message_classification_service.project_service,
                 "get_user_project",
                 return_value=self.project,
             ),
-            patch.object(project_manager_service, "_get_project_message", return_value=message),
             patch.object(
-                project_manager_service,
-                "_get_classification",
+                message_classification_service, "require_project_message", return_value=message
+            ),
+            patch.object(
+                message_classification_service,
+                "get_stored_classification",
                 side_effect=(None, winning),
             ),
-            patch.object(project_manager_service, "_recent_context", return_value=[]),
+            patch.object(message_classification_service, "_recent_context", return_value=[]),
             patch.object(
-                project_manager_service.project_manager_agent,
+                message_classification_service.project_manager_agent,
                 "classify_message",
                 return_value=decision,
             ),
         ):
-            result = project_manager_service.classify_user_message(
+            result = message_classification_service.classify_user_message(
                 db,
                 self.user,
                 self.project.id,

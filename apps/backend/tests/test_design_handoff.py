@@ -27,7 +27,7 @@ from app.schemas.task import TaskCreate
 from app.services import plan as plan_service
 from app.services import product_manager, project_manager
 from app.services import task as task_service
-from app.services.design_handoff import APPROVAL_VERSION
+from app.services.engineering import APPROVAL_VERSION
 from app.services.requirement_approval import approve_requirements
 from app.services.requirements import get_requirements_status
 from app.services.task_execution import utc_now

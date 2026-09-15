@@ -7,8 +7,7 @@ from app.schemas.product_manager_workflow import ProductManagerWorkflowResult
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import RequirementsApproval, RequirementsExecute, RequirementsStatus
 from app.schemas.response import ApiResponse, success
-from app.services import engineering_run
-from app.services.engineering_claim import claim_software_engineer_task
+from app.services import engineering
 from app.services.project_manager import create_clarification_plan, create_engineering_delivery_task
 from app.services.requirement_approval import approve_requirements
 from app.services.requirements import get_requirements_status
@@ -27,15 +26,17 @@ def _ensure_engineering_running(
     status = get_requirements_status(db, current_user, project_id)
     if status.run_id != run_id or status.state != "engineering_running":
         return status
-    if not status.execution_id or engineering_run.is_engineering_active(status.execution_id):
+    if not status.execution_id or engineering.is_engineering_active(status.execution_id):
         return status
     if status.error and not force:
         return status
     task_id = status.result.design_task_id if status.result else None
     if not task_id:
         return status
-    task, execution = claim_software_engineer_task(db, current_user, project_id, run_id, task_id)
-    engineering_run.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
+    task, execution = engineering.claim_software_engineer_task(
+        db, current_user, project_id, run_id, task_id
+    )
+    engineering.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
     return get_requirements_status(db, current_user, project_id)
 
 
@@ -53,10 +54,10 @@ def approve_requirement_plan(
 ) -> dict:
     approved_id = approve_requirements(db, current_user, project_id, run_id, item_id, payload)
     delivery = create_engineering_delivery_task(db, current_user, project_id, run_id, approved_id)
-    task, execution = claim_software_engineer_task(
+    task, execution = engineering.claim_software_engineer_task(
         db, current_user, project_id, run_id, delivery.task_id
     )
-    engineering_run.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
+    engineering.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
     return success(get_requirements_status(db, current_user, project_id))
 
 
@@ -82,8 +83,10 @@ def continue_engineering(
     task_id = status.result.design_task_id if status.result else None
     if not task_id:
         raise BusinessException("缺少工程任务")
-    task, execution = claim_software_engineer_task(db, current_user, project_id, run_id, task_id)
-    engineering_run.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
+    task, execution = engineering.claim_software_engineer_task(
+        db, current_user, project_id, run_id, task_id
+    )
+    engineering.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
     return success(get_requirements_status(db, current_user, project_id))
 
 

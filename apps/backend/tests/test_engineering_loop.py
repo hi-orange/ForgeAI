@@ -16,7 +16,7 @@ from app.models.task_execution import TaskExecution
 from app.orchestration.software_engineer import run_engineering_workflow
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
 from app.schemas.app_spec import AppSpec
-from app.services.engineering_claim import read_frozen_input_snapshot
+from app.services.engineering import read_frozen_input_snapshot
 from app.tools.paths import sha256_bytes
 
 

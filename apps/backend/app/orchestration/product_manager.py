@@ -23,13 +23,11 @@ from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowResult,
 )
 from app.services import build_run as build_run_service
-from app.services import configuration_manager, engineering_run, task_execution
+from app.services import configuration_manager, engineering, task_execution
 from app.services import plan as plan_service
 from app.services import product_manager as product_manager_service
 from app.services import project_manager as project_manager_service
 from app.services import task as task_service
-from app.services.design_handoff import APPROVAL_VERSION, find_pending_engineering_task
-from app.services.engineering_claim import claim_software_engineer_task
 from app.services.requirement_inputs import read_app_spec
 
 logger = logging.getLogger("forgeai")
@@ -294,7 +292,7 @@ class _ProductManagerNodes:
                 .limit(1)
             )
             if latest_plan_id != plan.plan_id:
-                design_task = find_pending_engineering_task(db, plan, item.item_id)
+                design_task = engineering.find_pending_engineering_task(db, plan, item.item_id)
                 if (
                     app_spec.open_questions
                     or design_task is None
@@ -304,7 +302,7 @@ class _ProductManagerNodes:
             return {
                 "configuration_item_id": item.item_id,
                 "app_spec": app_spec.model_dump(mode="json"),
-                "approved": result.prompt_version == APPROVAL_VERSION,
+                "approved": result.prompt_version == engineering.APPROVAL_VERSION,
             }
 
     @staticmethod
@@ -348,14 +346,14 @@ class _ProductManagerNodes:
                 state["build_run_id"],
                 state["configuration_item_id"],
             )
-            claimed, execution = claim_software_engineer_task(
+            claimed, execution = engineering.claim_software_engineer_task(
                 db,
                 user,
                 state["project_id"],
                 state["build_run_id"],
                 task.task_id,
             )
-            engineering_run.start_claimed_engineering(
+            engineering.start_claimed_engineering(
                 db,
                 user,
                 state["project_id"],
