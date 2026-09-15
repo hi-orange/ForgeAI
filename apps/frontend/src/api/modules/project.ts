@@ -1,29 +1,41 @@
 import { apiRequest } from '../request'
 import * as projectMock from '@/mocks/projectPipeline'
 
-const useProjectMock = import.meta.env.VITE_PROJECT_DATA_SOURCE !== 'api'
+/** Explicit opt-in only. Unset / any other value uses the real backend. */
+const useProjectMock = import.meta.env.VITE_PROJECT_DATA_SOURCE === 'mock'
 
-function buildRunApiPending<T>(): Promise<T> {
-  return Promise.reject(new Error('新 BuildRun 接口尚未接入，请使用 mock 数据源'))
+function demoOnlyApi<T>(action: string): Promise<T> {
+  return Promise.reject(
+    new Error(`${action} 仅在演示模式可用；真实流程请使用需求工作台与 BuildRun 接口`),
+  )
 }
 
+/** Matches backend `ProjectOut`. Demo-only fields are optional and absent from API responses. */
 export type Project = {
   id: number
   user_id: number
   name: string
   description: string | null
   prompt: string | null
-  prd: string | null
-  approved_spec: string | null
-  approved_at: string | null
-  generated_files: string | null
-  build_error: string | null
-  validation_report: string | null
-  website_revision: number
-  built_at: string | null
   status: string
   created_at: string
   updated_at: string
+  /** @deprecated Mock workbench only */
+  prd?: string | null
+  /** @deprecated Mock workbench only */
+  approved_spec?: string | null
+  /** @deprecated Mock workbench only */
+  approved_at?: string | null
+  /** @deprecated Mock workbench only */
+  generated_files?: string | null
+  /** @deprecated Mock workbench only */
+  build_error?: string | null
+  /** @deprecated Mock workbench only */
+  validation_report?: string | null
+  /** @deprecated Mock workbench only */
+  website_revision?: number
+  /** @deprecated Mock workbench only */
+  built_at?: string | null
 }
 
 export type WebsiteSection = {
@@ -212,28 +224,35 @@ export function startProject(token: string, id: number, payload: ProjectStartPay
   if (useProjectMock) return Promise.resolve(projectMock.startProject(id, payload))
 
   void token
-  return buildRunApiPending<ProjectStartResult>()
+  void id
+  void payload
+  return demoOnlyApi<ProjectStartResult>('启动模拟规格生成')
 }
 
 export function approveProjectSpec(token: string, id: number, payload: ProjectApproveSpecPayload) {
   if (useProjectMock) return Promise.resolve(projectMock.approveProjectSpec(id, payload))
 
   void token
-  return buildRunApiPending<Project>()
+  void id
+  void payload
+  return demoOnlyApi<Project>('批准模拟规格')
 }
 
 export function buildProject(token: string, id: number) {
   if (useProjectMock) return Promise.resolve(projectMock.buildProject(id))
 
   void token
-  return buildRunApiPending<Project>()
+  void id
+  return demoOnlyApi<Project>('模拟网站构建')
 }
 
 export function editProjectWebsite(token: string, id: number, payload: ProjectWebsiteEditPayload) {
   if (useProjectMock) return Promise.resolve(projectMock.editProjectWebsite(id, payload))
 
   void token
-  return buildRunApiPending<Project>()
+  void id
+  void payload
+  return demoOnlyApi<Project>('模拟网站编辑')
 }
 
 export function suggestProjectElementEdit(
@@ -244,7 +263,9 @@ export function suggestProjectElementEdit(
   if (useProjectMock) return Promise.resolve(projectMock.suggestProjectElementEdit(id, payload))
 
   void token
-  return buildRunApiPending<ProjectElementAiReply>()
+  void id
+  void payload
+  return demoOnlyApi<ProjectElementAiReply>('模拟元素建议')
 }
 
 export function reviseProjectWebsite(
@@ -255,5 +276,7 @@ export function reviseProjectWebsite(
   if (useProjectMock) return Promise.resolve(projectMock.reviseProjectWebsite(id, payload))
 
   void token
-  return buildRunApiPending<ProjectWebsiteReviseReply>()
+  void id
+  void payload
+  return demoOnlyApi<ProjectWebsiteReviseReply>('模拟网站修订')
 }

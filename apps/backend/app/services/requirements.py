@@ -1,7 +1,10 @@
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictException
+from app.core.settings import settings
+from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
 from app.models.plan import Plan
@@ -12,7 +15,7 @@ from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowOutcome,
     ProductManagerWorkflowResult,
 )
-from app.schemas.requirements import RequirementsStatus
+from app.schemas.requirements import EngineeringActivity, RequirementsStatus
 from app.services import project as project_service
 from app.services.design_handoff import (
     APPROVAL_VERSION,
@@ -21,8 +24,52 @@ from app.services.design_handoff import (
     find_pending_engineering_task,
     load_approved_app_spec,
 )
+from app.services.engineering_claim import read_frozen_input_snapshot
 from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import latest_execution, utc_now
+
+
+def _activities_from_checkpoint(checkpoint: object) -> list[EngineeringActivity]:
+    if not isinstance(checkpoint, dict):
+        return []
+    items: list[EngineeringActivity] = []
+    for raw in checkpoint.get("activity") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            items.append(EngineeringActivity.model_validate(raw))
+        except ValidationError:
+            continue
+    return items
+
+
+def _checkpoint_has_written_code(checkpoint: object) -> bool:
+    if not isinstance(checkpoint, dict):
+        return False
+    if checkpoint.get("outcome") == "generated":
+        return True
+    for item in checkpoint.get("observations") or []:
+        if isinstance(item, dict) and item.get("name") == "apply_patch" and item.get("ok"):
+            return True
+    return False
+
+
+def _attach_workspace_status(result: RequirementsStatus) -> RequirementsStatus:
+    if result.run_id is None or result.state not in (
+        "design_pending",
+        "engineering_running",
+        "engineering_generated",
+    ):
+        return result
+    ready = workspace_is_ready(result.project_id, result.run_id)
+    result.workspace_ready = ready
+    if result.state == "engineering_generated":
+        result.code_ready = True
+    if ready:
+        result.workspace_path = str(
+            default_workspace_path(settings.runtime_data_root, result.project_id, result.run_id)
+        )
+    return result
 
 
 def get_requirements_status(db: Session, user: User, project_id: int) -> RequirementsStatus:
@@ -37,25 +84,25 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
         .limit(1)
     )
     if run is None:
-        return result
+        return _attach_workspace_status(result)
     result.run_id = run.run_id
     plan = db.scalar(
         select(Plan).where(Plan.build_run_id == run.run_id).order_by(Plan.version.desc()).limit(1)
     )
-    if run.active_slot != 1 or (run.status == "running" and run.stage != "pm"):
+    if run.active_slot != 1:
         result.state = "stopped"
-        return result
+        return _attach_workspace_status(result)
+    if run.status == "running" and run.stage not in ("pm", "developer"):
+        result.state = "stopped"
+        return _attach_workspace_status(result)
     if plan is None:
-        return result
+        return _attach_workspace_status(result)
     tasks = list(db.scalars(select(Task).where(Task.plan_id == plan.plan_id)).all())
     delivery_task = tasks[0] if len(tasks) == 1 else None
     if delivery_task is not None and delivery_task.recipient in (
         "SoftwareEngineer",
         "SolutionArchitect",
     ):
-        if plan.status != "pending" or delivery_task.status != "pending":
-            result.state = "stopped"
-            return result
         if len(delivery_task.input_configuration_item_ids) != 1:
             raise ConflictException("工程交付任务没有固定唯一的需求输入")
         if delivery_task.recipient == "SoftwareEngineer":
@@ -75,10 +122,6 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             run.run_id,
             delivery_task.input_configuration_item_ids[0],
         )
-        verified = find_pending_engineering_task(db, source_plan, source_item.item_id)
-        if verified is None or verified.task_id != delivery_task.task_id:
-            raise ConflictException("工程交付任务与需求来源不一致")
-        result.state = "design_pending"
         result.plan_id, result.task_id, result.message_id = (
             plan.plan_id,
             delivery_task.task_id,
@@ -108,10 +151,59 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             result.plan_id, result.task_id = source_plan.plan_id, source_task.task_id
             result.result.outcome = ProductManagerWorkflowOutcome.AWAITING_APPROVAL
             result.result.design_plan_id = result.result.design_task_id = None
-        return result
+            return _attach_workspace_status(result)
+
+        if plan.status == "pending" and delivery_task.status == "pending":
+            verified = find_pending_engineering_task(db, source_plan, source_item.item_id)
+            if verified is None or verified.task_id != delivery_task.task_id:
+                raise ConflictException("工程交付任务与需求来源不一致")
+            result.state = "design_pending"
+            return _attach_workspace_status(result)
+
+        if (
+            delivery_task.recipient == "SoftwareEngineer"
+            and plan.status == "running"
+            and delivery_task.status == "running"
+            and run.stage == "developer"
+        ):
+            execution = latest_execution(db, delivery_task.task_id)
+            if (
+                execution is None
+                or execution.status != "running"
+                or execution.active_slot != 1
+                or execution.expires_at <= utc_now()
+            ):
+                result.state = "retry_available"
+                if execution is not None:
+                    result.execution_id = execution.execution_id
+                    result.execution_expires_at = execution.expires_at
+                    result.error = execution.error
+                return _attach_workspace_status(result)
+            result.state = "engineering_running"
+            result.execution_id = execution.execution_id
+            result.execution_expires_at = execution.expires_at
+            result.error = execution.error
+            snapshot = read_frozen_input_snapshot(execution)
+            checkpoint = snapshot.get("checkpoint") if snapshot else None
+            result.activities = _activities_from_checkpoint(checkpoint)
+            if isinstance(checkpoint, dict) and checkpoint.get("outcome") == "generated":
+                result.state = "engineering_generated"
+                result.code_ready = True
+            elif isinstance(checkpoint, dict) and checkpoint.get("blocked_reason"):
+                result.error = str(checkpoint.get("blocked_reason"))
+                result.code_ready = _checkpoint_has_written_code(checkpoint)
+            elif isinstance(checkpoint, dict) and checkpoint.get("last_error"):
+                result.error = str(checkpoint.get("last_error"))
+                result.code_ready = _checkpoint_has_written_code(checkpoint)
+            else:
+                result.code_ready = _checkpoint_has_written_code(checkpoint)
+            return _attach_workspace_status(result)
+
+        result.state = "stopped"
+        return _attach_workspace_status(result)
     if len(tasks) != 1 or tasks[0].recipient != "ProductManager":
         result.state = "stopped"
-        return result
+        return _attach_workspace_status(result)
     task = tasks[0]
     result.plan_id, result.task_id, result.message_id = (
         plan.plan_id,
@@ -173,4 +265,4 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 if execution.status == "running" and execution.expires_at > utc_now()
                 else "retry_available"
             )
-    return result
+    return _attach_workspace_status(result)

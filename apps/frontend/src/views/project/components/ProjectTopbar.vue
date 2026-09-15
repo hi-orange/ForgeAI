@@ -2,14 +2,16 @@
   <header class="project-topbar">
     <div class="topbar-start">
       <div class="project-menu">
-        <ForgeLogo :size="22" />
-        <strong>{{ name || 'Untitled Website' }}</strong>
+        <slot name="brand">
+          <ForgeLogo :size="22" />
+          <strong>{{ name || '未命名项目' }}</strong>
+        </slot>
       </div>
       <div class="topbar-start-tools">
         <button
           type="button"
           class="icon-btn"
-          title="版本历史"
+          title="历史"
           :class="{ 'is-active': historyOpen }"
           @click="$emit('toggle-history')"
         >
@@ -18,7 +20,7 @@
         <button
           type="button"
           class="icon-btn"
-          :title="chatCollapsed ? 'Open ChatBox' : 'Close ChatBox'"
+          :title="chatCollapsed ? '展开对话' : '收起对话'"
           @click="$emit('toggle-chat')"
         >
           <WorkbenchIcon :name="chatCollapsed ? 'chat-expand' : 'chat-collapse'" />
@@ -27,9 +29,9 @@
     </div>
 
     <div class="topbar-center">
-      <div class="toolbar-strip" role="toolbar" aria-label="预览工具">
+      <div class="toolbar-strip" role="toolbar" aria-label="工作区模式">
         <button
-          v-for="tab in modeTabs"
+          v-for="tab in resolvedTabs"
           :key="tab.id"
           type="button"
           role="tab"
@@ -51,7 +53,7 @@
       <button
         type="button"
         class="action-btn primary"
-        :disabled="status !== 'completed'"
+        :disabled="!canPublish"
         @click="$emit('publish')"
       >
         发布
@@ -61,17 +63,31 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import ForgeLogo from '@/components/ForgeLogo.vue'
 import type { WorkspaceView } from '../projectView'
 import WorkbenchIcon, { type WorkbenchIconName } from './WorkbenchIcon.vue'
 
-defineProps<{
-  name?: string | null
-  status?: string | null
-  workspaceView: WorkspaceView
-  chatCollapsed: boolean
-  historyOpen: boolean
-}>()
+export type TopbarModeTab = {
+  id: WorkspaceView
+  icon: WorkbenchIconName
+  label: string
+}
+
+const props = withDefaults(
+  defineProps<{
+    name?: string | null
+    workspaceView: WorkspaceView
+    chatCollapsed: boolean
+    historyOpen?: boolean
+    canPublish?: boolean
+    modeTabs?: TopbarModeTab[]
+  }>(),
+  {
+    historyOpen: false,
+    canPublish: false,
+  },
+)
 
 const emit = defineEmits<{
   'update:workspaceView': [value: WorkspaceView]
@@ -81,15 +97,13 @@ const emit = defineEmits<{
   'toggle-history': []
 }>()
 
-const modeTabs: {
-  id: WorkspaceView
-  icon: WorkbenchIconName
-  label: string
-}[] = [
+const defaultTabs: TopbarModeTab[] = [
   { id: 'viewer', icon: 'app-viewer', label: 'App Viewer' },
   { id: 'overview', icon: 'overview-grid', label: 'Overview' },
   { id: 'editor', icon: 'editor-terminal', label: 'Editor' },
 ]
+
+const resolvedTabs = computed(() => props.modeTabs ?? defaultTabs)
 
 function selectMode(view: WorkspaceView) {
   emit('update:workspaceView', view)
@@ -100,7 +114,6 @@ function selectMode(view: WorkspaceView) {
 .project-topbar {
   grid-column: 1 / -1;
   display: grid;
-  /* Always reserve left column width so App Viewer stays over the canvas (no jump on chat toggle). */
   grid-template-columns: clamp(360px, 28vw, 500px) minmax(0, 1fr) auto;
   align-items: center;
   column-gap: 0.5rem;
@@ -125,6 +138,7 @@ function selectMode(view: WorkspaceView) {
   flex: 1 1 auto;
 }
 
+.project-menu :deep(strong),
 .project-menu strong {
   overflow: hidden;
   font-size: 0.8125rem;
@@ -144,7 +158,7 @@ function selectMode(view: WorkspaceView) {
 .topbar-center {
   display: flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: center;
   min-width: 0;
 }
 
@@ -155,7 +169,7 @@ function selectMode(view: WorkspaceView) {
   width: fit-content;
   max-width: 100%;
   padding: 0.2rem 0.3rem;
-  border-radius: 0.55rem;
+  border-radius: 999px;
   background: #f4f4f5;
 }
 
@@ -167,7 +181,7 @@ function selectMode(view: WorkspaceView) {
   gap: 0.35rem;
   height: 2rem;
   border: 0;
-  border-radius: 0.45rem;
+  border-radius: 999px;
   background: transparent;
   color: #52525b;
   cursor: pointer;
@@ -181,7 +195,7 @@ function selectMode(view: WorkspaceView) {
 
 .mode-tab.is-active {
   width: auto;
-  padding: 0 0.6rem;
+  padding: 0 0.7rem;
   background: #fff;
   color: #18181b;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
@@ -196,11 +210,6 @@ function selectMode(view: WorkspaceView) {
   background: #fff;
   color: #18181b;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
-}
-
-.icon-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
 }
 
 .mode-tab-label {

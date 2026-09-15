@@ -23,12 +23,13 @@ from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowResult,
 )
 from app.services import build_run as build_run_service
-from app.services import configuration_manager, task_execution
+from app.services import configuration_manager, engineering_run, task_execution
 from app.services import plan as plan_service
 from app.services import product_manager as product_manager_service
 from app.services import project_manager as project_manager_service
 from app.services import task as task_service
 from app.services.design_handoff import APPROVAL_VERSION, find_pending_engineering_task
+from app.services.engineering_claim import claim_software_engineer_task
 from app.services.requirement_inputs import read_app_spec
 
 logger = logging.getLogger("forgeai")
@@ -339,12 +340,28 @@ class _ProductManagerNodes:
 
     def assign_design_task(self, state: _WorkflowState) -> dict[str, object]:
         with self._session_factory() as db:
+            user = _get_user(db, state["user_id"])
             task = project_manager_service.create_engineering_delivery_task(
                 db,
-                _get_user(db, state["user_id"]),
+                user,
                 state["project_id"],
                 state["build_run_id"],
                 state["configuration_item_id"],
+            )
+            claimed, execution = claim_software_engineer_task(
+                db,
+                user,
+                state["project_id"],
+                state["build_run_id"],
+                task.task_id,
+            )
+            engineering_run.start_claimed_engineering(
+                db,
+                user,
+                state["project_id"],
+                state["build_run_id"],
+                claimed,
+                execution,
             )
             return {"design_plan_id": task.plan_id, "design_task_id": task.task_id}
 

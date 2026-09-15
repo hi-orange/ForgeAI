@@ -142,6 +142,24 @@ def start_execution(
         raise
 
 
+def renew_execution_lease(db: Session, task_id: str, execution_id: str) -> None:
+    now = utc_now()
+    renewed = db.connection().execute(
+        update(TaskExecution)
+        .where(
+            TaskExecution.task_id == task_id,
+            TaskExecution.execution_id == execution_id,
+            TaskExecution.status == "running",
+            TaskExecution.active_slot == 1,
+            TaskExecution.expires_at > now,
+        )
+        .values(expires_at=now + EXECUTION_LEASE)
+    )
+    if renewed.rowcount != 1:
+        raise ConflictException("执行编号已失效或任务正在由其他执行处理")
+    db.commit()
+
+
 def fail_execution(
     db: Session,
     task_id: str,

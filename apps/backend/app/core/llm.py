@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from typing import Any
 
 import httpx
 
 from app.core.exceptions import BusinessException
 from app.core.settings import settings
+from app.schemas.agent_action import ChatWithToolsResult, TokenUsage, ToolCall, ToolDefinition
 
 logger = logging.getLogger("forgeai.llm")
 
@@ -22,14 +25,7 @@ def _content_preview(value: object, *, limit: int = 160) -> str:
     return repr(value[:limit])
 
 
-def chat_completion(
-    *,
-    messages: list[dict[str, str]],
-    temperature: float = 0.3,
-    max_tokens: int = 4096,
-    timeout: float = 120.0,
-    json_output: bool = False,
-) -> str:
+def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
     if not settings.deepseek_api_key:
         raise BusinessException("未配置 DEEPSEEK_API_KEY，无法调用大模型")
 
@@ -38,19 +34,6 @@ def chat_completion(
         "Authorization": f"Bearer {settings.deepseek_api_key}",
         "Content-Type": "application/json",
     }
-    body: dict[str, object] = {
-        "model": settings.deepseek_model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if json_output:
-        body["response_format"] = {"type": "json_object"}
-        # DeepSeek V4 enables thinking by default. Large structured generations can
-        # otherwise spend the entire max_tokens budget on reasoning and return an
-        # empty final content with finish_reason="length".
-        body["thinking"] = {"type": "disabled"}
-
     try:
         with httpx.Client(timeout=timeout) as client:
             response = client.post(url, headers=headers, json=body)
@@ -66,6 +49,33 @@ def chat_completion(
     except httpx.HTTPError as exc:
         logger.exception("LLM network error")
         raise BusinessException("无法连接大模型服务") from exc
+    if not isinstance(data, dict):
+        raise BusinessException("大模型返回格式异常")
+    return data
+
+
+def chat_completion(
+    *,
+    messages: list[dict[str, str]],
+    temperature: float = 0.3,
+    max_tokens: int = 4096,
+    timeout: float = 120.0,
+    json_output: bool = False,
+) -> str:
+    body: dict[str, object] = {
+        "model": settings.deepseek_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if json_output:
+        body["response_format"] = {"type": "json_object"}
+        # DeepSeek V4 enables thinking by default. Large structured generations can
+        # otherwise spend the entire max_tokens budget on reasoning and return an
+        # empty final content with finish_reason="length".
+        body["thinking"] = {"type": "disabled"}
+
+    data = _post_chat(body, timeout=timeout)
 
     try:
         choice = data["choices"][0]
@@ -113,3 +123,161 @@ def chat_completion(
     )
 
     return content.strip()
+
+
+def _parse_arguments(raw: object) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BusinessException("工具参数不是合法 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise BusinessException("工具参数必须是 JSON 对象")
+    return parsed
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON 字段重复")
+        result[key] = value
+    return result
+
+
+def parse_agent_action(payload: dict[str, Any]) -> ChatWithToolsResult:
+    """Parse an OpenAI-compatible chat completion, including tool-only turns."""
+    try:
+        choice = payload["choices"][0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise BusinessException("大模型返回格式异常") from exc
+
+    content = message.get("content")
+    if content is not None and not isinstance(content, str):
+        raise BusinessException("大模型返回格式异常")
+    usage_raw = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+    usage = TokenUsage.model_validate(usage_raw) if usage_raw else None
+    native_calls = message.get("tool_calls") or []
+    parsed_calls: list[ToolCall] = []
+    if isinstance(native_calls, list) and native_calls:
+        for index, item in enumerate(native_calls):
+            if not isinstance(item, dict):
+                raise BusinessException("工具调用格式异常")
+            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            name = function.get("name") or item.get("name")
+            call_id = item.get("id") or f"call_{index + 1}"
+            if not isinstance(name, str) or not name.strip():
+                raise BusinessException("工具调用缺少名称")
+            parsed_calls.append(
+                ToolCall(
+                    id=str(call_id),
+                    name=name.strip(),
+                    arguments=_parse_arguments(function.get("arguments", item.get("arguments"))),
+                )
+            )
+        return ChatWithToolsResult(
+            content=content,
+            tool_calls=parsed_calls,
+            finish_reason=choice.get("finish_reason"),
+            model=payload.get("model"),
+            usage=usage,
+            protocol="native",
+        )
+
+    text = content.strip() if isinstance(content, str) else ""
+    if not text:
+        finish_reason = choice.get("finish_reason")
+        raise BusinessException(
+            "大模型最终输出为空且没有工具调用",
+            data={"finish_reason": finish_reason},
+        )
+    try:
+        action = json.loads(text, object_pairs_hook=_unique_json_object)
+    except (json.JSONDecodeError, ValueError):
+        return ChatWithToolsResult(
+            content=content,
+            tool_calls=[],
+            finish_reason=choice.get("finish_reason"),
+            model=payload.get("model"),
+            usage=usage,
+            protocol="json",
+        )
+    if not isinstance(action, dict):
+        raise BusinessException("JSON 动作协议必须是对象")
+    calls_raw = action.get("tool_calls")
+    if calls_raw is None and action.get("name"):
+        calls_raw = [action]
+    if not isinstance(calls_raw, list):
+        return ChatWithToolsResult(
+            content=content,
+            tool_calls=[],
+            finish_reason=choice.get("finish_reason"),
+            model=payload.get("model"),
+            usage=usage,
+            protocol="json",
+        )
+    for index, item in enumerate(calls_raw):
+        if not isinstance(item, dict):
+            raise BusinessException("JSON 动作协议格式异常")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise BusinessException("JSON 动作协议缺少工具名")
+        parsed_calls.append(
+            ToolCall(
+                id=str(item.get("id") or f"call_{index + 1}"),
+                name=name.strip(),
+                arguments=_parse_arguments(item.get("arguments")),
+            )
+        )
+    return ChatWithToolsResult(
+        content=action.get("content") if isinstance(action.get("content"), str) else content,
+        tool_calls=parsed_calls,
+        finish_reason=choice.get("finish_reason"),
+        model=payload.get("model"),
+        usage=usage,
+        protocol="json",
+    )
+
+
+def chat_with_tools(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[ToolDefinition],
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    timeout: float = 120.0,
+) -> ChatWithToolsResult:
+    """Ask the model to choose among allowed tools. Empty content is valid with tool_calls."""
+    body: dict[str, object] = {
+        "model": settings.deepseek_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "thinking": {"type": "disabled"},
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in tools
+        ],
+    }
+    data = _post_chat(body, timeout=timeout)
+    result = parse_agent_action(data)
+    logger.info(
+        "LLM tool turn: model=%s finish_reason=%s tool_calls=%s content_length=%s usage=%s",
+        result.model or data.get("model"),
+        result.finish_reason,
+        [call.name for call in result.tool_calls],
+        _text_length(result.content),
+        result.usage.model_dump() if result.usage else None,
+    )
+    return result

@@ -4,7 +4,128 @@ import { readFile } from 'node:fs/promises'
 import { test, mock } from 'node:test'
 import { createContext, SourceTextModule, SyntheticModule } from 'node:vm'
 import ts from 'typescript'
-import { computed, ref } from 'vue'
+import { computed, ref, reactive, watch, nextTick, effectScope } from 'vue'
+
+test('presentation groups repeated model calls into one tool card and keeps stage narratives', async () => {
+  const { buildGroups } = await loadModule('../src/views/project/buildTimeline.ts', {})
+  const activities = []
+  for (let i = 0; i < 12; i++) {
+    activities.push({ id: 'model' + i, name: 'model', detail: '职位列表', ok: true })
+    activities.push({
+      id: 'read' + i,
+      name: 'read_file',
+      detail: 'backend/file' + i + '.py',
+      ok: true,
+    })
+  }
+  let groups = buildGroups(activities)
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0].steps.length, 12)
+  activities.push({
+    id: 'summary',
+    name: 'summary',
+    detail: '接口已确认，现在编写列表页面',
+    ok: true,
+  })
+  activities.push({ id: 'write', name: 'apply_patch', detail: 'frontend/src/App.vue', ok: true })
+  groups = buildGroups(activities)
+  assert.equal(groups.length, 2)
+  assert.equal(groups[1].title, '接口已确认，现在编写列表页面')
+  assert.equal(groups[1].steps[0].path, 'frontend/src/App.vue')
+})
+
+async function sourceFixture() {
+  const input = reactive({
+    projectId: 7,
+    runId: 'run-1',
+    ready: true,
+    generation: 0,
+    writtenPath: null,
+  })
+  const contents = { 'frontend/src/App.vue': 'template', 'backend/main.py': 'backend' }
+  const api = {
+    getWorkspace: mock.fn(async () => ({
+      ready: true,
+      run_id: input.runId,
+      files: Object.keys(contents).map((path) => ({ path, size_bytes: 1 })),
+    })),
+    getWorkspaceFile: mock.fn(async (_token, _id, path) => ({
+      run_id: input.runId,
+      path,
+      content: contents[path],
+    })),
+  }
+  const stops = []
+  const module = await loadModule('../src/views/project/useWorkspaceSource.ts', {
+    vue: { ref, watch, onBeforeUnmount: (fn) => stops.push(fn) },
+    '@/api/modules/workspace': api,
+  })
+  const scope = effectScope()
+  const view = scope.run(() => module.useWorkspaceSource(input, () => 'test-token'))
+  const settle = async () => {
+    await nextTick()
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  await settle()
+  return {
+    input,
+    contents,
+    api,
+    view,
+    settle,
+    stop() {
+      stops.forEach((fn) => fn())
+      scope.stop()
+    },
+  }
+}
+
+test('source viewer opens template and refreshes same file on every successful write', async () => {
+  const f = await sourceFixture()
+  assert.equal(f.view.fileContent.value, 'template')
+  f.contents['frontend/src/App.vue'] = 'first write'
+  f.input.writtenPath = 'frontend/src/App.vue'
+  f.input.generation++
+  await f.settle()
+  assert.equal(f.view.fileContent.value, 'first write')
+  f.contents['frontend/src/App.vue'] = 'second write'
+  f.input.generation++
+  await f.settle()
+  assert.equal(f.view.fileContent.value, 'second write')
+  f.stop()
+})
+
+test('source viewer preserves manual selection while updating and can follow new files', async () => {
+  const f = await sourceFixture()
+  await f.view.selectFile('backend/main.py')
+  f.contents['frontend/src/Jobs.vue'] = 'new page'
+  f.input.writtenPath = 'frontend/src/Jobs.vue'
+  f.input.generation++
+  await f.settle()
+  assert.equal(f.view.selectedPath.value, 'backend/main.py')
+  assert.equal(f.view.fileContent.value, 'backend')
+  f.view.followWrites()
+  await f.settle()
+  assert.equal(f.view.selectedPath.value, 'frontend/src/Jobs.vue')
+  assert.equal(f.view.fileContent.value, 'new page')
+  f.stop()
+})
+
+test('source viewer rejects late file responses after selection or run changes', async () => {
+  const f = await sourceFixture()
+  const late = deferred()
+  f.api.getWorkspaceFile.mock.mockImplementationOnce(() => late.promise)
+  const pending = f.view.selectFile('frontend/src/App.vue')
+  await f.view.selectFile('backend/main.py')
+  late.resolve({ run_id: 'run-1', content: 'stale content' })
+  await pending
+  assert.equal(f.view.fileContent.value, 'backend')
+  f.input.runId = 'run-2'
+  f.contents['frontend/src/App.vue'] = 'new run'
+  await f.settle()
+  assert.equal(f.view.fileContent.value, 'new run')
+  f.stop()
+})
 
 // 使用真实 Vue 响应式和生产 composable，仅替换生命周期、计时器和 HTTP 边界。
 // 不需要浏览器，不安装新的测试依赖；这里不检验页面视觉布局。
@@ -62,10 +183,16 @@ function approvalState() {
   return progress('awaiting_approval', {
     result: { configuration_item_id: 'ci-proposal', open_questions: [] },
     app_spec: {
-      goal: '查看记录', target_users: ['访客'],
+      goal: '查看记录',
+      target_users: ['访客'],
       features: [{ id: 'feat_read', text: '登录后查看记录' }],
-      data_requirements: [], interface_requirements: [], constraints: [], open_questions: [],
-      acceptance_criteria: [{ id: 'ac_read', text: '未登录时拒绝访问记录', source_ids: ['feat_read'] }],
+      data_requirements: [],
+      interface_requirements: [],
+      constraints: [],
+      open_questions: [],
+      acceptance_criteria: [
+        { id: 'ac_read', text: '未登录时拒绝访问记录', source_ids: ['feat_read'] },
+      ],
     },
   })
 }
@@ -91,7 +218,9 @@ test('editing a feature requires current acceptance and preserves retry identity
   assert.equal(f.api.approveRequirements.mock.callCount(), 0)
   assert.match(f.view.error.value, /怎样才算完成/)
   item.acceptance = '无需登录即可看到记录列表'
-  f.api.approveRequirements.mock.mockImplementation(async () => { throw new Error('network failed') })
+  f.api.approveRequirements.mock.mockImplementation(async () => {
+    throw new Error('network failed')
+  })
   await f.view.approve()
   await f.view.approve()
   const first = f.api.approveRequirements.mock.calls[0].arguments[4]
@@ -161,6 +290,9 @@ async function fixture(state = progress()) {
     approveRequirements: mock.fn(async () => {
       state = progress('design_pending')
     }),
+    continueEngineering: mock.fn(async () => {
+      state = progress('engineering_running', { activities: [{ id: 'start', name: 'start' }] })
+    }),
   }
   const { useRequirements } = await loadModule(
     '../src/views/project/useRequirements.ts',
@@ -223,7 +355,10 @@ test('mount executes the stored home message without posting a duplicate', async
   assert.equal(f.api.createRequirementsRun.mock.callCount(), 0)
   assert.equal(f.api.executeRequirements.mock.callCount(), 1)
   assert.deepEqual(Array.from(f.api.executeRequirements.mock.calls[0].arguments), [
-    'test-token', 7, 'run-1', 1,
+    'test-token',
+    7,
+    'run-1',
+    1,
   ])
   f.unmount()
 })
@@ -389,11 +524,11 @@ test('ready requirements resume the saved workflow without posting or classifyin
   assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
   assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 0)
   assert.equal(f.view.status.value.state, 'design_pending')
-  assert.equal(f.view.canResume.value, false)
+  assert.equal(f.view.canResume.value, true)
   f.unmount()
 })
 
-test('refreshing a design assignment preserves identifiers without auto-execution or polling', async () => {
+test('refreshing a design assignment is read-only and explicit continuation starts engineering', async () => {
   const f = await fixture(
     progress('design_pending', {
       result: {
@@ -409,11 +544,73 @@ test('refreshing a design assignment preserves identifiers without auto-executio
   assert.equal(f.view.status.value.result.configuration_item_id, 'ci-pinned')
   assert.equal(f.view.status.value.result.design_task_id, 'task-design')
   assert.equal(f.view.canWrite.value, false)
-  assert.equal(f.view.canResume.value, false)
+  assert.equal(f.view.canResume.value, true)
+  assert.equal(f.api.continueEngineering.mock.callCount(), 0)
+  assert.equal(f.timers.size, 0)
   await f.view.resume()
   assert.equal(f.api.executeRequirements.mock.callCount(), 0)
-  assert.equal(f.timers.size, 0)
+  assert.equal(f.api.continueEngineering.mock.callCount(), 1)
+  assert.equal(f.view.status.value.state, 'engineering_running')
+  assert.equal(f.timers.size, 1)
   f.unmount()
+})
+
+test('blocked engineering resumes the saved run without a new requirement message', async () => {
+  const f = await fixture(progress('engineering_running', { error: '工程执行已暂停' }))
+  await f.mount()
+  assert.equal(f.timers.size, 0)
+  assert.equal(f.view.canResume.value, true)
+  await f.view.resume()
+  assert.deepEqual(Array.from(f.api.continueEngineering.mock.calls[0].arguments), [
+    'test-token',
+    7,
+    'run-1',
+  ])
+  assert.equal(f.api.executeRequirements.mock.callCount(), 0)
+  assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
+  assert.equal(f.view.status.value.state, 'engineering_running')
+  f.unmount()
+})
+
+test('generated engineering stops polling and does not offer another completion', async () => {
+  const f = await fixture(progress('engineering_generated'))
+  await f.mount()
+  assert.equal(f.timers.size, 0)
+  assert.equal(f.view.canResume.value, false)
+  f.unmount()
+})
+
+test('timeline merges starts and results in operation order without losing failure logs', async () => {
+  const { timelineSteps } = await loadModule('../src/views/project/buildTimeline.ts', {})
+  const rows = timelineSteps([
+    { id: '1', operation_id: 'model', name: 'model', status: 'running', ok: true },
+    { id: '2', operation_id: 'model', name: 'model', status: 'succeeded', ok: true },
+    { id: '3', name: 'summary', detail: '现在检查数据库', ok: true },
+    { id: '4', operation_id: 'check', name: 'run_check', status: 'running', ok: true },
+    {
+      id: '5',
+      operation_id: 'check',
+      name: 'run_check',
+      status: 'failed',
+      ok: false,
+      output: 'missing id',
+    },
+    {
+      id: '6',
+      operation_id: 'write',
+      name: 'apply_patch',
+      status: 'running',
+      ok: true,
+      path: 'models.py',
+    },
+  ])
+  assert.deepEqual(
+    Array.from(rows, (row) => row.id),
+    ['3', '5', '6'],
+  )
+  assert.equal(rows[1].output, 'missing id')
+  assert.equal(rows[2].status, 'running')
+  assert.equal(rows[2].path, 'models.py')
 })
 
 test('a failed dispatch retry keeps the continuation button available', async () => {

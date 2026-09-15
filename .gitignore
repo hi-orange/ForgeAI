@@ -27,3 +27,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Generated-app runtime volumes (workspaces, revisions, app data)
+runtime-data/

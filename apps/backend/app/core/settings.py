@@ -34,6 +34,12 @@ class Settings(BaseSettings):
 
     upload_root: str = "uploads"
     max_resume_size_mb: int = 10
+    # Isolated engineering workspaces: runtime-data/work/{project}/{execution}
+    runtime_data_root: str = "runtime-data"
+
+    # Disposable Linux check containers for generated fullstack-v1 apps.
+    engineering_check_image: str = "forgeai-checks:fullstack-v1"
+    engineering_check_timeout_seconds: int = 180
 
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env.development",

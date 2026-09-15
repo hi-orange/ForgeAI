@@ -1,5 +1,6 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 from unittest.mock import patch
 
@@ -168,12 +169,20 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                     self.run.run_id,
                     design_task.task_id,
                 )
+        workspace = Path(self.workspace_root) / "work" / str(self.project.id) / self.run.run_id
+        self.assertTrue((workspace / "backend" / "app" / "main.py").is_file())
+        self.assertTrue((workspace / "frontend" / "package.json").is_file())
+        self.assertTrue((workspace / "forgeai" / "approved_app_spec.json").is_file())
+        self.assertTrue((workspace / "forgeai" / "workspace.json").is_file())
         self.chat.assert_called_once()
         self.assertEqual(self._count(ConfigurationItem), 1)
         self.assertEqual(self._count(TaskExecution), 0)
         self.assertEqual(self._count(TaskResult), 1)
         progress = self._status()
         self.assertEqual(progress.state, "design_pending")
+        self.assertTrue(progress.workspace_ready)
+        self.assertFalse(progress.code_ready)
+        self.assertEqual(progress.workspace_path, str(workspace.resolve()))
         self.assertEqual((progress.plan_id, progress.task_id), (assigned.plan_id, assigned.task_id))
         self.assertEqual(progress.result.configuration_item_id, result.item_id)
         self.assertEqual(progress.app_spec.model_dump(), valid_spec())

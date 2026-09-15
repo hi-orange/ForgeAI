@@ -69,6 +69,17 @@ def _is_engineering_delivery_task(task: Task, item_id: str) -> bool:
     )
 
 
+def _is_claimed_engineering_delivery_task(task: Task, item_id: str) -> bool:
+    return (
+        task.task_key == ENGINEERING_TASK_KEY
+        and task.recipient == TaskRecipient.SOFTWARE_ENGINEER.value
+        and task.expected_output_type == "code"
+        and task.status == TaskStatus.RUNNING.value
+        and task.input_configuration_item_ids == [item_id]
+        and not task.depends_on_task_ids
+    )
+
+
 def _is_legacy_design_task(task: Task, item_id: str) -> bool:
     return (
         task.task_key == LEGACY_DESIGN_TASK_KEY
@@ -118,11 +129,44 @@ def find_pending_engineering_task(
         if plan.status == "pending" and _is_legacy_design_task(task, item_id):
             legacy = task
             continue
+        if plan.status == "running" and _is_claimed_engineering_delivery_task(task, item_id):
+            # Already claimed; create_engineering_delivery_task uses find_claimed separately.
+            continue
         if plan.status == "pending":
             raise ConflictException("已有后续任务与本次工程交付不一致")
         if task.status not in (TaskStatus.CANCELLED.value, TaskStatus.FAILED.value):
             raise ConflictException("已有其他后续计划，不能重复派工")
     return engineering or legacy
+
+
+def find_claimed_engineering_task(
+    db: Session, source_plan: Plan, item_id: str, *, lock: bool = False
+) -> Task | None:
+    """Return the running engineering delivery for this approval, if already claimed."""
+    statement = (
+        select(Plan)
+        .where(
+            Plan.project_id == source_plan.project_id,
+            Plan.build_run_id == source_plan.build_run_id,
+            Plan.version > source_plan.version,
+            Plan.status == "running",
+            Plan.cause_message_id == source_plan.cause_message_id,
+        )
+        .order_by(Plan.version.asc())
+    )
+    if lock:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    for plan in db.scalars(statement).all():
+        tasks_query = select(Task).where(Task.plan_id == plan.plan_id)
+        if lock:
+            tasks_query = tasks_query.with_for_update().execution_options(populate_existing=True)
+        tasks = list(db.scalars(tasks_query).all())
+        if len(tasks) != 1:
+            continue
+        task = tasks[0]
+        if _is_claimed_engineering_delivery_task(task, item_id):
+            return task
+    return None
 
 
 def find_pending_design_task(

@@ -1,17 +1,17 @@
 <template>
   <AuthLayout
-    headline="Start Building with Forge"
-    tagline="Turn ideas into intelligent workflows."
-    description="Fast setup. Powerful automation. Unified AI operations."
+    headline="用 Forge 开始构建"
+    tagline="把想法变成智能工作流。"
+    description="快速上手 · 强大自动化 · 统一的 AI 运维。"
   >
     <header class="intro">
-      <h2>Create your account</h2>
-      <p>Get started with Forge and build intelligent workflows faster</p>
+      <h2>创建账号</h2>
+      <p>注册 Forge，更快构建智能工作流</p>
     </header>
 
     <form class="auth-form" @submit.prevent="onSubmit">
       <label>
-        <span>Email</span>
+        <span>邮箱</span>
         <div class="field">
           <span class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -29,7 +29,7 @@
       </label>
 
       <label>
-        <span>Password</span>
+        <span>密码</span>
         <div class="field">
           <span class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -41,12 +41,12 @@
             v-model="form.password"
             :type="showPassword ? 'text' : 'password'"
             autocomplete="new-password"
-            placeholder="Create a password"
+            placeholder="请设置密码"
           />
           <button
             type="button"
             class="eye"
-            :aria-label="showPassword ? 'Hide password' : 'Show password'"
+            :aria-label="showPassword ? '隐藏密码' : '显示密码'"
             @click="showPassword = !showPassword"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -60,13 +60,13 @@
       <p v-if="localError" class="error" role="alert">{{ localError }}</p>
 
       <button type="submit" class="primary" :disabled="auth.loading">
-        {{ auth.loading ? 'Creating…' : 'Create Account' }}
+        {{ auth.loading ? '创建中…' : '创建账号' }}
       </button>
     </form>
 
     <p class="switch">
-      Already have an account?
-      <RouterLink :to="{ name: 'login' }">Sign in</RouterLink>
+      已有账号？
+      <RouterLink :to="{ name: 'login' }">去登录</RouterLink>
     </p>
   </AuthLayout>
 </template>

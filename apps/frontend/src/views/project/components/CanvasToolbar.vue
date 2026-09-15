@@ -147,13 +147,16 @@ const activePageLabel = computed(() => {
 })
 
 const workspaceLabel = computed(() => {
-  const map: Record<WorkspaceView, string> = {
+  const map: Partial<Record<WorkspaceView, string>> = {
     viewer: 'App Viewer',
     overview: 'Overview',
     editor: 'Editor',
     files: 'Files',
+    design: 'Design',
+    cloud: 'Cloud',
+    more: 'More',
   }
-  return map[props.workspaceView]
+  return map[props.workspaceView] ?? props.workspaceView
 })
 
 function deviceIconName(mode: PreviewMode): WorkbenchIconName {

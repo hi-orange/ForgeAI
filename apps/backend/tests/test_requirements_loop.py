@@ -557,7 +557,8 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
             json=approval_payload(client_message_id="api-approval"),
         )
         self.assertEqual(approval.status_code, 200, approval.text)
-        self.assertEqual(approval.json()["data"]["state"], "design_pending")
+        self.assertEqual(approval.json()["data"]["state"], "engineering_running")
+        self.assertIsNotNone(approval.json()["data"]["execution_id"])
         replay_approval = self.client.post(
             f"{self.execute}/{current['result']['configuration_item_id']}/approval",
             json=approval_payload(client_message_id="api-approval"),

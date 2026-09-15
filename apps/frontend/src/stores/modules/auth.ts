@@ -11,22 +11,55 @@ import type {
 } from '@/api/modules/auth'
 
 const TOKEN_KEY = 'forgeai_access_token'
+const REMEMBER_KEY = 'forgeai_remember_me'
+const EMAIL_KEY = 'forgeai_remembered_email'
+
+function readStoredToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY) ?? sessionStorage.getItem(TOKEN_KEY)
+}
+
+function readRememberPreference(): boolean {
+  const raw = localStorage.getItem(REMEMBER_KEY)
+  if (raw === null) return true
+  return raw === '1'
+}
+
+export function readRememberedEmail(): string {
+  return localStorage.getItem(EMAIL_KEY) ?? ''
+}
 
 export const useAuthStore = defineStore('auth', () => {
-  const token = ref<string | null>(localStorage.getItem(TOKEN_KEY))
+  const token = ref<string | null>(readStoredToken())
   const user = ref<User | null>(null)
   const bootstrapped = ref(false)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  const rememberMe = ref(readRememberPreference())
 
   const isAuthenticated = computed(() => Boolean(token.value))
 
-  function setToken(value: string | null) {
+  function setToken(value: string | null, remember: boolean = rememberMe.value) {
     token.value = value
-    if (value) {
+    rememberMe.value = remember
+    localStorage.setItem(REMEMBER_KEY, remember ? '1' : '0')
+
+    localStorage.removeItem(TOKEN_KEY)
+    sessionStorage.removeItem(TOKEN_KEY)
+
+    if (!value) return
+
+    if (remember) {
       localStorage.setItem(TOKEN_KEY, value)
     } else {
-      localStorage.removeItem(TOKEN_KEY)
+      sessionStorage.setItem(TOKEN_KEY, value)
+    }
+  }
+
+  function setRememberedEmail(email: string | null) {
+    if (email) {
+      localStorage.setItem(EMAIL_KEY, email)
+    } else {
+      localStorage.removeItem(EMAIL_KEY)
     }
   }
 
@@ -47,12 +80,21 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function login(payload: LoginPayload) {
+  async function login(payload: LoginPayload & { remember?: boolean }) {
     loading.value = true
     error.value = null
+    const remember = payload.remember ?? true
     try {
-      const result = await authApi.login(payload)
-      setToken(result.access_token)
+      const result = await authApi.login({
+        email: payload.email,
+        password: payload.password,
+      })
+      setToken(result.access_token, remember)
+      if (remember) {
+        setRememberedEmail(payload.email)
+      } else {
+        setRememberedEmail(null)
+      }
       user.value = await authApi.fetchMe(result.access_token)
     } catch (err) {
       error.value = err instanceof Error ? err.message : '登录失败'
@@ -62,12 +104,23 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function register(payload: RegisterPayload) {
+  async function register(payload: RegisterPayload & { remember?: boolean }) {
     loading.value = true
     error.value = null
+    const remember = payload.remember ?? true
     try {
       await authApi.register(payload)
-      await login({ email: payload.email, password: payload.password })
+      const result = await authApi.login({
+        email: payload.email,
+        password: payload.password,
+      })
+      setToken(result.access_token, remember)
+      if (remember) {
+        setRememberedEmail(payload.email)
+      } else {
+        setRememberedEmail(null)
+      }
+      user.value = await authApi.fetchMe(result.access_token)
     } catch (err) {
       error.value = err instanceof Error ? err.message : '注册失败'
       throw err
@@ -111,7 +164,7 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function logout() {
-    setToken(null)
+    setToken(null, rememberMe.value)
     user.value = null
     error.value = null
   }
@@ -122,6 +175,7 @@ export const useAuthStore = defineStore('auth', () => {
     bootstrapped,
     loading,
     error,
+    rememberMe,
     isAuthenticated,
     bootstrap,
     login,

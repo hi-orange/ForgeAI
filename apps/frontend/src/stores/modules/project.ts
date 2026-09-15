@@ -9,6 +9,7 @@ import { useAuthStore } from '@/stores/modules/auth'
  * Project identity is always `id`.
  * Home rule: each home requirement submission creates exactly one new project
  * (same prompt/name is allowed; never reuse by text).
+ * Default data source is the real API; mock is explicit opt-in only.
  */
 export const useProjectStore = defineStore('project', () => {
   const auth = useAuthStore()

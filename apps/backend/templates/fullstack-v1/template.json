@@ -1,0 +1,9 @@
+{
+  "template_version": "fullstack-v1",
+  "stack": {
+    "frontend": "vue",
+    "backend": "fastapi",
+    "database": "sqlite"
+  },
+  "description": "Bootable empty fullstack skeleton. Business features are generated later from approved requirements."
+}

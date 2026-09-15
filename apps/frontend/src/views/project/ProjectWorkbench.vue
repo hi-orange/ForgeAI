@@ -11,7 +11,7 @@
     <ProjectTopbar
       v-if="generatedFiles"
       :name="project?.name"
-      :status="project?.status"
+      :can-publish="project?.status === 'completed'"
       :workspace-view="workspaceView"
       :chat-collapsed="chatCollapsed"
       :history-open="historyOpen"
@@ -942,7 +942,7 @@ async function saveVisualEdits() {
   editorError.value = null
   try {
     await projects.editWebsite(current.id, {
-      base_revision: current.website_revision,
+      base_revision: current.website_revision ?? 0,
       patches,
     })
     pendingEdits.value = {}
