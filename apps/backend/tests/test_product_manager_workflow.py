@@ -115,7 +115,7 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
             )
         )
         self.engineer = self.enterContext(
-            patch("app.services.engineering_run.start_claimed_engineering", return_value={})
+            patch("app.services.engineering.start_claimed_engineering", return_value={})
         )
         with self.session_factory() as db:
             self.owner = User(

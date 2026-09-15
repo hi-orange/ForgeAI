@@ -26,6 +26,7 @@ from app.models.user import User
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
 from app.schemas.task import TaskCreate
+from app.services import message_classification as message_classification_service
 from app.services import plan as plan_service
 from app.services import project_manager as project_manager_service
 from app.services import task as task_service
@@ -406,11 +407,11 @@ class ProjectManagerPlanningTests(unittest.TestCase):
                 decision_summary="首次提出应用需求",
             )
             with patch.object(
-                project_manager_service.project_manager_agent,
+                message_classification_service.project_manager_agent,
                 "classify_message",
                 return_value=decision,
             ) as classify:
-                project_manager_service.classify_user_message(
+                message_classification_service.classify_user_message(
                     db, self.owner, self.project.id, message.id
                 )
                 self._assert_counts(db)

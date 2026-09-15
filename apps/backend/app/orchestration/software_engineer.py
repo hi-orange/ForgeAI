@@ -15,8 +15,8 @@ from app.generation.delivery import WorkItem, plan_delivery, work_items_to_json
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
 from app.schemas.agent_action import ToolCall, ToolExecutionResult
-from app.services.design_handoff import load_approved_app_spec
-from app.services.engineering_claim import read_frozen_input_snapshot
+from app.services.engineering.claim import read_frozen_input_snapshot
+from app.services.engineering.handoff import load_approved_app_spec
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
 from app.tools.registry import execute_tool_call
 

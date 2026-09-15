@@ -6,7 +6,7 @@ from app.api.deps import CurrentUser, DbSession
 from app.schemas.project_message import ProjectMessageCreate, ProjectMessageOut
 from app.schemas.project_message_classification import ProjectMessageClassificationOut
 from app.schemas.response import ApiResponse, success
-from app.services import project_manager as project_manager_service
+from app.services import message_classification as message_classification_service
 from app.services import project_message as project_message_service
 
 router = APIRouter(prefix="/projects/{project_id}/messages", tags=["project-messages"])
@@ -56,7 +56,7 @@ def classify_project_message(
     db: DbSession,
     current_user: CurrentUser,
 ) -> dict:
-    classification = project_manager_service.classify_user_message(
+    classification = message_classification_service.classify_user_message(
         db,
         current_user,
         project_id,
@@ -75,7 +75,7 @@ def get_project_message_classification(
     db: DbSession,
     current_user: CurrentUser,
 ) -> dict:
-    classification = project_manager_service.get_user_message_classification(
+    classification = message_classification_service.get_user_message_classification(
         db,
         current_user,
         project_id,

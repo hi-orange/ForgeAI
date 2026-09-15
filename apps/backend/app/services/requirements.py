@@ -17,14 +17,14 @@ from app.schemas.product_manager_workflow import (
 )
 from app.schemas.requirements import EngineeringActivity, RequirementsStatus
 from app.services import project as project_service
-from app.services.design_handoff import (
+from app.services.engineering import (
     APPROVAL_VERSION,
     ENGINEERING_TASK_KEY,
     LEGACY_DESIGN_TASK_KEY,
     find_pending_engineering_task,
     load_approved_app_spec,
+    read_frozen_input_snapshot,
 )
-from app.services.engineering_claim import read_frozen_input_snapshot
 from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import latest_execution, utc_now
 

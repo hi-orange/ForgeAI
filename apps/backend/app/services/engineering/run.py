@@ -12,7 +12,7 @@ from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.orchestration.software_engineer import run_engineering_workflow
-from app.services.engineering_claim import read_frozen_input_snapshot
+from app.services.engineering.claim import read_frozen_input_snapshot
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
 
 logger = logging.getLogger("forgeai")

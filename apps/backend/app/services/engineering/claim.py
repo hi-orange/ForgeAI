@@ -21,7 +21,7 @@ from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.schemas.app_spec import AppSpec
-from app.services.design_handoff import ENGINEERING_TASK_KEY, load_approved_app_spec
+from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_approved_app_spec
 from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_now
 
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"

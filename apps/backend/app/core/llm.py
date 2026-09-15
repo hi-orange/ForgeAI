@@ -16,16 +16,19 @@ logger = logging.getLogger("forgeai.llm")
 
 
 def _text_length(value: object) -> int | None:
+    """返回字符串长度；非字符串返回 None。"""
     return len(value) if isinstance(value, str) else None
 
 
 def _content_preview(value: object, *, limit: int = 160) -> str:
+    """截取内容预览，便于日志诊断空响应。"""
     if not isinstance(value, str):
         return repr(value)
     return repr(value[:limit])
 
 
 def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
+    """向 DeepSeek chat/completions 发请求，统一处理超时与 HTTP 错误。"""
     if not settings.deepseek_api_key:
         raise BusinessException("未配置 DEEPSEEK_API_KEY，无法调用大模型")
 
@@ -62,6 +65,7 @@ def chat_completion(
     timeout: float = 120.0,
     json_output: bool = False,
 ) -> str:
+    """普通对话补全；json_output 时强制 JSON 并关闭 thinking，返回最终文本。"""
     body: dict[str, object] = {
         "model": settings.deepseek_model,
         "messages": messages,
@@ -126,6 +130,7 @@ def chat_completion(
 
 
 def _parse_arguments(raw: object) -> dict[str, Any]:
+    """把工具参数解析成 dict；已是对象则原样返回，空串视为 {}。"""
     if isinstance(raw, dict):
         return raw
     if not isinstance(raw, str) or not raw.strip():
@@ -140,6 +145,7 @@ def _parse_arguments(raw: object) -> dict[str, Any]:
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """json.loads 的 object_pairs_hook：拒绝重复键，避免静默覆盖。"""
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
@@ -149,7 +155,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def parse_agent_action(payload: dict[str, Any]) -> ChatWithToolsResult:
-    """Parse an OpenAI-compatible chat completion, including tool-only turns."""
+    """解析 chat completion：优先 native tool_calls，否则尝试 JSON 动作协议。"""
     try:
         choice = payload["choices"][0]
         message = choice["message"]
@@ -251,7 +257,7 @@ def chat_with_tools(
     max_tokens: int = 4096,
     timeout: float = 120.0,
 ) -> ChatWithToolsResult:
-    """Ask the model to choose among allowed tools. Empty content is valid with tool_calls."""
+    """带 tools 的一轮对话；允许只有 tool_calls、content 为空。"""
     body: dict[str, object] = {
         "model": settings.deepseek_model,
         "messages": messages,

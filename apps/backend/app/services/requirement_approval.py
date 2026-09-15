@@ -28,10 +28,7 @@ from app.schemas.requirements import RequirementsApproval, RequirementsApprovalS
 from app.schemas.task import TaskCreate
 from app.services import configuration_manager
 from app.services import plan as plan_service
-from app.services.design_handoff import (
-    APPROVAL_VERSION,
-    prepare_requirements_followup,
-)
+from app.services.engineering import APPROVAL_VERSION, prepare_requirements_followup
 from app.services.project_message import stage_user_project_message
 from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import lock_run
