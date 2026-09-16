@@ -97,13 +97,7 @@ const emit = defineEmits<{
   'toggle-history': []
 }>()
 
-const defaultTabs: TopbarModeTab[] = [
-  { id: 'viewer', icon: 'app-viewer', label: 'App Viewer' },
-  { id: 'overview', icon: 'overview-grid', label: 'Overview' },
-  { id: 'editor', icon: 'editor-terminal', label: 'Editor' },
-]
-
-const resolvedTabs = computed(() => props.modeTabs ?? defaultTabs)
+const resolvedTabs = computed(() => props.modeTabs ?? [])
 
 function selectMode(view: WorkspaceView) {
   emit('update:workspaceView', view)

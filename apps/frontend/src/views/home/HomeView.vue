@@ -289,7 +289,6 @@ async function onBuild() {
     typedText.value = ''
   }
 
-  // Home rule: each submit creates exactly one new project (never reuse by prompt text).
   building.value = true
   buildError.value = null
   try {

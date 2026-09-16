@@ -11,8 +11,29 @@ const labels: Record<string, string> = {
   model: '暂时无法继续',
   error: '操作失败',
 }
-export function timelineSteps(events: EngineeringActivity[]): EngineeringActivity[] {
-  const rows = new Map<string, EngineeringActivity>()
+
+/** Optional presentation fields beyond the API `EngineeringActivity` contract. */
+export type TimelineInput = EngineeringActivity & {
+  operation_id?: string | null
+  status?: string | null
+  output?: string | null
+  path?: string | null
+  work_item_title?: string | null
+  work_item_id?: string | null
+}
+
+/** Presentation row derived from API activity (plus optional extras). */
+export type TimelineStep = EngineeringActivity & {
+  operation_id?: string | null
+  status?: string | null
+  output?: string | null
+  path: string | null
+  work_item_title: string
+  work_item_id: string
+}
+
+export function timelineSteps(events: TimelineInput[]): TimelineStep[] {
+  const rows = new Map<string, TimelineInput>()
   for (const event of events) {
     const key = event.operation_id || event.id
     rows.set(key, { ...rows.get(key), ...event })
@@ -22,7 +43,11 @@ export function timelineSteps(events: EngineeringActivity[]): EngineeringActivit
     .map((step) => ({
       ...step,
       label: labels[step.name] || step.label,
-      path: step.path || (['read_file', 'apply_patch'].includes(step.name) ? step.detail : null),
+      path:
+        step.path ||
+        (['read_file', 'apply_patch'].includes(step.name) ? step.detail || null : null),
+      work_item_title: step.work_item_title || '',
+      work_item_id: step.work_item_id || '',
     }))
 }
 
@@ -30,20 +55,21 @@ export type BuildGroup = {
   id: string
   title: string
   workItemId: string
-  steps: EngineeringActivity[]
+  steps: TimelineStep[]
 }
 
 /** Narration starts a step; consecutive tools share its collapsed card.
  * Old checkpoints without narration group by work item instead of repeating model calls.
  */
-export function buildGroups(events: EngineeringActivity[]): BuildGroup[] {
-  const annotated: EngineeringActivity[] = []
+export function buildGroups(events: TimelineInput[]): BuildGroup[] {
+  const annotated: TimelineStep[] = []
   let legacyTitle = '正在构建应用'
   for (const event of events) {
     if (['start', 'model'].includes(event.name) && event.ok && event.detail)
       legacyTitle = event.detail
     annotated.push({
       ...event,
+      path: event.path ?? null,
       work_item_title: event.work_item_title || legacyTitle,
       work_item_id: event.work_item_id || legacyTitle,
     })
@@ -52,7 +78,7 @@ export function buildGroups(events: EngineeringActivity[]): BuildGroup[] {
   for (const step of timelineSteps(annotated)) {
     if (step.name === 'start') continue
     let group = groups.at(-1)
-    const title = step.name === 'summary' ? step.detail : step.work_item_title!
+    const title = step.name === 'summary' ? step.detail : step.work_item_title
     if (
       !group ||
       group.workItemId !== step.work_item_id ||
@@ -62,7 +88,7 @@ export function buildGroups(events: EngineeringActivity[]): BuildGroup[] {
       if (group && !group.steps.length && group.workItemId === step.work_item_id)
         group.title = title
       else {
-        group = { id: step.id, title, workItemId: step.work_item_id!, steps: [] }
+        group = { id: step.id, title, workItemId: step.work_item_id, steps: [] }
         groups.push(group)
       }
     }
