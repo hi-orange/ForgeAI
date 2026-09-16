@@ -36,7 +36,6 @@ export function useWorkspaceSource(input: WorkspaceSourceInput, token: () => str
     try {
       const file = await workspaceApi.getWorkspaceFile(accessToken, input.projectId, path)
       if (request !== fileRequest || runId !== input.runId) return
-      if (file.run_id && runId && file.run_id !== runId) return
       fileContent.value = file.content
     } catch (err) {
       if (request === fileRequest)
