@@ -43,7 +43,7 @@ from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import RequirementsApproval
 from app.services import product_manager, project_manager, task, task_execution
 from app.services.requirement_approval import approve_requirements
-from app.services.requirements import get_requirements_status
+from app.services.requirements import get_requirements_status, pause_active_execution
 
 
 class RequirementsLoopTests(ProductManagerWorkflowFixture):
@@ -510,6 +510,24 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
                 db.commit()
             db.rollback()
 
+    def test_pause_pm_execution_becomes_retry_available_then_resumes(self):
+        _, pending = self._create_plan()
+        with self.session_factory() as db:
+            task.claim_product_manager_task(
+                db, self.owner, self.project.id, self.run.run_id, pending.task_id
+            )
+            execution = task_execution.start_execution(
+                db, self.owner, self.project.id, self.run.run_id, pending.task_id
+            )
+            paused = pause_active_execution(db, self.owner, self.project.id, self.run.run_id)
+        self.assertEqual(paused.state, "retry_available")
+        self.assertEqual(paused.execution_id, execution.execution_id)
+        self.assertIn("暂停", paused.error or "")
+        self.chat.return_value = json.dumps(valid_spec())
+        result = self._run(recovery_execution_id=execution.execution_id)
+        self.assertEqual(result.outcome, "awaiting_approval")
+        self.assertEqual(self._status().state, "awaiting_approval")
+
 
 class RequirementsApiTests(ProductManagerWorkflowFixture):
     def setUp(self):
@@ -615,3 +633,28 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         ]:
             self.assertEqual(self.client.post(self.execute, json=payload).status_code, 422)
         self.chat.assert_not_called()
+
+    def test_http_pause_engineering_then_continue(self):
+        first = self.client.post(self.execute, json={"message_id": self.message.id})
+        self.assertEqual(first.status_code, 200, first.text)
+        item_id = first.json()["data"]["configuration_item_id"]
+        approval = self.client.post(
+            f"{self.execute}/{item_id}/approval",
+            json=approval_payload(client_message_id="pause-approval"),
+        )
+        self.assertEqual(approval.status_code, 200, approval.text)
+        self.assertEqual(approval.json()["data"]["state"], "engineering_running")
+        run_id = approval.json()["data"]["run_id"]
+        paused = self.client.post(f"{self.base}/build-runs/{run_id}/pause")
+        self.assertEqual(paused.status_code, 200, paused.text)
+        body = paused.json()["data"]
+        self.assertEqual(body["state"], "retry_available")
+        self.assertIn("暂停", body["error"] or "")
+        with patch(
+            "app.api.v1.requirements.engineering.start_claimed_engineering",
+            return_value={"started": True, "execution_id": "exec_test"},
+        ) as start:
+            resumed = self.client.post(f"{self.base}/build-runs/{run_id}/engineering")
+        self.assertEqual(resumed.status_code, 200, resumed.text)
+        self.assertEqual(resumed.json()["data"]["state"], "engineering_running")
+        start.assert_called_once()

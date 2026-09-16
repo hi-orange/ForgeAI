@@ -1,6 +1,6 @@
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useAuthStore } from '@/stores'
 import * as api from '@/api/modules/requirements'
+import { useAuthStore } from '@/stores'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 export type RequirementPlanItem = {
   id: string
@@ -18,11 +18,13 @@ export function useRequirements(projectId: number) {
   const text = ref('')
   const error = ref('')
   const busy = ref(false)
+  const pausing = ref(false)
   const refreshing = ref(false)
   const planGoal = ref('')
   const planItems = ref<RequirementPlanItem[]>([])
   let draftItemId: string | null = null
   let lastApproval: { signature: string; key: string } | null = null
+  let pendingAssistantReply: string | null = null
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let inFlight: Promise<void> | null = null
@@ -41,6 +43,32 @@ export function useRequirements(projectId: number) {
       planItems.value.filter((item) => item.kind === 'feature' && item.checked && item.label.trim())
         .length,
   )
+
+  function guidanceForCategory(category: string): string {
+    if (category === 'inquiry') {
+      return '先具体描述一下你想做的应用或功能，我再帮你整理构建计划。'
+    }
+    if (category === 'stop') {
+      return '当前还没有开始构建。描述你想做的应用后，就可以开始了。'
+    }
+    if (category === 'implementation_repair') {
+      return '现在还没有可修复的实现。先描述你想做的应用，我会整理一份构建计划。'
+    }
+    return '请描述你要做的应用或功能，我再开始整理需求。'
+  }
+
+  function appendPendingAssistantReply() {
+    if (!pendingAssistantReply) return
+    const content = pendingAssistantReply
+    pendingAssistantReply = null
+    messages.value.push({
+      id: -Date.now(),
+      sequence: (messages.value.at(-1)?.sequence ?? 0) + 1,
+      sender: 'assistant',
+      content,
+      client_message_id: null,
+    })
+  }
 
   function loadPlan(current: api.RequirementsStatus) {
     const itemId = current.result?.configuration_item_id ?? null
@@ -117,6 +145,12 @@ export function useRequirements(projectId: number) {
       status.value?.state === 'ready_for_design' ||
       (status.value?.state === 'engineering_running' &&
         (Boolean(status.value.error) || !status.value.activities?.length)),
+  )
+  const canPause = computed(
+    () =>
+      status.value?.state === 'running' ||
+      status.value?.state === 'engineering_running' ||
+      status.value?.state === 'engineering_generated',
   )
 
   function token() {
@@ -195,6 +229,7 @@ export function useRequirements(projectId: number) {
       // 先等旧轮询结束，再重新读库，避免旧响应盖住刚刚完成的结果。
       if (inFlight) await inFlight
       await refresh()
+      if (!disposed) appendPendingAssistantReply()
     }
   }
 
@@ -202,7 +237,9 @@ export function useRequirements(projectId: number) {
     // 初始计划只接受已落库的 product_change；首页已保存的 prompt 也要先分类。
     const classification = await api.classifyRequirementMessage(token(), projectId, messageId)
     if (classification.category !== 'product_change') {
-      throw new Error('请描述你要做的应用或功能，再开始整理需求')
+      // 问询/停止/修复等不进入构建；用助手回复引导，而不是红色错误条。
+      pendingAssistantReply = guidanceForCategory(classification.category)
+      return
     }
     const runId = current.run_id ?? (await api.createRequirementsRun(token(), projectId)).run_id
     await api.executeRequirements(token(), projectId, runId, messageId)
@@ -234,7 +271,10 @@ export function useRequirements(projectId: number) {
   async function resume() {
     const current = status.value
     if (!current?.run_id || !canResume.value) return
-    if (current.state === 'engineering_running') {
+    if (
+      current.state === 'engineering_running' ||
+      (current.state === 'retry_available' && current.result?.design_task_id)
+    ) {
       await perform(() => api.continueEngineering(token(), projectId, current.run_id!))
       return
     }
@@ -248,6 +288,24 @@ export function useRequirements(projectId: number) {
         current.state === 'retry_available' ? current.execution_id : null,
       ),
     )
+  }
+
+  async function pause() {
+    const current = status.value
+    if (!current?.run_id || !canPause.value || pausing.value || disposed) return
+    pausing.value = true
+    error.value = ''
+    try {
+      status.value = await api.pauseBuildRun(token(), projectId, current.run_id)
+      loadPlan(status.value)
+    } catch (err) {
+      if (!disposed) error.value = err instanceof Error ? err.message : '暂停失败，请刷新进度后重试'
+    } finally {
+      pausing.value = false
+      clearTimeout(timer)
+      if (inFlight) await inFlight
+      await refresh()
+    }
   }
 
   async function approve() {
@@ -289,22 +347,18 @@ export function useRequirements(projectId: number) {
       if (disposed) return
       name.value = project.name
       await refresh()
-      // A project created from the home composer already has its initial prompt.
-      // Reuse that saved message (classify + execute) instead of posting the same text again.
-      if (!disposed && status.value?.state === 'not_started' && project.prompt?.trim()) {
-        const initial = messages.value.find(
-          (message) =>
-            message.sender === 'user' && message.content.trim() === project.prompt?.trim(),
-        )
-        if (initial) {
-          const current = status.value
-          await perform(async () => {
-            await startFromMessage(initial.id, current)
-          })
-        } else {
-          text.value = project.prompt
-          await submit()
-        }
+      if (disposed || status.value?.state !== 'not_started') return
+      const current = status.value
+      const initial = messages.value.find((message) => message.sender === 'user')
+      if (initial) {
+        void perform(async () => {
+          await startFromMessage(initial.id, current)
+        })
+        return
+      }
+      if (project.prompt?.trim()) {
+        text.value = project.prompt
+        void submit()
       }
     } catch (err) {
       if (!disposed) error.value = err instanceof Error ? err.message : '读取项目失败'
@@ -322,6 +376,7 @@ export function useRequirements(projectId: number) {
     text,
     error,
     busy,
+    pausing,
     refreshing,
     planGoal,
     planItems,
@@ -332,8 +387,10 @@ export function useRequirements(projectId: number) {
     approve,
     canWrite,
     canResume,
+    canPause,
     refresh,
     submit,
     resume,
+    pause,
   }
 }

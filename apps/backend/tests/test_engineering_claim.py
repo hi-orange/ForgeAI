@@ -11,7 +11,7 @@ from test_product_manager_workflow import (
     valid_spec,
 )
 
-from app.core.exceptions import BusinessException
+from app.core.exceptions import BusinessException, ConflictException
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
 from app.models.plan import Plan
@@ -31,7 +31,7 @@ from app.services.engineering import (
     read_frozen_input_snapshot,
 )
 from app.services.requirement_approval import approve_requirements
-from app.services.requirements import get_requirements_status
+from app.services.requirements import get_requirements_status, pause_active_execution
 
 
 class EngineeringClaimTests(ProductManagerWorkflowFixture):
@@ -216,3 +216,31 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
                 db.get(TaskExecution, execution.execution_id).execution_id,
                 after.execution_id,
             )
+
+    def test_pause_then_explicit_recovery_starts_new_attempt(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        _, execution = self._claim(delivery.task_id)
+        with self.session_factory() as db:
+            paused = pause_active_execution(db, self.owner, self.project.id, self.run.run_id)
+        self.assertEqual(paused.state, "retry_available")
+        self.assertEqual(paused.execution_id, execution.execution_id)
+        with self.assertRaises(ConflictException):
+            self._claim(delivery.task_id)
+        with self.session_factory() as db:
+            _, recovered = claim_software_engineer_task(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                delivery.task_id,
+                recovery_execution_id=execution.execution_id,
+            )
+        self.assertEqual(recovered.attempt, 2)
+        self.assertEqual(recovered.status, "running")
+        self.assertEqual(
+            read_frozen_input_snapshot(recovered), read_frozen_input_snapshot(execution)
+        )
+        progress = self._status()
+        self.assertEqual(progress.state, "engineering_running")
+        self.assertEqual(progress.execution_id, recovered.execution_id)

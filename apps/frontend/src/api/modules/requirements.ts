@@ -98,6 +98,13 @@ export function continueEngineering(token: string, id: number, runId: string) {
   })
 }
 
+export function pauseBuildRun(token: string, id: number, runId: string) {
+  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/build-runs/${runId}/pause`, {
+    method: 'POST',
+    token,
+  })
+}
+
 export function approveRequirements(
   token: string,
   id: number,
@@ -137,13 +144,13 @@ export function createRequirementMessage(token: string, id: number, content: str
 }
 
 export function classifyRequirementMessage(token: string, id: number, messageId: number) {
-  return apiRequest<{ category: string }>(
-    `/api/v1/projects/${id}/messages/${messageId}/classification`,
-    {
-      method: 'POST',
-      token,
-    },
-  )
+  return apiRequest<{
+    category: 'inquiry' | 'stop' | 'product_change' | 'implementation_repair'
+    decision_summary: string
+  }>(`/api/v1/projects/${id}/messages/${messageId}/classification`, {
+    method: 'POST',
+    token,
+  })
 }
 
 export function createRequirementsRun(token: string, id: number) {
