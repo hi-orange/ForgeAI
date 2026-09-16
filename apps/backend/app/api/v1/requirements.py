@@ -10,7 +10,7 @@ from app.schemas.response import ApiResponse, success
 from app.services import engineering
 from app.services.project_manager import create_clarification_plan, create_engineering_delivery_task
 from app.services.requirement_approval import approve_requirements
-from app.services.requirements import get_requirements_status
+from app.services.requirements import get_requirements_status, pause_active_execution
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["requirements"])
 
@@ -38,6 +38,41 @@ def _ensure_engineering_running(
     )
     engineering.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
     return get_requirements_status(db, current_user, project_id)
+
+
+def _resume_engineering_from_retry(
+    db: DbSession,
+    current_user: CurrentUser,
+    project_id: int,
+    run_id: str,
+    status: RequirementsStatus,
+) -> RequirementsStatus:
+    task_id = status.result.design_task_id if status.result else None
+    if not task_id or not status.execution_id:
+        raise BusinessException("当前没有可继续的工程任务")
+    task, execution = engineering.claim_software_engineer_task(
+        db,
+        current_user,
+        project_id,
+        run_id,
+        task_id,
+        recovery_execution_id=status.execution_id,
+    )
+    engineering.start_claimed_engineering(db, current_user, project_id, run_id, task, execution)
+    return get_requirements_status(db, current_user, project_id)
+
+
+@router.post(
+    "/build-runs/{run_id}/pause",
+    response_model=ApiResponse[RequirementsStatus],
+)
+def pause_build_run(
+    project_id: int,
+    run_id: str,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    return success(pause_active_execution(db, current_user, project_id, run_id))
 
 
 @router.post(
@@ -74,6 +109,8 @@ def continue_engineering(
     status = get_requirements_status(db, current_user, project_id)
     if status.run_id != run_id:
         raise BusinessException("构建任务不匹配")
+    if status.state == "retry_available" and status.result and status.result.design_task_id:
+        return success(_resume_engineering_from_retry(db, current_user, project_id, run_id, status))
     if status.state not in ("engineering_running", "design_pending"):
         raise BusinessException("当前没有可继续的工程任务")
     if status.state == "engineering_running":

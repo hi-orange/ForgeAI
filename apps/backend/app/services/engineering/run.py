@@ -26,6 +26,12 @@ def is_engineering_active(execution_id: str) -> bool:
         return execution_id in _active_executions
 
 
+def mark_engineering_inactive(execution_id: str) -> None:
+    """Drop the in-process active marker so pause/resume can reclaim the slot."""
+    with _active_lock:
+        _active_executions.discard(execution_id)
+
+
 def _record_loop_failure(
     session_factory: Any,
     task_id: str,

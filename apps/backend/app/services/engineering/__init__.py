@@ -23,7 +23,11 @@ from app.services.engineering.handoff import (
     load_design_source,
     prepare_requirements_followup,
 )
-from app.services.engineering.run import is_engineering_active, start_claimed_engineering
+from app.services.engineering.run import (
+    is_engineering_active,
+    mark_engineering_inactive,
+    start_claimed_engineering,
+)
 
 __all__ = [
     "APPROVAL_VERSION",
@@ -43,6 +47,7 @@ __all__ = [
     "is_engineering_active",
     "load_approved_app_spec",
     "load_design_source",
+    "mark_engineering_inactive",
     "prepare_requirements_followup",
     "read_frozen_input_snapshot",
     "start_claimed_engineering",

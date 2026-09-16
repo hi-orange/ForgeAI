@@ -31,7 +31,7 @@
           </div>
           <p>{{ message.content }}</p>
         </article>
-        <article class="agent-message">
+        <article v-if="!awaitingIdeaAfterReply" class="agent-message">
           <div class="agent-meta">
             <span class="avatar">F</span><strong>Forge</strong><span>产品助手</span>
           </div>
@@ -44,7 +44,7 @@
               }"
             />{{ stateLabel }}
           </p>
-          <p class="intro">{{ agentText }}</p>
+          <p v-if="agentText" class="intro">{{ agentText }}</p>
           <ol v-if="status?.activities?.length" class="tool-trace">
             <li
               v-for="(step, index) in status.activities"
@@ -187,14 +187,25 @@
         />
         <div class="composer-bottom">
           <span>{{ canApprove ? '也可以直接在上方勾选并批准' : '从一个想法开始' }}</span>
-          <button
-            type="submit"
-            class="send-button"
-            :disabled="busy || !canWrite || !text.trim()"
-            :aria-label="status?.state === 'not_started' ? '开始构建' : '发送补充'"
-          >
-            ↑
-          </button>
+          <div class="composer-actions">
+            <button
+              v-if="canPause"
+              type="button"
+              class="secondary pause-button"
+              :disabled="pausing"
+              @click="pause"
+            >
+              {{ pausing ? '暂停中…' : '暂停' }}
+            </button>
+            <button
+              type="submit"
+              class="send-button"
+              :disabled="busy || !canWrite || !text.trim()"
+              :aria-label="status?.state === 'not_started' ? '开始构建' : '发送补充'"
+            >
+              ↑
+            </button>
+          </div>
         </div>
       </form>
     </aside>
@@ -295,9 +306,11 @@ const {
   text,
   error,
   busy,
+  pausing,
   refreshing,
   canWrite,
   canResume,
+  canPause,
   canApprove,
   planGoal,
   planItems,
@@ -307,6 +320,7 @@ const {
   refresh,
   submit,
   resume,
+  pause,
   approve,
 } = useRequirements(projectId)
 const chatCollapsed = ref(false)
@@ -351,10 +365,26 @@ const postApproval = computed(
     status.value?.state === 'engineering_running' ||
     status.value?.state === 'engineering_generated',
 )
-const stateLabel = computed(() =>
-  busy.value ? '正在处理…' : status.value ? labels[status.value.state] : '正在加载项目…',
+// 问询等已在对话里回过话时，不再用常驻卡重复「告诉我你想做什么」。
+const awaitingIdeaAfterReply = computed(() => {
+  if (busy.value || status.value?.state !== 'not_started') return false
+  return messages.value.at(-1)?.sender === 'assistant'
+})
+const understandingFirstTurn = computed(
+  () =>
+    busy.value &&
+    (status.value?.state === 'not_started' || !status.value) &&
+    messages.value.some((message) => message.sender === 'user'),
 )
+const stateLabel = computed(() => {
+  if (understandingFirstTurn.value) return '正在理解…'
+  if (busy.value) return '正在处理…'
+  if (awaitingIdeaAfterReply.value) return '等待你的描述'
+  return status.value ? labels[status.value.state] : '正在加载项目…'
+})
 const agentText = computed(() => {
+  if (awaitingIdeaAfterReply.value) return ''
+  if (understandingFirstTurn.value) return '我在理解你刚才说的话。'
   if (canApprove.value) return '我整理了一份初步计划。选择你想要的功能，随时补充自己的想法。'
   if (postApproval.value) {
     if (status.value?.state === 'engineering_generated') {
@@ -833,6 +863,15 @@ summary:focus-visible {
   color: #aaadbb;
   font-size: 11px;
   margin-top: 9px;
+}
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pause-button {
+  padding: 6px 12px;
+  font-size: 12px;
 }
 .send-button {
   border: 0;

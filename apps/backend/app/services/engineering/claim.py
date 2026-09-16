@@ -108,11 +108,13 @@ def claim_software_engineer_task(
     task_id: str,
     *,
     template_version: str = DEFAULT_TEMPLATE_VERSION,
+    recovery_execution_id: str | None = None,
 ) -> tuple[Task, TaskExecution]:
     """Claim a pending engineering delivery and freeze its inputs on a new execution.
 
-    Refresh / retry of an already-claimed task returns the same frozen snapshot and
-    does not create another execution or call the model.
+    Refresh of an already-claimed running task returns the same frozen snapshot.
+    Failed or expired executions require ``recovery_execution_id`` to start a new attempt
+    that reuses the previous draft (including any checkpoint).
     """
     try:
         project = db.scalar(
@@ -169,10 +171,33 @@ def claim_software_engineer_task(
 
         if task.status == TaskStatus.RUNNING.value and plan.status == PlanStatus.RUNNING.value:
             current = latest_execution(db, task_id, lock=True)
-            if current is None or current.status != "running" or current.active_slot != 1:
+            now = utc_now()
+            if (
+                current is not None
+                and current.status == "running"
+                and current.active_slot == 1
+                and current.expires_at > now
+                and recovery_execution_id is None
+            ):
+                snapshot = read_frozen_input_snapshot(current)
+                if snapshot is None:
+                    raise ConflictException("工程执行缺少冻结输入快照")
+                if snapshot.get("approved_item_id") != approved_item_id:
+                    raise ConflictException("冻结输入与任务定义不一致")
+                if snapshot.get("approved_spec_digest") != approved_spec_digest(spec):
+                    raise ConflictException("获批需求已被替换，不能沿用旧执行")
+                db.commit()
+                db.refresh(task)
+                db.refresh(current)
+                return task, current
+            if current is None:
                 raise ConflictException("工程任务缺少有效执行，不能静默重领")
-            if current.expires_at <= utc_now():
-                raise ConflictException("工程执行租约已过期，请显式恢复")
+            if recovery_execution_id is None:
+                if current.status == "running" and current.expires_at <= now:
+                    raise ConflictException("工程执行租约已过期，请显式恢复")
+                raise ConflictException("工程任务缺少有效执行，不能静默重领")
+            if current.execution_id != recovery_execution_id or current.status == "succeeded":
+                raise ConflictException("请使用当前执行编号显式恢复任务")
             snapshot = read_frozen_input_snapshot(current)
             if snapshot is None:
                 raise ConflictException("工程执行缺少冻结输入快照")
@@ -180,10 +205,24 @@ def claim_software_engineer_task(
                 raise ConflictException("冻结输入与任务定义不一致")
             if snapshot.get("approved_spec_digest") != approved_spec_digest(spec):
                 raise ConflictException("获批需求已被替换，不能沿用旧执行")
+            if current.status == "running":
+                current.status, current.active_slot, current.finished_at = "superseded", None, now
+                db.flush()
+            execution = TaskExecution(
+                execution_id=f"exec_{uuid4().hex}",
+                task_id=task_id,
+                attempt=current.attempt + 1,
+                status="running",
+                active_slot=1,
+                started_at=now,
+                expires_at=now + EXECUTION_LEASE,
+                draft=current.draft,
+            )
+            db.add(execution)
             db.commit()
             db.refresh(task)
-            db.refresh(current)
-            return task, current
+            db.refresh(execution)
+            return task, execution
 
         if task.status != TaskStatus.PENDING.value:
             raise ConflictException("任务已被领取或已结束，不能重复领取")

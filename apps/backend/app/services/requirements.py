@@ -23,10 +23,36 @@ from app.services.engineering import (
     LEGACY_DESIGN_TASK_KEY,
     find_pending_engineering_task,
     load_approved_app_spec,
+    mark_engineering_inactive,
     read_frozen_input_snapshot,
 )
 from app.services.requirement_inputs import read_app_spec
-from app.services.task_execution import latest_execution, utc_now
+from app.services.task_execution import fail_execution, latest_execution, lock_run, utc_now
+
+
+def pause_active_execution(
+    db: Session, user: User, project_id: int, run_id: str
+) -> RequirementsStatus:
+    """Fail the current running execution so the user can resume later.
+
+    Keeps BuildRun / Plan / Task active; status becomes ``retry_available``.
+    """
+    lock_run(db, user, project_id, run_id)
+    status = get_requirements_status(db, user, project_id)
+    if status.run_id != run_id:
+        raise ConflictException("构建任务不匹配")
+    if status.state not in ("running", "engineering_running", "engineering_generated"):
+        raise ConflictException("当前没有可暂停的执行")
+    if not status.task_id or not status.execution_id:
+        raise ConflictException("当前没有可暂停的执行")
+    mark_engineering_inactive(status.execution_id)
+    fail_execution(
+        db,
+        status.task_id,
+        status.execution_id,
+        error="用户已暂停，可继续处理。",
+    )
+    return get_requirements_status(db, user, project_id)
 
 
 def _activities_from_checkpoint(checkpoint: object) -> list[EngineeringActivity]:
