@@ -1,14 +1,19 @@
-"""Persist the user's exact checklist before handing it to engineering delivery; no model call."""
+"""Read, validate, and approve immutable AppSpec artifacts.
+
+This module owns the product-intent artifact boundary. Workflow routing belongs to
+``services.requirements``; model execution and task dispatch do not belong here.
+"""
 
 import hashlib
 import json
 from uuid import uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import ConflictException, NotFoundException
+from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
 from app.models.plan import Plan
 from app.models.requirement_clarification import RequirementClarification
@@ -28,10 +33,54 @@ from app.schemas.requirements import RequirementsApproval, RequirementsApprovalS
 from app.schemas.task import TaskCreate
 from app.services import configuration_manager
 from app.services import plan as plan_service
-from app.services.engineering import APPROVAL_VERSION, prepare_requirements_followup
+from app.services import task as task_service
 from app.services.project_message import stage_user_project_message
-from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import lock_run
+
+
+def read_app_spec(item: ConfigurationItem) -> AppSpec:
+    """Read a supported persisted product-intent version without changing its identity."""
+
+    if item.state != "usable" or item.semantic_type != "app_spec":
+        raise ConflictException("需求成果已不可用")
+    if item.schema_version not in (1, APP_SPEC_SCHEMA_VERSION):
+        raise ConflictException("需求版本暂不支持")
+    try:
+        return AppSpec.model_validate(item.payload)
+    except ValidationError as exc:
+        raise ConflictException("需求正文不符合要求") from exc
+
+
+def load_previous_app_spec(db: Session, task: Task, *, lock: bool = False) -> AppSpec | None:
+    """Load only the exact AppSpec pinned to a valid clarification task."""
+
+    if task.depends_on_task_ids or len(task.input_configuration_item_ids) > 1:
+        raise BusinessException("需求任务只支持无任务依赖、最多一个原 app_spec")
+    if not task.input_configuration_item_ids:
+        return None
+    statement = (
+        select(ConfigurationItem, RequirementClarification, Plan)
+        .join(
+            RequirementClarification,
+            RequirementClarification.configuration_item_id == ConfigurationItem.item_id,
+        )
+        .join(Plan, Plan.plan_id == RequirementClarification.followup_plan_id)
+        .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+        .where(
+            Plan.plan_id == task.plan_id,
+            ConfigurationItem.item_id == task.input_configuration_item_ids[0],
+            ConfigurationItem.project_id == Plan.project_id,
+            ConfigurationItem.producer_run_id == Plan.build_run_id,
+            RequirementClarification.answer_message_id == Plan.cause_message_id,
+            RequirementClarification.task_id == TaskResult.task_id,
+        )
+    )
+    if lock:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    row = db.execute(statement).one_or_none()
+    if row is None:
+        raise BusinessException("原需求与本次补充任务的关联不正确")
+    return read_app_spec(row[0])
 
 
 def _index_items(items: list[RequirementItem]) -> dict[str, RequirementItem]:
@@ -52,9 +101,7 @@ def _resolve_items(
 ) -> list[RequirementItem]:
     resolved: list[RequirementItem] = []
     for item in selected:
-        if item.id in source_by_id:
-            resolved.append(RequirementItem(id=item.id, text=item.text))
-        elif allow_new:
+        if item.id in source_by_id or allow_new:
             resolved.append(RequirementItem(id=item.id, text=item.text))
         else:
             raise ConflictException(f"批准清单引用了未知条目：{item.id}")
@@ -105,12 +152,11 @@ def approve_requirements(
     item_id: str,
     payload: RequirementsApproval,
 ) -> str:
-    """Atomically save an immutable approved revision and its completed task.
+    """Atomically save the user's exact checklist as an immutable approved AppSpec."""
 
-    Selection is by stable requirement ids. Deleted / unchecked proposal items never
-    re-enter the approved intent. Dispatch is separate so a failed handoff can resume
-    without losing approval.
-    """
+    # Imported lazily because engineering handoff validates AppSpec through this module.
+    from app.services.engineering.handoff import APPROVAL_VERSION, prepare_requirements_followup
+
     payload = RequirementsApproval.model_validate(payload.model_dump())
     canonical = json.dumps(
         payload.model_dump(exclude_none=True), ensure_ascii=False, sort_keys=True
@@ -144,7 +190,7 @@ def approve_requirements(
             source_task.recipient,
             source_task.status,
             source_plan.status,
-        ) != ("ProductManager", "succeeded", "succeeded"):
+        ) != ("Product Manager", "succeeded", "succeeded"):
             raise ConflictException("只能批准已整理完成的需求")
         source = read_app_spec(item)
         link = db.get(RequirementClarification, item_id)
@@ -201,8 +247,6 @@ def approve_requirements(
         constraints = _resolve_items(
             _selected_by_kind(payload.selected, "constraint"), source_constraints, allow_new=True
         )
-        # Unchecked proposal items are omitted entirely — they must not reappear via
-        # text-matched data/interface leftovers or copied acceptance lines.
         acceptance_criteria = _build_acceptance(source, features, selected_features)
         spec = AppSpec(
             goal=payload.goal,
@@ -258,7 +302,8 @@ def approve_requirements(
         )
         if approved_item.state != "usable":
             raise ConflictException("批准版本未能保存，请刷新后重试")
-        task.status = plan.status = "succeeded"
+        task_service.stage_succeeded(task, allow_pending=True)
+        plan_service.stage_succeeded_if_tasks_complete(db, plan)
         db.add(
             TaskResult(
                 task_id=task.task_id,

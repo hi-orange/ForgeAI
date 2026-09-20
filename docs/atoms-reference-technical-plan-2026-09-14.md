@@ -41,7 +41,7 @@
 - **R3**：[截图目录索引](C:/Users/Administrator/Downloads/atoms-全站功能事件明细-含截图-2026-09-14/shots-2026-09-14/README.md)，33 张图片已作为输入提供；其中大量补充图是相同状态，不能视为多次独立验证。
 - **C1**：[产品架构约束](F:/project/ForgeAI/docs/architecture.md)、[成果约定](F:/project/ForgeAI/.agents/skills/forgeai-architecture/reference.md)。
 - **C2**：[后端依赖](F:/project/ForgeAI/apps/backend/pyproject.toml)、[前端依赖](F:/project/ForgeAI/apps/frontend/package.json)。版本表达式来自仓库，不宣称是最新稳定版。
-- **C3**：[真实项目模型](F:/project/ForgeAI/apps/backend/app/models/project.py)、[API 汇总](F:/project/ForgeAI/apps/backend/app/api/v1/router.py)、[需求批准](F:/project/ForgeAI/apps/backend/app/services/requirement_approval.py)。
+- **C3**：[真实项目模型](F:/project/ForgeAI/apps/backend/app/models/project.py)、[API 汇总](F:/project/ForgeAI/apps/backend/app/api/v1/router.py)、[需求成果](F:/project/ForgeAI/apps/backend/app/services/app_spec.py)。
 - **C4**：[前端 API/mock 分流](F:/project/ForgeAI/apps/frontend/src/views/project/ProjectView.vue)、[mock 接口](F:/project/ForgeAI/apps/frontend/src/api/modules/project.ts)、[演示工作台](F:/project/ForgeAI/apps/frontend/src/views/project/ProjectWorkbench.vue)。
 - **C5**：[现有 CI](F:/project/ForgeAI/.github/workflows/ci.yml)、[旧静态流程移除测试](F:/project/ForgeAI/apps/backend/tests/test_legacy_static_pipeline_removed.py)。
 - 下文目录树以仓库根 `F:/project/ForgeAI` 为根；`B` 指 `apps/backend/app`，`F` 指 `apps/frontend/src`，`T` 指拟新增 `apps/backend/templates/fullstack-v1`，`E` 指拟新增 `tests/e2e`，`D` 指拟新增 `deploy`。提到 `runtime-data` 均为部署挂载目录，不提交 Git。
@@ -244,7 +244,7 @@ ForgeAI/
 
 | 分类 | 文件/模块 | 动作和边界 |
 |---|---|---|
-| 复用 | `B/services/requirement_approval.py`、`configuration_manager.py`、`plan.py`、`task_artifact.py` | 保持批准、版本和成果来源约束 |
+| 复用 | `B/services/app_spec.py`、`configuration_manager.py`、`plan.py`、`task_artifact.py` | 保持批准、版本和成果来源约束 |
 | 复用 | `B/api/deps.py`、`services/project.py`、`schemas/response.py` | 所有权、Session、返回格式 |
 | 复用 | `F/views/project/RequirementsWorkbench.vue`、`useRequirements.ts`、现有 toolbar/editor 组件 | 保留需求体验，组合真实交付面板 |
 | 改造 | `B/services/task.py`、`task_execution.py`、`core/llm.py` | 工程领取、续租、fencing、结构化工具输出、计量 |

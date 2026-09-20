@@ -1,9 +1,13 @@
 """Approval compatibility and provenance regressions using isolated SQLite databases."""
 
 import hashlib
+import importlib.util
 import json
+from pathlib import Path
 from unittest.mock import patch
 
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import func, null, select, update
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
@@ -14,9 +18,8 @@ from test_product_manager_workflow import (
 from app.core.exceptions import ConflictException
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
-from app.models.plan import Plan
 from app.models.project import Project
-from app.models.task import Task
+from app.models.project_message import ProjectMessage
 from app.models.task_artifact import TaskArtifact
 from app.models.task_execution import TaskExecution
 from app.schemas.app_spec import AppSpec
@@ -24,10 +27,9 @@ from app.schemas.plan import PlanCreate
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.task import TaskCreate
+from app.services import manager, product_manager
 from app.services import plan as plan_service
-from app.services import product_manager, project_manager
-from app.services.requirement_approval import approve_requirements
-from app.services.requirement_inputs import read_app_spec
+from app.services.app_spec import approve_requirements, read_app_spec
 from app.services.requirements import get_requirements_status
 from app.services.task_artifact import TaskArtifactRole, stage_task_side_artifact
 
@@ -46,6 +48,19 @@ def legacy_spec():
 
 
 class ApprovalContractTests(ProductManagerWorkflowFixture):
+    def _run_legacy_cleanup_migration(self) -> None:
+        path = (
+            Path(__file__).parents[1]
+            / "alembic/versions/d9e0f1a2b3c4_remove_legacy_delivery_runs.py"
+        )
+        spec = importlib.util.spec_from_file_location("legacy_delivery_cleanup", path)
+        assert spec is not None and spec.loader is not None
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        with self.engine.begin() as connection:
+            migration.op = Operations(MigrationContext.configure(connection))
+            migration.upgrade()
+
     def _status(self):
         with self.session_factory() as db:
             return get_requirements_status(db, self.owner, self.project.id)
@@ -100,15 +115,73 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             self.assertEqual((old.schema_version, old.payload), (1, original))
             self.assertEqual(new.schema_version, 2)
             self.assertEqual(new.upstream_item_ids, [old.item_id])
-            delivery = project_manager.create_engineering_delivery_task(
+            delivery = manager.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
             self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
 
+    def test_code_delivery_rejects_approved_prd_without_system_design(self):
+        result = self._run()
+        approved_id = self._approve(result, approval_payload())
+        with self.session_factory() as db, self.assertRaises(ConflictException):
+            manager.create_engineering_delivery_task(
+                db, self.owner, self.project.id, self.run.run_id, approved_id
+            )
+
+    def test_cleanup_migration_deletes_legacy_run_but_keeps_project_messages(self):
+        result = self._run()
+        with self.session_factory() as db:
+            plan_service.save_plan(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                PlanCreate(
+                    version=2,
+                    cause_message_id=self.message.id,
+                    tasks=[
+                        TaskCreate(
+                            task_key="engineering_delivery",
+                            recipient="Code Engineer",
+                            title="旧直达编码任务",
+                            instructions="legacy",
+                            expected_output_type="code",
+                            input_configuration_item_ids=[result.configuration_item_id],
+                        )
+                    ],
+                ),
+            )
+
+        self._run_legacy_cleanup_migration()
+
+        with self.session_factory() as db:
+            self.assertIsNone(db.get(BuildRun, self.run.id))
+            self.assertEqual(db.scalar(select(func.count()).select_from(ConfigurationItem)), 0)
+            self.assertEqual(db.scalar(select(func.count()).select_from(TaskExecution)), 0)
+            self.assertIsNotNone(db.get(Project, self.project.id))
+            self.assertEqual(
+                db.scalar(select(func.count()).select_from(ProjectMessage)),
+                2,
+            )
+
+    def test_cleanup_migration_keeps_approved_architecture_chain(self):
+        result = self._run()
+        approved_id = self._approve(result, approval_payload())
+        with self.session_factory() as db:
+            manager.create_architecture_task(
+                db, self.owner, self.project.id, self.run.run_id, approved_id
+            )
+
+        self._run_legacy_cleanup_migration()
+
+        with self.session_factory() as db:
+            self.assertIsNotNone(db.get(BuildRun, self.run.id))
+            self.assertEqual(db.scalar(select(func.count()).select_from(ConfigurationItem)), 2)
+
     def test_v1_clarification_uses_normalized_pinned_input(self):
         result, original = self._legacy_result()
         with self.session_factory() as db:
-            plan = project_manager.create_clarification_plan(
+            plan = manager.create_clarification_plan(
                 db,
                 self.owner,
                 self.project.id,
@@ -125,125 +198,6 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
         self.assertEqual(sent["previous_item_id"], result.configuration_item_id)
         self.assertEqual(sent["previous_app_spec"], AppSpec.model_validate(original).model_dump())
 
-    def test_real_legacy_pending_task_waits_for_approval_then_is_replaced_once(self):
-        result, original = self._legacy_result()
-        with self.session_factory() as db:
-            legacy = plan_service.save_plan(
-                db,
-                self.owner,
-                self.project.id,
-                self.run.run_id,
-                PlanCreate(
-                    version=2,
-                    cause_message_id=self.message.id,
-                    tasks=[
-                        TaskCreate(
-                            task_key="system_design",
-                            recipient="SolutionArchitect",
-                            title="旧设计",
-                            instructions="legacy",
-                            expected_output_type="system_design",
-                            input_configuration_item_ids=[result.configuration_item_id],
-                        )
-                    ],
-                ),
-            )
-        status = self._status()
-        self.assertEqual(status.state, "awaiting_approval")
-        self.assertIsNone(status.result.design_task_id)
-        self.assertEqual(self._run().outcome, "awaiting_approval")
-        # Historical automatic dispatch is not an approval signal.
-        with self.session_factory() as db, self.assertRaises(ConflictException):
-            project_manager.create_engineering_delivery_task(
-                db, self.owner, self.project.id, self.run.run_id, result.configuration_item_id
-            )
-        payload = approval_payload(status.app_spec.model_dump())
-        invalid = approval_payload(status.app_spec.model_dump())
-        invalid["selected"][0]["text"] = "修改过的功能"
-        with self.assertRaises(ConflictException):
-            self._approve(result, invalid)
-        with self.session_factory() as db:
-            self.assertEqual(
-                db.scalar(select(Plan.status).where(Plan.plan_id == legacy.plan_id)), "pending"
-            )
-        approved_id = self._approve(result, payload)
-        self.assertEqual(self._approve(result, payload), approved_id)
-        with self.session_factory() as db:
-            old_plan = db.scalar(select(Plan).where(Plan.plan_id == legacy.plan_id))
-            old_task = db.scalar(select(Task).where(Task.plan_id == legacy.plan_id))
-            self.assertEqual((old_plan.status, old_task.status), ("cancelled", "cancelled"))
-            delivery = project_manager.create_engineering_delivery_task(
-                db, self.owner, self.project.id, self.run.run_id, approved_id
-            )
-            replay = project_manager.create_engineering_delivery_task(
-                db, self.owner, self.project.id, self.run.run_id, approved_id
-            )
-            self.assertEqual(delivery.task_id, replay.task_id)
-            old = db.scalar(
-                select(ConfigurationItem).where(
-                    ConfigurationItem.item_id == result.configuration_item_id
-                )
-            )
-            self.assertEqual(old.payload, original)
-
-    def test_legacy_pending_assignment_can_be_replaced_by_clarification(self):
-        result, _ = self._legacy_result()
-        with self.session_factory() as db:
-            legacy = plan_service.save_plan(
-                db,
-                self.owner,
-                self.project.id,
-                self.run.run_id,
-                PlanCreate(
-                    version=2,
-                    cause_message_id=self.message.id,
-                    tasks=[
-                        TaskCreate(
-                            task_key="system_design",
-                            recipient="SolutionArchitect",
-                            title="旧设计",
-                            instructions="legacy",
-                            expected_output_type="system_design",
-                            input_configuration_item_ids=[result.configuration_item_id],
-                        )
-                    ],
-                ),
-            )
-            answer = ProjectMessageCreate(
-                content="CSV 导出", client_message_id="legacy-pending-answer"
-            )
-            followup = project_manager.create_clarification_plan(
-                db,
-                self.owner,
-                self.project.id,
-                self.run.run_id,
-                result.configuration_item_id,
-                answer,
-            )
-            replay = project_manager.create_clarification_plan(
-                db,
-                self.owner,
-                self.project.id,
-                self.run.run_id,
-                result.configuration_item_id,
-                answer,
-            )
-            self.assertEqual(followup.version, 3)
-            self.assertEqual(followup.plan_id, replay.plan_id)
-            self.assertEqual(
-                db.scalar(select(Plan.status).where(Plan.plan_id == legacy.plan_id)), "cancelled"
-            )
-            from app.orchestration.product_manager import run_product_manager_workflow
-
-            completed = run_product_manager_workflow(
-                db,
-                self.owner,
-                self.project.id,
-                self.run.run_id,
-                followup.cause_message_id,
-            )
-            self.assertEqual(completed.outcome, "awaiting_approval")
-
     def test_unknown_version_rejected_by_read_approval_clarification_and_replay(self):
         result = self._run()
         with self.session_factory() as db:
@@ -253,7 +207,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             with self.assertRaises(ConflictException):
                 action()
         with self.session_factory() as db, self.assertRaises(ConflictException):
-            project_manager.create_clarification_plan(
+            manager.create_clarification_plan(
                 db,
                 self.owner,
                 self.project.id,
@@ -379,7 +333,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
         result = self._run()
         approved_id = self._approve(result, approval_payload())
         with self.session_factory() as db:
-            task = project_manager.create_engineering_delivery_task(
+            task = manager.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
             with self.assertRaises(ConflictException):

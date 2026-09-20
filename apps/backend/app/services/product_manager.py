@@ -32,8 +32,10 @@ from app.schemas.product_manager import (
     RequirementMessage,
 )
 from app.services import configuration_manager, task_execution
+from app.services import plan as plan_service
 from app.services import project as project_service
-from app.services.requirement_inputs import load_previous_app_spec
+from app.services import task as task_service
+from app.services.app_spec import load_previous_app_spec
 
 
 def _load_task(
@@ -78,7 +80,7 @@ def _require_running_task(task: Task, plan: Plan, run: BuildRun, message: Projec
         or task.depends_on_task_ids
         or len(task.input_configuration_item_ids) > 1
     ):
-        raise BusinessException("当前只支持无任务依赖、最多一个原需求输入的 ProductManager 任务")
+        raise BusinessException("当前只支持无任务依赖、最多一个原需求输入的 Product Manager 任务")
     if message.sender != ProjectMessageSender.USER.value:
         raise BusinessException("需求任务必须引用原始用户消息")
 
@@ -158,7 +160,7 @@ def generate_task_app_spec(
             plan_id, cause_message_id = plan.plan_id, plan.cause_message_id
             input_item_ids = list(task.input_configuration_item_ids)
     except ValidationError as exc:
-        raise BusinessException("ProductManager 需求输入不符合要求") from exc
+        raise BusinessException("Product Manager 需求输入不符合要求") from exc
 
     model = settings.deepseek_model
     app_spec = product_manager_agent.generate_app_spec(payload)
@@ -203,7 +205,7 @@ def complete_task_app_spec(
     try:
         result = ProductManagerResult.model_validate(result.model_dump())
     except ValidationError as exc:
-        raise BusinessException("ProductManager 提交结果不符合要求") from exc
+        raise BusinessException("Product Manager 提交结果不符合要求") from exc
     if (result.project_id, result.build_run_id, result.task_id) != (project_id, run_id, task_id):
         raise BusinessException("提交结果不属于指定的项目、构建或任务")
     content = result.model_dump(mode="json", exclude={"execution_id"})
@@ -311,7 +313,7 @@ def complete_task_app_spec(
                     prompt_version=result.prompt_version,
                 )
             )
-            task.status = TaskStatus.SUCCEEDED.value
+            task_service.stage_succeeded(task)
             if execution is not None:
                 execution.status = "succeeded"
                 execution.active_slot = None
@@ -321,13 +323,7 @@ def complete_task_app_spec(
                     RequirementClarification(configuration_item_id=item.item_id, task_id=task_id)
                 )
             db.flush()
-            statuses = list(
-                db.scalars(
-                    select(Task.status).where(Task.plan_id == plan.plan_id).with_for_update()
-                ).all()
-            )
-            if all(status == TaskStatus.SUCCEEDED.value for status in statuses):
-                plan.status = PlanStatus.SUCCEEDED.value
+            plan_service.stage_succeeded_if_tasks_complete(db, plan)
         db.commit()
     except IntegrityError as exc:
         db.rollback()

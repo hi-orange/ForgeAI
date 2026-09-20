@@ -49,7 +49,7 @@ async function sourceFixture() {
       run_id: input.runId,
       files: Object.keys(contents).map((path) => ({ path, size_bytes: 1 })),
     })),
-    getWorkspaceFile: mock.fn(async (_token, _id, path) => ({
+    getWorkspaceFile: mock.fn(async (_id, path) => ({
       run_id: input.runId,
       path,
       content: contents[path],
@@ -59,9 +59,10 @@ async function sourceFixture() {
   const module = await loadModule('../src/views/project/useWorkspaceSource.ts', {
     vue: { ref, watch, onBeforeUnmount: (fn) => stops.push(fn) },
     '@/api/modules/workspace': api,
+    '@/stores': { useAuthStore: () => ({ token: 'test-token' }) },
   })
   const scope = effectScope()
-  const view = scope.run(() => module.useWorkspaceSource(input, () => 'test-token'))
+  const view = scope.run(() => module.useWorkspaceSource(input))
   const settle = async () => {
     await nextTick()
     await new Promise((resolve) => setImmediate(resolve))
@@ -202,7 +203,7 @@ test('unchanged approved scope keeps existing acceptance without extra input', a
   await f.mount()
   assert.equal(f.view.needsAcceptance(f.view.planItems.value[0]), false)
   await f.view.approve()
-  const selected = f.api.approveRequirements.mock.calls[0].arguments[4].selected
+  const selected = f.api.approveRequirements.mock.calls[0].arguments[3].selected
   assert.equal(selected[0].id, 'feat_read')
   assert.equal('acceptance' in selected[0], false)
   f.unmount()
@@ -223,14 +224,14 @@ test('editing a feature requires current acceptance and preserves retry identity
   })
   await f.view.approve()
   await f.view.approve()
-  const first = f.api.approveRequirements.mock.calls[0].arguments[4]
-  const retry = f.api.approveRequirements.mock.calls[1].arguments[4]
+  const first = f.api.approveRequirements.mock.calls[0].arguments[3]
+  const retry = f.api.approveRequirements.mock.calls[1].arguments[3]
   assert.equal(first.selected[0].text, '匿名查看记录')
   assert.equal(first.selected[0].acceptance, item.acceptance)
   assert.equal(first.client_message_id, retry.client_message_id)
   item.acceptance = '首页直接展示记录列表'
   await f.view.approve()
-  const changed = f.api.approveRequirements.mock.calls[2].arguments[4]
+  const changed = f.api.approveRequirements.mock.calls[2].arguments[3]
   assert.notEqual(changed.client_message_id, first.client_message_id)
   f.unmount()
 })
@@ -245,7 +246,7 @@ test('new feature requires acceptance but unchecked features do not block approv
   assert.equal(f.api.approveRequirements.mock.callCount(), 0)
   added.checked = false
   await f.view.approve()
-  assert.equal(f.api.approveRequirements.mock.calls[0].arguments[4].selected.length, 1)
+  assert.equal(f.api.approveRequirements.mock.calls[0].arguments[3].selected.length, 1)
   f.unmount()
 })
 
@@ -262,7 +263,7 @@ test('removing part of a joint criterion requests acceptance for the remaining f
   assert.equal(f.api.approveRequirements.mock.callCount(), 0)
   f.view.planItems.value[0].acceptance = '登录后显示记录列表'
   await f.view.approve()
-  assert.equal(f.api.approveRequirements.mock.calls[0].arguments[4].selected.length, 1)
+  assert.equal(f.api.approveRequirements.mock.calls[0].arguments[3].selected.length, 1)
   f.unmount()
 })
 
@@ -270,6 +271,7 @@ async function fixture(state = progress()) {
   const mounted = [],
     unmounted = [],
     timers = new Set()
+  const messages = []
   const api = {
     getRequirementsProject: mock.fn(async () => ({
       id: 7,
@@ -277,21 +279,60 @@ async function fixture(state = progress()) {
       prompt: '做一个读书记录应用',
     })),
     getRequirements: mock.fn(async () => structuredClone(state)),
-    getRequirementMessages: mock.fn(async () => []),
-    createRequirementMessage: mock.fn(async () => ({ id: 12, sequence: 12 })),
-    classifyRequirementMessage: mock.fn(async () => ({ category: 'product_change' })),
-    createRequirementsRun: mock.fn(async () => ({ run_id: 'run-new' })),
-    executeRequirements: mock.fn(async () => {
-      state = progress('ready_for_design')
+    getRequirementMessages: mock.fn(async (_id, after = 0) =>
+      messages.filter((message) => message.sequence > after).slice(0, 200),
+    ),
+    submitRequirements: mock.fn(async (_id, content) => {
+      const sequence = (messages.at(-1)?.sequence ?? 0) + 1
+      messages.push({
+        id: sequence,
+        sequence,
+        sender: 'user',
+        content,
+        client_message_id: `key-${sequence}`,
+      })
+      state = progress('ready_for_design', { message_id: sequence })
+      return structuredClone(state)
     }),
-    answerRequirements: mock.fn(async () => {
-      state = progress('ready_for_design')
+    startRequirements: mock.fn(async () => {
+      state = progress('ready_for_design', { message_id: messages[0]?.id ?? 1 })
+      return structuredClone(state)
+    }),
+    continueRequirements: mock.fn(async () => {
+      if (state.state === 'design_pending' || state.state === 'engineering_running') {
+        state = progress('engineering_running', {
+          activities: [{ id: 'start', name: 'start' }],
+          result: state.result,
+        })
+      } else if (state.state === 'ready_for_design') {
+        state = progress('design_pending', {
+          message_id: state.message_id,
+          result: {
+            configuration_item_id: 'ci-1',
+            design_plan_id: 'plan-design',
+            design_task_id: 'task-design',
+            open_questions: [],
+          },
+        })
+      } else {
+        state = progress('engineering_running', {
+          activities: [{ id: 'start', name: 'start' }],
+          result: state.result,
+        })
+      }
+      return structuredClone(state)
     }),
     approveRequirements: mock.fn(async () => {
       state = progress('design_pending')
+      return structuredClone(state)
     }),
-    continueEngineering: mock.fn(async () => {
-      state = progress('engineering_running', { activities: [{ id: 'start', name: 'start' }] })
+    pauseBuildRun: mock.fn(async () => {
+      state = progress('retry_available', {
+        task_id: state.task_id,
+        execution_id: state.execution_id,
+        error: '用户已暂停，可继续处理。',
+      })
+      return structuredClone(state)
     }),
   }
   const { useRequirements } = await loadModule(
@@ -303,7 +344,6 @@ async function fixture(state = progress()) {
         onMounted: (fn) => mounted.push(fn),
         onBeforeUnmount: (fn) => unmounted.push(fn),
       },
-      '@/stores': { useAuthStore: () => ({ token: 'test-token' }) },
       '@/api/modules/requirements': api,
     },
     {
@@ -317,6 +357,7 @@ async function fixture(state = progress()) {
   return {
     view: useRequirements(7),
     api,
+    messages,
     timers,
     mount: async () => {
       for (const fn of mounted) await fn()
@@ -330,75 +371,63 @@ async function fixture(state = progress()) {
   }
 }
 
-test('mount submits the home prompt once and starts requirement planning', async () => {
+test('mount starts requirement planning from the home prompt', async () => {
   const f = await fixture()
   await f.mount()
   assert.equal(f.view.text.value, '')
-  assert.equal(f.api.createRequirementMessage.mock.callCount(), 1)
-  assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 1)
-  assert.equal(f.api.createRequirementsRun.mock.callCount(), 0)
-  assert.equal(f.api.executeRequirements.mock.callCount(), 1)
-  assert.equal(f.api.answerRequirements.mock.callCount(), 0)
+  assert.equal(f.api.startRequirements.mock.callCount(), 1)
+  assert.equal(f.api.submitRequirements.mock.callCount(), 0)
   assert.equal(f.timers.size, 0)
   f.unmount()
 })
 
-test('mount executes the stored home message without posting a duplicate', async () => {
+test('mount starts from the stored home message without posting a duplicate', async () => {
   const f = await fixture()
-  f.api.getRequirementMessages.mock.mockImplementation(async () => [
-    { id: 1, sequence: 1, sender: 'user', content: '做一个读书记录应用' },
-  ])
+  f.messages.push({
+    id: 1,
+    sequence: 1,
+    sender: 'user',
+    content: '做一个读书记录应用',
+    client_message_id: 'project:7:initial',
+  })
   await f.mount()
-  assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
-  assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 1)
-  assert.equal(f.api.classifyRequirementMessage.mock.calls[0].arguments[2], 1)
-  assert.equal(f.api.createRequirementsRun.mock.callCount(), 0)
-  assert.equal(f.api.executeRequirements.mock.callCount(), 1)
-  assert.deepEqual(Array.from(f.api.executeRequirements.mock.calls[0].arguments), [
-    'test-token',
-    7,
-    'run-1',
-    1,
-  ])
+  assert.equal(f.api.startRequirements.mock.callCount(), 1)
+  assert.equal(f.api.submitRequirements.mock.callCount(), 0)
+  assert.deepEqual(Array.from(f.api.startRequirements.mock.calls[0].arguments), [7])
   f.unmount()
 })
 
 test('messages paginate and a refreshed waiting round binds the exact item', async () => {
   const f = await fixture(progress('needs_user_input'))
-  f.api.getRequirementMessages.mock.mockImplementation(async (_token, _id, after) =>
-    after === 0
-      ? Array.from({ length: 200 }, (_, index) => ({ id: index + 1, sequence: index + 1 }))
-      : [],
-  )
+  for (let index = 0; index < 200; index++) {
+    f.messages.push({ id: index + 1, sequence: index + 1, sender: 'user', content: 'm' })
+  }
   await f.mount()
   assert.equal(f.view.messages.value.length, 200)
-  assert.equal(f.api.getRequirementMessages.mock.calls[1].arguments[2], 200)
+  assert.equal(f.api.getRequirementMessages.mock.calls[1].arguments[1], 200)
   f.view.text.value = 'CSV'
   await f.view.submit()
-  assert.deepEqual(Array.from(f.api.answerRequirements.mock.calls[0].arguments).slice(0, 5), [
-    'test-token',
+  assert.deepEqual(Array.from(f.api.submitRequirements.mock.calls[0].arguments).slice(0, 2), [
     7,
-    'run-1',
-    'ci-1',
     'CSV',
   ])
-  assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 0)
   assert.equal(f.view.status.value.state, 'ready_for_design')
   f.unmount()
 })
 
-test('double submit calls the answer endpoint only once', async () => {
+test('double submit calls the submit endpoint only once', async () => {
   const f = await fixture(progress('needs_user_input'))
   const gate = deferred()
-  f.api.answerRequirements.mock.mockImplementation(async () => {
+  f.api.submitRequirements.mock.mockImplementation(async () => {
     await gate.promise
     f.setState(progress('ready_for_design'))
+    return progress('ready_for_design')
   })
   await f.mount()
   f.view.text.value = 'CSV'
   const submission = f.view.submit()
   await f.view.submit()
-  assert.equal(f.api.answerRequirements.mock.callCount(), 1)
+  assert.equal(f.api.submitRequirements.mock.callCount(), 1)
   assert.equal(f.view.busy.value, true)
   gate.resolve()
   await submission
@@ -409,7 +438,7 @@ test('double submit calls the answer endpoint only once', async () => {
 
 test('retrying an unsaved answer preserves its idempotency key', async () => {
   const f = await fixture(progress('needs_user_input'))
-  f.api.answerRequirements.mock.mockImplementationOnce(async () => {
+  f.api.submitRequirements.mock.mockImplementationOnce(async () => {
     throw new Error('网络断开')
   })
   await f.mount()
@@ -419,54 +448,66 @@ test('retrying an unsaved answer preserves its idempotency key', async () => {
   assert.equal(f.view.error.value, '网络断开')
   await f.view.submit()
   assert.equal(
-    f.api.answerRequirements.mock.calls[0].arguments[5],
-    f.api.answerRequirements.mock.calls[1].arguments[5],
+    f.api.submitRequirements.mock.calls[0].arguments[2],
+    f.api.submitRequirements.mock.calls[1].arguments[2],
   )
   f.unmount()
 })
 
-test('initial submission reuses a queued run and executes the saved message', async () => {
-  const f = await fixture()
+test('initial submission uses the coarse submit action', async () => {
+  const f = await fixture(progress('not_started', { run_id: null }))
+  f.api.getRequirementsProject.mock.mockImplementation(async () => ({
+    id: 7,
+    name: '读书记录',
+    prompt: null,
+  }))
   await f.mount()
+  assert.equal(f.api.startRequirements.mock.callCount(), 0)
+  f.view.text.value = '做一个读书记录应用'
   await f.view.submit()
-  assert.equal(f.api.createRequirementMessage.mock.callCount(), 1)
-  assert.equal(f.api.classifyRequirementMessage.mock.calls[0].arguments[2], 12)
-  assert.deepEqual(Array.from(f.api.executeRequirements.mock.calls[0].arguments), [
-    'test-token',
+  assert.equal(f.api.submitRequirements.mock.callCount(), 1)
+  assert.deepEqual(Array.from(f.api.submitRequirements.mock.calls[0].arguments).slice(0, 2), [
     7,
-    'run-1',
-    12,
+    '做一个读书记录应用',
   ])
-  assert.equal(f.api.createRequirementsRun.mock.callCount(), 0)
   f.unmount()
 })
 
 test('a question classified as inquiry does not create or execute a run', async () => {
   const f = await fixture(progress('not_started', { run_id: null }))
-  f.api.classifyRequirementMessage.mock.mockImplementation(async () => ({ category: 'inquiry' }))
+  f.api.startRequirements.mock.mockImplementation(async () => {
+    f.messages.push({
+      id: 2,
+      sequence: 2,
+      sender: 'assistant',
+      content: '先具体描述一下你想做的应用或功能，我再帮你整理构建计划。',
+      client_message_id: 'guidance:msg:1:inquiry',
+    })
+    return progress('not_started', { run_id: null })
+  })
+  f.messages.push({
+    id: 1,
+    sequence: 1,
+    sender: 'user',
+    content: '你好',
+    client_message_id: 'k1',
+  })
   await f.mount()
-  await f.view.submit()
-  assert.equal(f.api.createRequirementsRun.mock.callCount(), 0)
-  assert.equal(f.api.executeRequirements.mock.callCount(), 0)
-  assert.match(f.view.error.value, /描述你要做的应用/)
+  assert.equal(f.api.startRequirements.mock.callCount(), 1)
+  assert.equal(f.view.error.value, '')
+  assert.match(f.view.messages.value.at(-1)?.content ?? '', /描述一下你想做的应用/)
   f.unmount()
 })
 
-test('explicit recovery uses the current execution and pinned cause message', async () => {
+test('explicit recovery uses continue', async () => {
   const f = await fixture(
     progress('retry_available', { execution_id: 'exec-failed', message_id: 28 }),
   )
   await f.mount()
-  assert.equal(f.api.executeRequirements.mock.callCount(), 0)
+  assert.equal(f.api.continueRequirements.mock.callCount(), 0)
   await f.view.resume()
-  assert.deepEqual(Array.from(f.api.executeRequirements.mock.calls[0].arguments), [
-    'test-token',
-    7,
-    'run-1',
-    28,
-    'exec-failed',
-  ])
-  assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
+  assert.deepEqual(Array.from(f.api.continueRequirements.mock.calls[0].arguments), [7])
+  assert.equal(f.api.submitRequirements.mock.callCount(), 0)
   f.unmount()
 })
 
@@ -475,9 +516,10 @@ test('an older polling response cannot overwrite the final result', async () => 
   await f.mount()
   const work = deferred(),
     reading = deferred()
-  f.api.answerRequirements.mock.mockImplementation(async () => {
+  f.api.submitRequirements.mock.mockImplementation(async () => {
     await work.promise
     f.setState(progress('ready_for_design'))
+    return progress('ready_for_design')
   })
   f.view.text.value = 'CSV'
   const submission = f.view.submit()
@@ -505,24 +547,14 @@ test('unmount cancels polling and ignores late read results', async () => {
   assert.equal(f.timers.size, 0)
 })
 
-test('ready requirements resume the saved workflow without posting or classifying a new message', async () => {
+test('ready requirements resume through continue without posting a new message', async () => {
   const f = await fixture(progress('ready_for_design', { message_id: 45 }))
   await f.mount()
   assert.equal(f.view.canResume.value, true)
-  assert.equal(f.api.executeRequirements.mock.callCount(), 0)
-  f.api.executeRequirements.mock.mockImplementation(async () => {
-    f.setState(progress('design_pending'))
-  })
+  assert.equal(f.api.continueRequirements.mock.callCount(), 0)
   await f.view.resume()
-  assert.deepEqual(Array.from(f.api.executeRequirements.mock.calls[0].arguments), [
-    'test-token',
-    7,
-    'run-1',
-    45,
-    null,
-  ])
-  assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
-  assert.equal(f.api.classifyRequirementMessage.mock.callCount(), 0)
+  assert.equal(f.api.continueRequirements.mock.callCount(), 1)
+  assert.equal(f.api.submitRequirements.mock.callCount(), 0)
   assert.equal(f.view.status.value.state, 'design_pending')
   assert.equal(f.view.canResume.value, true)
   f.unmount()
@@ -545,11 +577,10 @@ test('refreshing a design assignment is read-only and explicit continuation star
   assert.equal(f.view.status.value.result.design_task_id, 'task-design')
   assert.equal(f.view.canWrite.value, false)
   assert.equal(f.view.canResume.value, true)
-  assert.equal(f.api.continueEngineering.mock.callCount(), 0)
+  assert.equal(f.api.continueRequirements.mock.callCount(), 0)
   assert.equal(f.timers.size, 0)
   await f.view.resume()
-  assert.equal(f.api.executeRequirements.mock.callCount(), 0)
-  assert.equal(f.api.continueEngineering.mock.callCount(), 1)
+  assert.equal(f.api.continueRequirements.mock.callCount(), 1)
   assert.equal(f.view.status.value.state, 'engineering_running')
   assert.equal(f.timers.size, 1)
   f.unmount()
@@ -561,13 +592,8 @@ test('blocked engineering resumes the saved run without a new requirement messag
   assert.equal(f.timers.size, 0)
   assert.equal(f.view.canResume.value, true)
   await f.view.resume()
-  assert.deepEqual(Array.from(f.api.continueEngineering.mock.calls[0].arguments), [
-    'test-token',
-    7,
-    'run-1',
-  ])
-  assert.equal(f.api.executeRequirements.mock.callCount(), 0)
-  assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
+  assert.deepEqual(Array.from(f.api.continueRequirements.mock.calls[0].arguments), [7])
+  assert.equal(f.api.submitRequirements.mock.callCount(), 0)
   assert.equal(f.view.status.value.state, 'engineering_running')
   f.unmount()
 })
@@ -577,6 +603,36 @@ test('generated engineering stops polling and does not offer another completion'
   await f.mount()
   assert.equal(f.timers.size, 0)
   assert.equal(f.view.canResume.value, false)
+  assert.equal(f.view.canPause.value, false)
+  f.unmount()
+})
+
+test('only an active execution can pause and the paused status replaces the running status', async () => {
+  const f = await fixture(
+    progress('engineering_running', {
+      task_id: 'task-engineering',
+      execution_id: 'exec-engineering',
+      activities: [{ id: 'start', name: 'start' }],
+    }),
+  )
+  await f.mount()
+  assert.equal(f.view.canPause.value, true)
+  assert.equal(f.timers.size, 1)
+  await f.view.pause()
+  assert.deepEqual(Array.from(f.api.pauseBuildRun.mock.calls[0].arguments), [7, 'run-1'])
+  assert.equal(f.view.status.value.state, 'retry_available')
+  assert.equal(f.view.canPause.value, false)
+  assert.equal(f.view.canResume.value, true)
+  assert.equal(f.timers.size, 0)
+  f.unmount()
+})
+
+test('a running label without an active execution does not offer pause', async () => {
+  const f = await fixture(progress('engineering_running'))
+  await f.mount()
+  assert.equal(f.view.canPause.value, false)
+  await f.view.pause()
+  assert.equal(f.api.pauseBuildRun.mock.callCount(), 0)
   f.unmount()
 })
 
@@ -616,33 +672,32 @@ test('timeline merges starts and results in operation order without losing failu
 test('a failed dispatch retry keeps the continuation button available', async () => {
   const f = await fixture(progress('ready_for_design'))
   await f.mount()
-  f.api.executeRequirements.mock.mockImplementation(async () => {
+  f.api.continueRequirements.mock.mockImplementation(async () => {
     throw new Error('派工失败')
   })
   await f.view.resume()
   assert.equal(f.view.canResume.value, true)
   assert.equal(f.view.status.value.state, 'ready_for_design')
   assert.equal(f.view.error.value, '派工失败')
-  assert.equal(f.api.createRequirementMessage.mock.callCount(), 0)
+  assert.equal(f.api.submitRequirements.mock.callCount(), 0)
   f.unmount()
 })
 
-test('HTTP wrappers carry authentication, exact identifiers, and answer keys', async () => {
+test('HTTP wrappers post coarse actions without embedding tokens', async () => {
   const request = mock.fn(async () => ({}))
   const api = await loadModule('../src/api/modules/requirements.ts', {
     '../request': { apiRequest: request },
   })
-  await api.executeRequirements('token', 7, 'run-2', 33, 'exec-2')
-  await api.answerRequirements('token', 7, 'run-2', 'ci-2', 'CSV', 'key-2')
+  await api.submitRequirements(7, 'CSV', 'key-2')
+  await api.startRequirements(7, 33)
+  await api.continueRequirements(7)
   const calls = JSON.parse(JSON.stringify(request.mock.calls.map((call) => call.arguments)))
   assert.deepEqual(calls, [
     [
-      '/api/v1/projects/7/build-runs/run-2/requirements',
-      { method: 'POST', token: 'token', body: { message_id: 33, recovery_execution_id: 'exec-2' } },
+      '/api/v1/projects/7/requirements/submit',
+      { method: 'POST', body: { content: 'CSV', client_message_id: 'key-2' } },
     ],
-    [
-      '/api/v1/projects/7/build-runs/run-2/requirements/ci-2/answers',
-      { method: 'POST', token: 'token', body: { content: 'CSV', client_message_id: 'key-2' } },
-    ],
+    ['/api/v1/projects/7/requirements/start', { method: 'POST', body: { message_id: 33 } }],
+    ['/api/v1/projects/7/requirements/continue', { method: 'POST' }],
   ])
 })

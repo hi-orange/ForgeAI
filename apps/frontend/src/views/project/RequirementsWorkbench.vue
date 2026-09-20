@@ -33,28 +33,28 @@
         </article>
         <article v-if="!awaitingIdeaAfterReply" class="agent-message">
           <div class="agent-meta">
-            <span class="avatar">F</span><strong>Forge</strong><span>产品助手</span>
+            <span class="avatar">F</span><strong>Forge</strong
+            ><span>{{ postApproval ? '工程师' : '产品助手' }}</span>
           </div>
           <p class="agent-status" role="status">
             <span
               class="status-dot"
               :class="{
                 working:
-                  busy || status?.state === 'running' || status?.state === 'engineering_running',
+                  busy ||
+                  status?.state === 'running' ||
+                  status?.state === 'design_running' ||
+                  (status?.state === 'engineering_running' && !status.error),
               }"
             />{{ stateLabel }}
           </p>
           <p v-if="agentText" class="intro">{{ agentText }}</p>
-          <ol v-if="status?.activities?.length" class="tool-trace">
-            <li
-              v-for="(step, index) in status.activities"
-              :key="step.id + '-' + index"
-              :class="{ failed: !step.ok }"
-            >
-              <span class="tool-label">{{ step.label }}</span>
-              <span v-if="step.detail" class="tool-detail">{{ step.detail }}</span>
-            </li>
-          </ol>
+          <BuildTimeline
+            v-if="status?.activities?.length"
+            :activities="status.activities"
+            :running="engineeringRunning"
+            @open-file="openWorkspaceFile"
+          />
         </article>
 
         <section v-if="canApprove" class="approval-card" aria-labelledby="plan-heading">
@@ -158,6 +158,7 @@
         <details
           v-if="
             status?.state === 'design_pending' ||
+            status?.state === 'design_running' ||
             status?.state === 'engineering_running' ||
             status?.state === 'engineering_generated'
           "
@@ -186,18 +187,21 @@
           @keydown.enter.exact.prevent="!$event.isComposing && submit()"
         />
         <div class="composer-bottom">
-          <span>{{ canApprove ? '也可以直接在上方勾选并批准' : '从一个想法开始' }}</span>
+          <span>{{ composerHint }}</span>
           <div class="composer-actions">
             <button
-              v-if="canPause"
+              v-if="canPause || pausing"
               type="button"
-              class="secondary pause-button"
+              class="send-button pause-button"
               :disabled="pausing"
+              :aria-label="pausing ? '正在暂停构建' : '暂停构建'"
+              :title="pausing ? '正在暂停构建' : '暂停构建'"
               @click="pause"
             >
-              {{ pausing ? '暂停中…' : '暂停' }}
+              <span class="pause-icon" aria-hidden="true" />
             </button>
             <button
+              v-else
               type="submit"
               class="send-button"
               :disabled="busy || !canWrite || !text.trim()"
@@ -214,71 +218,26 @@
       <WorkspaceEditorPane
         v-if="workspaceView === 'editor'"
         :project-id="projectId"
-        :ready="Boolean(status?.code_ready)"
+        :ready="Boolean(status?.workspace_ready)"
+        :run-id="status?.run_id"
+        :generation="workspaceGeneration"
+        :written-path="latestWrittenPath"
+        :requested-path="requestedWorkspacePath"
+        :request-sequence="workspaceRequestSequence"
         @download="downloadWorkspaceHint"
       />
-      <div v-else-if="workspaceView === 'design'" class="design-surface">
-        <div class="canvas-toolbar">
-          <span>设计 / 预览</span>
-          <div class="preview-address">
-            <WorkbenchIcon name="home" /> Home <WorkbenchIcon name="chevron-down" />
-          </div>
-          <button type="button" :disabled="refreshing" @click="refresh">
-            <WorkbenchIcon name="refresh" /> 刷新
-          </button>
-          <button type="button" :aria-expanded="consoleOpen" @click="consoleOpen = !consoleOpen">
-            <WorkbenchIcon name="console" /> 控制台
-          </button>
-        </div>
-        <div v-if="showPlanOverview" class="plan-overview">
-          <span class="eyebrow">{{ canApprove ? '待批准的建议' : '当前计划' }}</span>
-          <h1>{{ planGoal }}</h1>
-          <ul>
-            <li v-for="item in planItems.filter((entry) => entry.checked)" :key="item.id">
-              <WorkbenchIcon name="check" />{{ item.label }}
-            </li>
-          </ul>
-          <p v-if="canApprove">在左侧勾选、编辑或新增需求，批准后继续。</p>
-        </div>
-        <div v-else class="preview-empty">
-          <div class="preview-illustration" aria-hidden="true">
-            <div class="mini-sidebar"><i /><i /><i /></div>
-            <div class="mini-page">
-              <div class="mini-nav"><i /><i /></div>
-              <div class="mini-hero" />
-              <div class="mini-cards"><i /><i /><i /></div>
-            </div>
-            <span class="preview-spark">✦</span>
-          </div>
-          <span class="eyebrow">从想法到应用</span>
-          <h1>{{ previewTitle }}</h1>
-          <p>{{ previewDescription }}</p>
-          <p v-if="status?.code_ready && status.workspace_path" class="workspace-path">
-            工作区已写入磁盘：<code>{{ status.workspace_path }}</code>
-          </p>
-          <div class="progress-steps">
-            <span class="done">描述想法</span><i /><span
-              :class="{
-                done:
-                  canApprove ||
-                  status?.state === 'design_pending' ||
-                  status?.state === 'engineering_running' ||
-                  status?.state === 'engineering_generated',
-              }"
-              >确认计划</span
-            ><i /><span :class="{ done: status?.code_ready }">生成应用</span><i /><span
-              >在线预览</span
-            >
-          </div>
-          <p v-if="status?.code_ready" class="preview-note">
-            切换到顶栏「编辑器」可浏览已写入的前后端源码。在线预览网关尚未接入。
-          </p>
-        </div>
-        <aside v-if="consoleOpen" class="console">
-          <strong>运行详情</strong>
-          <pre>{{ JSON.stringify(status, null, 2) }}</pre>
-        </aside>
-      </div>
+      <AppPreviewPane
+        v-else-if="workspaceView === 'design'"
+        :status="status"
+        :plan-goal="planGoal"
+        :plan-items="planItems"
+        :can-approve="canApprove"
+        :can-resume="canResume"
+        :busy="busy"
+        :refreshing="refreshing"
+        @refresh="refresh"
+        @resolve="resume"
+      />
       <div v-else class="mode-placeholder">
         <h2>{{ placeholderTitle }}</h2>
         <p>{{ placeholderDescription }}</p>
@@ -292,6 +251,9 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import ForgeLogo from '@/components/ForgeLogo.vue'
 import type { WorkspaceView } from './projectView'
+import { isNearThreadBottom } from './buildTimeline'
+import AppPreviewPane from './components/AppPreviewPane.vue'
+import BuildTimeline from './components/BuildTimeline.vue'
 import ProjectTopbar, { type TopbarModeTab } from './components/ProjectTopbar.vue'
 import WorkbenchIcon from './components/WorkbenchIcon.vue'
 import WorkspaceEditorPane from './components/WorkspaceEditorPane.vue'
@@ -324,17 +286,19 @@ const {
   approve,
 } = useRequirements(projectId)
 const chatCollapsed = ref(false)
-const consoleOpen = ref(false)
 const editing = ref(false)
 const newRequirement = ref('')
 const historyOpen = ref(false)
 const workspaceView = ref<WorkspaceView>('design')
+const requestedWorkspacePath = ref<string | null>(null)
+const workspaceRequestSequence = ref(0)
 const thread = ref<HTMLElement | null>(null)
+let autoOpenedWorkspace = false
 const featureCount = computed(
   () => planItems.value.filter((item) => item.kind === 'feature').length,
 )
 const modeTabs: TopbarModeTab[] = [
-  { id: 'design', icon: 'paintbrush', label: '设计' },
+  { id: 'design', icon: 'desktop', label: '预览' },
   { id: 'editor', icon: 'editor-code', label: '编辑器' },
   { id: 'cloud', icon: 'cloud-upload', label: '云' },
   { id: 'files', icon: 'folder', label: '文件' },
@@ -350,6 +314,7 @@ const labels = {
   awaiting_approval: '构建计划已准备好',
   ready_for_design: '计划已批准',
   design_pending: '计划已批准，正在开始构建',
+  design_running: 'Architect 正在设计系统',
   engineering_running: '正在根据获批需求编写代码',
   engineering_generated: '业务代码已写入工作区',
 }
@@ -362,9 +327,18 @@ function kindLabel(kind: string) {
 const postApproval = computed(
   () =>
     status.value?.state === 'design_pending' ||
+    status.value?.state === 'design_running' ||
     status.value?.state === 'engineering_running' ||
     status.value?.state === 'engineering_generated',
 )
+const engineeringRunning = computed(
+  () => status.value?.state === 'engineering_running' && !status.value.error,
+)
+const successfulWrites = computed(
+  () => status.value?.activities?.filter((step) => step.name === 'apply_patch' && step.ok) ?? [],
+)
+const workspaceGeneration = computed(() => successfulWrites.value.length)
+const latestWrittenPath = computed(() => successfulWrites.value.at(-1)?.detail || null)
 // 问询等已在对话里回过话时，不再用常驻卡重复「告诉我你想做什么」。
 const awaitingIdeaAfterReply = computed(() => {
   if (busy.value || status.value?.state !== 'not_started') return false
@@ -392,8 +366,11 @@ const agentText = computed(() => {
     }
     if (status.value?.state === 'engineering_running') {
       return status.value.activities?.length
-        ? '正在按获批需求读写工作区。下面是逐步操作。'
-        : '正在根据获批需求构建应用，读写文件会出现在这条对话里。'
+        ? '正在按获批需求读写工作区。当前动作保持精简，完整历史可按需展开。'
+        : '正在根据获批需求构建应用，右侧会同步显示真实文件。'
+    }
+    if (status.value?.state === 'design_running') {
+      return 'Architect 正在把获批 PRD 转化为模块、接口和数据结构设计。'
     }
     return '计划已批准，正在开始构建应用。'
   }
@@ -401,29 +378,11 @@ const agentText = computed(() => {
     return '我正在把你的想法整理成可选择的功能和页面。'
   return '告诉我你想做什么，我会先整理一份简洁的构建计划。'
 })
-const previewTitle = computed(() =>
-  postApproval.value
-    ? status.value?.code_ready
-      ? '应用代码已写入'
-      : '正在构建你的应用'
-    : canApprove.value
-      ? '你的应用，即将从这里开始'
-      : '把想法变成看得见的应用',
-)
-const previewDescription = computed(() =>
-  postApproval.value
-    ? status.value?.state === 'engineering_generated'
-      ? '已按获批需求写入工作区代码。未跑完整验收，也尚未登记可用版本。'
-      : status.value?.state === 'engineering_running'
-        ? status.value.activities?.length
-          ? '对话里可以看到正在读取和写入的文件。'
-          : '正在根据获批需求编写业务代码，操作会显示在左侧对话中。'
-        : '需求已交给工程任务，正在开始构建。'
-    : canApprove.value
-      ? '在左侧选择需要的功能，编辑计划或补充需求，然后批准构建。'
-      : '描述你的想法，确认核心功能，应用生成后将在这里预览。',
-)
-const showPlanOverview = computed(() => Boolean(status.value?.app_spec) && canApprove.value)
+const composerHint = computed(() => {
+  if (pausing.value) return '正在暂停，当前进度会被保留'
+  if (canPause.value) return '构建运行中，点击右侧按钮可暂停'
+  return canApprove.value ? '也可以直接在上方勾选并批准' : '从一个想法开始'
+})
 const canvasLabel = computed(() => {
   if (workspaceView.value === 'editor') return '代码编辑器'
   if (workspaceView.value === 'design') return '设计预览'
@@ -442,6 +401,11 @@ const placeholderDescription = computed(() => {
 
 function setWorkspaceView(view: WorkspaceView) {
   workspaceView.value = view
+}
+function openWorkspaceFile(path: string) {
+  workspaceView.value = 'editor'
+  requestedWorkspacePath.value = path
+  workspaceRequestSequence.value += 1
 }
 function shareProject() {
   void navigator.clipboard?.writeText(window.location.href)
@@ -462,10 +426,28 @@ function addRequirement() {
   newRequirement.value = ''
 }
 watch(
+  () => [status.value?.state, status.value?.workspace_ready] as const,
+  ([state, workspaceReady]) => {
+    if (
+      !autoOpenedWorkspace &&
+      workspaceReady &&
+      (state === 'design_pending' ||
+        state === 'design_running' ||
+        state === 'engineering_running' ||
+        state === 'engineering_generated')
+    ) {
+      autoOpenedWorkspace = true
+      workspaceView.value = 'editor'
+    }
+  },
+  { immediate: true },
+)
+watch(
   () => [messages.value.length, status.value?.state, status.value?.activities?.length],
   async () => {
+    const shouldFollow = thread.value ? isNearThreadBottom(thread.value) : true
     await nextTick()
-    thread.value?.scrollTo({ top: thread.value.scrollHeight, behavior: 'smooth' })
+    if (shouldFollow) thread.value?.scrollTo({ top: thread.value.scrollHeight, behavior: 'smooth' })
   },
 )
 </script>
@@ -656,38 +638,6 @@ summary:focus-visible {
   line-height: 1.9;
   color: #787b8b;
 }
-.tool-trace {
-  margin: 0 0 26px 39px;
-  padding: 0;
-  list-style: none;
-  display: grid;
-  gap: 8px;
-  li {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 8px;
-    color: #5d6478;
-    font-size: 13px;
-  }
-  .tool-label {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12px;
-    font-weight: 600;
-    color: #3d4aa8;
-    background: #e8ebff;
-    border-radius: 999px;
-    padding: 2px 8px;
-  }
-  .tool-detail {
-    color: #6a7084;
-    word-break: break-all;
-  }
-  .failed .tool-label {
-    color: #9b2c2c;
-    background: #fde8e8;
-  }
-}
 .approval-card {
   padding: 16px 8px 8px;
   border-radius: 22px;
@@ -867,13 +817,10 @@ summary:focus-visible {
 .composer-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
-}
-.pause-button {
-  padding: 6px 12px;
-  font-size: 12px;
 }
 .send-button {
+  display: grid;
+  place-items: center;
   border: 0;
   border-radius: 50%;
   background: var(--accent);
@@ -881,6 +828,15 @@ summary:focus-visible {
   width: 32px;
   height: 32px;
   font-size: 23px;
+}
+.pause-button {
+  background: #252936;
+}
+.pause-icon {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: currentColor;
 }
 .canvas-pane {
   display: flex;
@@ -891,12 +847,6 @@ summary:focus-visible {
   border-radius: 18px;
   overflow: hidden;
   background: white;
-}
-.design-surface {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  flex: 1;
 }
 .mode-placeholder {
   flex: 1;
@@ -918,201 +868,6 @@ summary:focus-visible {
     line-height: 1.7;
   }
 }
-.canvas-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  min-height: 34px;
-  padding: 0 14px;
-  background: #fafafa;
-  border-bottom: 1px solid #f1f1f3;
-  color: #777;
-  font-size: 11px;
-  button {
-    display: flex;
-    gap: 4px;
-    align-items: center;
-    border: 0;
-    background: transparent;
-    color: #555;
-  }
-}
-.preview-address {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 60px;
-  padding: 3px 10px;
-  border: 1px solid #eaeaec;
-  border-radius: 20px;
-}
-.preview-empty {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 30px;
-  text-align: center;
-  h1 {
-    font-size: clamp(20px, 2vw, 28px);
-    letter-spacing: -0.6px;
-    font-weight: 500;
-    margin: 12px 0;
-  }
-  > p {
-    max-width: 390px;
-    color: #9193a1;
-    line-height: 1.9;
-    margin: 0;
-  }
-}
-.workspace-path {
-  max-width: min(640px, 90%);
-  margin-top: 14px;
-  font-size: 12px;
-  color: #59617e;
-  word-break: break-all;
-  code {
-    display: inline-block;
-    margin-top: 4px;
-    padding: 4px 8px;
-    border-radius: 6px;
-    background: #f3f4f8;
-    font-size: 11px;
-  }
-}
-.preview-note {
-  max-width: 420px;
-  margin-top: 16px;
-  font-size: 12px;
-  color: #8a6d3b;
-  line-height: 1.7;
-}
-.eyebrow {
-  font-size: 11px;
-  color: #8b8fbd;
-  letter-spacing: 2px;
-}
-.preview-illustration {
-  display: flex;
-  position: relative;
-  width: 246px;
-  height: 150px;
-  padding: 12px;
-  gap: 9px;
-  margin-bottom: 34px;
-  border: 1px solid #e4e6f5;
-  border-radius: 12px;
-  background: #f9faff;
-  box-shadow: 0 20px 60px #536eff10;
-  transform: rotate(-3deg);
-}
-.mini-sidebar {
-  width: 54px;
-  padding: 12px 5px;
-  border-radius: 7px;
-  background: #eff0fb;
-  i {
-    display: block;
-    height: 4px;
-    margin: 7px 2px;
-    border-radius: 4px;
-    background: #d6dcf5;
-  }
-}
-.mini-page {
-  flex: 1;
-  padding: 8px;
-  background: white;
-  border-radius: 7px;
-}
-.mini-nav {
-  display: flex;
-  justify-content: space-between;
-  i {
-    width: 23px;
-    height: 4px;
-    background: #e3e7f5;
-    border-radius: 4px;
-  }
-}
-.mini-hero {
-  height: 57px;
-  margin-top: 15px;
-  border-radius: 6px;
-  background: linear-gradient(120deg, #e7e9ff, #e4f0ff);
-}
-.mini-cards {
-  display: flex;
-  gap: 6px;
-  margin-top: 10px;
-  i {
-    flex: 1;
-    height: 28px;
-    border: 1px solid #edeff8;
-    border-radius: 5px;
-  }
-}
-.preview-spark {
-  position: absolute;
-  right: -14px;
-  top: -18px;
-  font-size: 36px;
-  color: #9ba8ff;
-}
-.progress-steps {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 30px;
-  font-size: 11px;
-  color: #c3c4cf;
-  i {
-    width: 25px;
-    height: 1px;
-    background: #e5e6ed;
-  }
-  .done {
-    color: #7d88bc;
-  }
-}
-.plan-overview {
-  flex: 1;
-  overflow: auto;
-  padding: clamp(24px, 5vw, 80px);
-  h1 {
-    font-size: 25px;
-    line-height: 1.5;
-  }
-  ul {
-    list-style: none;
-    padding: 0;
-  }
-  li {
-    display: flex;
-    gap: 12px;
-    align-items: baseline;
-    line-height: 1.8;
-    padding: 15px 0;
-    border-bottom: 1px solid #eee;
-  }
-  p {
-    color: #8a8d9e;
-  }
-}
-.console {
-  border-top: 1px solid #ececf1;
-  padding: 14px;
-  max-height: 180px;
-  overflow: auto;
-  font-size: 11px;
-  pre {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    color: #7a7d8d;
-  }
-}
 @keyframes pulse {
   50% {
     opacity: 0.35;
@@ -1132,9 +887,6 @@ summary:focus-visible {
   }
   .workspace-tabs {
     display: none;
-  }
-  .preview-address {
-    gap: 12px;
   }
 }
 @media (max-width: 640px) {

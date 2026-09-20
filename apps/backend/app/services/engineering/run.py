@@ -1,4 +1,4 @@
-"""Start the engineering coding loop after a SoftwareEngineer task is claimed."""
+"""Start the engineering coding loop after a Code Engineer task is claimed."""
 
 from __future__ import annotations
 
@@ -8,10 +8,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.exceptions import ConflictException
 from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.user import User
-from app.orchestration.software_engineer import run_engineering_workflow
+from app.orchestration.code_engineer import run_engineering_workflow
 from app.services.engineering.claim import read_frozen_input_snapshot
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
 
@@ -96,13 +97,15 @@ def start_claimed_engineering(
 ) -> dict:
     """Run the coding loop. Default is a background thread so the chat can poll tool steps."""
     if wait:
-        return run_engineering_workflow(
-            db,
-            user,
-            project_id,
-            run_id,
-            task.task_id,
-            execution.execution_id,
+        return dict(
+            run_engineering_workflow(
+                db,
+                user,
+                project_id,
+                run_id,
+                task.task_id,
+                execution.execution_id,
+            )
         )
     if db.new or db.dirty or db.deleted:
         db.commit()
@@ -138,6 +141,13 @@ def start_claimed_engineering(
                     execution_id,
                     session_factory=factory,
                 )
+        except ConflictException as exc:
+            # Soft pause / fencing: the user can resume; do not treat as a loop crash.
+            logger.info(
+                "engineering loop stopped execution_id=%s reason=%s",
+                execution_id,
+                exc,
+            )
         except Exception as exc:
             logger.exception("engineering loop failed execution_id=%s", execution_id)
             _record_loop_failure(factory, task_id, execution_id, str(exc) or "工程循环失败")

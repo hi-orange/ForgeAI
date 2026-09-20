@@ -9,10 +9,10 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.models.build_run import ACTIVE_BUILD_RUN_STATUSES, BuildRun
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemState
-from app.models.plan import Plan
+from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
 from app.models.project_message import ProjectMessage, ProjectMessageSender
-from app.models.task import Task
+from app.models.task import Task, TaskStatus
 from app.models.user import User
 from app.schemas.plan import PlanCreate
 from app.services import project as project_service
@@ -86,6 +86,48 @@ def _validate_inputs(db: Session, project_id: int, payload: PlanCreate) -> None:
         raise NotFoundException("输入 ConfigurationItem 不存在或不属于当前项目")
     if any(item.state != ConfigurationItemState.USABLE.value for item in items):
         raise ConflictException("Task 输入不能引用 unusable 的 ConfigurationItem")
+
+
+def stage_running(db: Session, plan: Plan) -> None:
+    """Claim one plan as the run's only running plan without committing."""
+
+    if plan.status not in (PlanStatus.PENDING.value, PlanStatus.RUNNING.value):
+        raise ConflictException("计划已结束，不能领取其中的任务")
+    other_running_plan = db.scalar(
+        select(Plan.plan_id)
+        .where(
+            Plan.build_run_id == plan.build_run_id,
+            Plan.plan_id != plan.plan_id,
+            Plan.status == PlanStatus.RUNNING.value,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if other_running_plan is not None:
+        raise ConflictException("该构建已有另一份计划正在执行，不能混用计划")
+    plan.status = PlanStatus.RUNNING.value
+
+
+def stage_succeeded_if_tasks_complete(db: Session, plan: Plan) -> bool:
+    """Derive plan completion from its task ledger without committing."""
+
+    statuses = list(
+        db.scalars(select(Task.status).where(Task.plan_id == plan.plan_id).with_for_update()).all()
+    )
+    if not statuses:
+        raise ConflictException("空计划不能标记为完成")
+    if all(status == TaskStatus.SUCCEEDED.value for status in statuses):
+        plan.status = PlanStatus.SUCCEEDED.value
+        return True
+    return False
+
+
+def stage_cancelled(plan: Plan) -> None:
+    """Cancel only a plan that has not started executing."""
+
+    if plan.status != PlanStatus.PENDING.value:
+        raise ConflictException("只能取消尚未执行的计划")
+    plan.status = PlanStatus.CANCELLED.value
 
 
 def stage_plan(

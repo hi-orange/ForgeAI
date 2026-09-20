@@ -1,4 +1,4 @@
-"""Claim a SoftwareEngineer delivery task and freeze its execution inputs."""
+"""Claim a Code Engineer delivery task and freeze its execution inputs."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.generation.template_registry import DEFAULT_TEMPLATE_VERSION, load_template_metadata
-from app.models.build_run import ACTIVE_BUILD_RUN_STATUSES, BuildRun, BuildRunStage, BuildRunStatus
+from app.models.build_run import BuildRun, BuildRunStage
 from app.models.configuration_item import ConfigurationItemType
 from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
@@ -21,12 +21,16 @@ from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.schemas.app_spec import AppSpec
-from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_approved_app_spec
+from app.schemas.system_design import SystemDesign
+from app.services import build_run as build_run_service
+from app.services import plan as plan_service
+from app.services import task as task_service
+from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_engineering_source
 from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_now
 
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
 INPUT_SNAPSHOT_SCHEMA_VERSION = 1
-TOOL_STRATEGY_VERSION = "engineering_tools_v1"
+TOOL_STRATEGY_VERSION = "engineering_tools_v3"
 
 DEFAULT_CALL_BUDGET: dict[str, int] = {
     "max_model_turns": 40,
@@ -57,13 +61,16 @@ def build_frozen_input_snapshot(
     task_id: str,
     approved_item_id: str,
     spec: AppSpec,
+    design_item_id: str,
+    system_design: SystemDesign,
     template_version: str = DEFAULT_TEMPLATE_VERSION,
     base_revision_id: str | None = None,
     call_budget: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Build the immutable input bag for one engineering execution."""
     meta = load_template_metadata(template_version)
-    stack = meta.get("stack") if isinstance(meta.get("stack"), dict) else {}
+    stack_raw = meta.get("stack")
+    stack: dict[str, Any] = stack_raw if isinstance(stack_raw, dict) else {}
     return {
         "kind": INPUT_SNAPSHOT_KIND,
         "schema_version": INPUT_SNAPSHOT_SCHEMA_VERSION,
@@ -72,6 +79,8 @@ def build_frozen_input_snapshot(
         "task_id": task_id,
         "approved_item_id": approved_item_id,
         "approved_spec_digest": approved_spec_digest(spec),
+        "design_item_id": design_item_id,
+        "system_design": system_design.model_dump(mode="json"),
         "base_revision_id": base_revision_id,
         "template_version": template_version,
         "template_digest": template_digest(template_version),
@@ -100,7 +109,7 @@ def read_frozen_input_snapshot(execution: TaskExecution) -> dict[str, Any] | Non
     return draft
 
 
-def claim_software_engineer_task(
+def claim_code_engineer_task(
     db: Session,
     user: User,
     project_id: int,
@@ -132,14 +141,10 @@ def claim_software_engineer_task(
         )
         if run is None:
             raise NotFoundException("构建任务不存在")
-        if run.status not in ACTIVE_BUILD_RUN_STATUSES or run.active_slot != 1:
-            raise ConflictException("构建任务已结束，不能领取工程任务")
-        if run.status == BuildRunStatus.RUNNING.value and run.stage not in (
-            BuildRunStage.PM.value,
-            BuildRunStage.DEVELOPER.value,
-        ):
-            raise ConflictException("构建已进入其他阶段，不能领取工程任务")
-
+        build_run_service.require_active_for_stages(
+            run,
+            {BuildRunStage.ARCHITECT, BuildRunStage.DEVELOPER},
+        )
         result = db.execute(
             select(Task, Plan)
             .join(Plan, Task.plan_id == Plan.plan_id)
@@ -155,8 +160,8 @@ def claim_software_engineer_task(
             raise NotFoundException("任务不存在或不属于指定构建")
         task, plan = result
 
-        if task.recipient != TaskRecipient.SOFTWARE_ENGINEER.value:
-            raise BusinessException("该任务不是分配给 SoftwareEngineer 的")
+        if task.recipient != TaskRecipient.CODE_ENGINEER.value:
+            raise BusinessException("该任务不是分配给 Code Engineer 的")
         if task.task_key != ENGINEERING_TASK_KEY:
             raise BusinessException("只能领取工程交付任务")
         if task.expected_output_type != ConfigurationItemType.CODE.value:
@@ -166,8 +171,11 @@ def claim_software_engineer_task(
         if task.depends_on_task_ids:
             raise ConflictException("工程交付任务不能带依赖链")
 
-        approved_item_id = task.input_configuration_item_ids[0]
-        _, _, _, spec = load_approved_app_spec(db, project_id, run_id, approved_item_id, lock=True)
+        input_item_id = task.input_configuration_item_ids[0]
+        source = load_engineering_source(db, project_id, run_id, input_item_id, lock=True)
+        approved_item_id = source.app_spec_item.item_id
+        design_item_id = source.input_item.item_id
+        spec = source.app_spec
 
         if task.status == TaskStatus.RUNNING.value and plan.status == PlanStatus.RUNNING.value:
             current = latest_execution(db, task_id, lock=True)
@@ -186,6 +194,8 @@ def claim_software_engineer_task(
                     raise ConflictException("冻结输入与任务定义不一致")
                 if snapshot.get("approved_spec_digest") != approved_spec_digest(spec):
                     raise ConflictException("获批需求已被替换，不能沿用旧执行")
+                if snapshot.get("design_item_id") != design_item_id:
+                    raise ConflictException("冻结系统设计与任务定义不一致")
                 db.commit()
                 db.refresh(task)
                 db.refresh(current)
@@ -205,6 +215,8 @@ def claim_software_engineer_task(
                 raise ConflictException("冻结输入与任务定义不一致")
             if snapshot.get("approved_spec_digest") != approved_spec_digest(spec):
                 raise ConflictException("获批需求已被替换，不能沿用旧执行")
+            if snapshot.get("design_item_id") != design_item_id:
+                raise ConflictException("冻结系统设计与任务定义不一致")
             if current.status == "running":
                 current.status, current.active_slot, current.finished_at = "superseded", None, now
                 db.flush()
@@ -229,50 +241,17 @@ def claim_software_engineer_task(
         if plan.status not in (PlanStatus.PENDING.value, PlanStatus.RUNNING.value):
             raise ConflictException("计划已结束，不能领取其中的任务")
 
-        other_running_plan = db.scalar(
-            select(Plan.plan_id)
-            .where(
-                Plan.build_run_id == run_id,
-                Plan.plan_id != plan.plan_id,
-                Plan.status == PlanStatus.RUNNING.value,
-            )
-            .limit(1)
-            .with_for_update()
+        build_run_service.stage_running(
+            db,
+            run,
+            stage=BuildRunStage.DEVELOPER,
+            allowed_running_stages={
+                BuildRunStage.ARCHITECT,
+                BuildRunStage.DEVELOPER,
+            },
         )
-        if other_running_plan is not None:
-            raise ConflictException("该构建已有另一份计划正在执行，不能混用计划")
-
-        reserved = db.connection().execute(
-            update(BuildRun)
-            .where(
-                BuildRun.project_id == project_id,
-                BuildRun.run_id == run_id,
-                BuildRun.status == run.status,
-                BuildRun.stage == run.stage,
-                BuildRun.active_slot == 1,
-            )
-            .values(
-                status=BuildRunStatus.RUNNING.value,
-                stage=BuildRunStage.DEVELOPER.value,
-            )
-        )
-        if reserved.rowcount != 1:
-            raise ConflictException("构建状态已改变，请重新读取后再领取")
-        db.expire(run)
-
-        claimed = db.connection().execute(
-            update(Task)
-            .where(
-                Task.task_id == task_id,
-                Task.plan_id == plan.plan_id,
-                Task.status == TaskStatus.PENDING.value,
-            )
-            .values(status=TaskStatus.RUNNING.value)
-        )
-        if claimed.rowcount != 1:
-            raise ConflictException("任务已被其他请求领取或状态已改变")
-        db.expire(task)
-        plan.status = PlanStatus.RUNNING.value
+        plan_service.stage_running(db, plan)
+        task_service.stage_running(db, task)
 
         now = utc_now()
         if latest_execution(db, task_id, lock=True) is not None:
@@ -284,6 +263,8 @@ def claim_software_engineer_task(
             task_id=task_id,
             approved_item_id=approved_item_id,
             spec=spec,
+            design_item_id=design_item_id,
+            system_design=source.system_design,
             template_version=template_version,
         )
         execution = TaskExecution(

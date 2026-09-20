@@ -28,7 +28,7 @@ export const useProjectStore = defineStore('project', () => {
     error.value = null
     try {
       const payload: ProjectCreatePayload = { prompt: text }
-      const project = await projectsApi.createProject(auth.token, payload)
+      const project = await projectsApi.createProject(payload)
       current.value = project
       upsertItem(project)
       return project
@@ -45,7 +45,7 @@ export const useProjectStore = defineStore('project', () => {
     loading.value = true
     error.value = null
     try {
-      items.value = await projectsApi.listProjects(auth.token)
+      items.value = await projectsApi.listProjects()
     } catch (err) {
       error.value = err instanceof Error ? err.message : '加载项目失败'
       throw err
@@ -61,7 +61,7 @@ export const useProjectStore = defineStore('project', () => {
     loading.value = true
     error.value = null
     try {
-      current.value = await projectsApi.getProject(auth.token, id)
+      current.value = await projectsApi.getProject(id)
       return current.value
     } catch (err) {
       error.value = err instanceof Error ? err.message : '加载项目失败'

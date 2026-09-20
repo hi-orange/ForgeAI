@@ -99,7 +99,7 @@ class WorkspaceFilesTests(unittest.TestCase):
                         db, self._owner(), self.project_id, "../secret.txt"
                     )
 
-    def test_list_hides_template_until_business_code_is_written(self) -> None:
+    def test_list_exposes_template_as_soon_as_workspace_is_ready(self) -> None:
         prepare_engineering_workspace(
             self.project_id,
             self.run_id,
@@ -121,12 +121,12 @@ class WorkspaceFilesTests(unittest.TestCase):
                 listing = workspace_files_service.list_project_workspace(
                     db, self._owner(), self.project_id
                 )
-                self.assertFalse(listing.ready)
-                self.assertEqual(listing.files, [])
-                with self.assertRaises(ConflictException):
-                    workspace_files_service.read_project_workspace_file(
-                        db, self._owner(), self.project_id, "frontend/src/App.vue"
-                    )
+                self.assertTrue(listing.ready)
+                self.assertIn("frontend/src/App.vue", {item.path for item in listing.files})
+                content = workspace_files_service.read_project_workspace_file(
+                    db, self._owner(), self.project_id, "frontend/src/App.vue"
+                )
+                self.assertIn("template", content.content)
 
 
 if __name__ == "__main__":

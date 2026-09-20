@@ -173,7 +173,8 @@ def parse_agent_action(payload: dict[str, Any]) -> ChatWithToolsResult:
         for index, item in enumerate(native_calls):
             if not isinstance(item, dict):
                 raise BusinessException("工具调用格式异常")
-            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            function_raw = item.get("function")
+            function: dict[str, Any] = function_raw if isinstance(function_raw, dict) else {}
             name = function.get("name") or item.get("name")
             call_id = item.get("id") or f"call_{index + 1}"
             if not isinstance(name, str) or not name.strip():
@@ -264,6 +265,7 @@ def chat_with_tools(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "thinking": {"type": "disabled"},
+        "parallel_tool_calls": False,
         "tools": [
             {
                 "type": "function",

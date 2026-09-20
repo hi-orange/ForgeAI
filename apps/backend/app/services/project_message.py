@@ -81,6 +81,26 @@ def _validate_idempotent_replay(existing: ProjectMessage, content: str) -> Proje
     return existing
 
 
+def find_idempotent_user_message(
+    db: Session,
+    user: User,
+    project_id: int,
+    payload: ProjectMessageCreate,
+) -> ProjectMessage | None:
+    """Return a matching saved user turn when a coarse action is retried.
+
+    Action services use this before checking the current workflow state. A request whose response
+    was lost must remain a replay even if the first attempt already advanced the project from
+    ``not_started`` to ``awaiting_approval``.
+    """
+
+    project_service.get_user_project(db, user, project_id)
+    existing = _find_by_client_message_id(db, project_id, payload.client_message_id)
+    if existing is None:
+        return None
+    return _validate_idempotent_replay(existing, payload.content)
+
+
 def create_user_project_message(
     db: Session,
     user: User,
@@ -116,6 +136,58 @@ def create_user_project_message(
             existing = _find_by_client_message_id(db, project_id, client_message_id)
             if existing is not None:
                 return _validate_idempotent_replay(existing, content)
+            continue
+
+        db.refresh(message)
+        return message
+
+    raise ConflictException("消息写入冲突，请重试") from last_error
+
+
+def create_assistant_project_message(
+    db: Session,
+    user: User,
+    project_id: int,
+    content: str,
+    client_message_id: str,
+) -> ProjectMessage:
+    """追加一条助手消息；同 client_message_id 可幂等重放。"""
+
+    project_service.get_user_project(db, user, project_id)
+    content = content.strip()
+    client_message_id = client_message_id.strip()
+    if not content or not client_message_id:
+        raise ConflictException("助手消息内容与幂等键不能为空")
+
+    existing = _find_by_client_message_id(db, project_id, client_message_id)
+    if existing is not None:
+        if existing.sender != ProjectMessageSender.ASSISTANT.value or existing.content != content:
+            raise ConflictException("client_message_id 已用于另一条消息")
+        return existing
+
+    last_error: IntegrityError | None = None
+    for _ in range(MAX_SEQUENCE_RETRIES):
+        message = ProjectMessage(
+            project_id=project_id,
+            sequence=_next_sequence(db, project_id),
+            sender=ProjectMessageSender.ASSISTANT.value,
+            content=content,
+            client_message_id=client_message_id,
+        )
+        db.add(message)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            last_error = exc
+            existing = _find_by_client_message_id(db, project_id, client_message_id)
+            if existing is not None:
+                if (
+                    existing.sender != ProjectMessageSender.ASSISTANT.value
+                    or existing.content != content
+                ):
+                    raise ConflictException("client_message_id 已用于另一条消息") from exc
+                return existing
             continue
 
         db.refresh(message)

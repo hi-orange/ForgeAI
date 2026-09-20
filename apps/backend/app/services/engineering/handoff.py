@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -7,12 +10,25 @@ from app.models.plan import Plan
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_result import TaskResult
 from app.schemas.app_spec import AppSpec
-from app.services.requirement_inputs import read_app_spec
+from app.schemas.system_design import SystemDesign
+from app.services.app_spec import read_app_spec
 
 APPROVAL_VERSION = "requirements_approval_v1"
 
 ENGINEERING_TASK_KEY = "engineering_delivery"
-LEGACY_DESIGN_TASK_KEY = "system_design"
+ARCHITECTURE_TASK_KEY = "system_design"
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringSource:
+    input_item: ConfigurationItem
+    source_task: Task
+    source_plan: Plan
+    app_spec_item: ConfigurationItem
+    app_spec_task: Task
+    app_spec_plan: Plan
+    app_spec: AppSpec
+    system_design: SystemDesign
 
 
 def load_approved_app_spec(
@@ -41,7 +57,7 @@ def load_approved_app_spec(
     if (
         (item.semantic_type, item.state) != ("app_spec", "usable")
         or (task.recipient, task.expected_output_type, task.status)
-        != ("ProductManager", "app_spec", "succeeded")
+        != ("Product Manager", "app_spec", "succeeded")
         or plan.status != "succeeded"
     ):
         raise ConflictException("只能将已完成的可用需求交给工程交付")
@@ -51,17 +67,61 @@ def load_approved_app_spec(
     return item, task, plan, spec
 
 
-def load_design_source(
+def load_engineering_source(
     db: Session, project_id: int, run_id: str, item_id: str, *, lock: bool = False
-) -> tuple[ConfigurationItem, Task, Plan, AppSpec]:
-    """兼容旧调用名；语义与 load_approved_app_spec 相同。"""
-    return load_approved_app_spec(db, project_id, run_id, item_id, lock=lock)
+) -> EngineeringSource:
+    """Resolve an exact system design to its approved product intent."""
+
+    statement = (
+        select(ConfigurationItem, Task, Plan)
+        .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+        .join(Task, Task.task_id == TaskResult.task_id)
+        .join(Plan, Plan.plan_id == Task.plan_id)
+        .where(
+            ConfigurationItem.item_id == item_id,
+            ConfigurationItem.project_id == project_id,
+            ConfigurationItem.producer_run_id == run_id,
+            Plan.project_id == project_id,
+            Plan.build_run_id == run_id,
+        )
+    )
+    if lock:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    row = db.execute(statement).one_or_none()
+    if row is None:
+        raise NotFoundException("工程输入成果不存在或不属于当前构建")
+    item, task, plan = row
+    if (
+        (item.semantic_type, item.state) != ("system_design", "usable")
+        or (task.recipient, task.expected_output_type, task.status)
+        != (TaskRecipient.ARCHITECT.value, "system_design", TaskStatus.SUCCEEDED.value)
+        or plan.status != "succeeded"
+        or len(item.upstream_item_ids) != 1
+    ):
+        raise ConflictException("只能把已完成的可用系统设计交给 Code Engineer")
+    try:
+        design = SystemDesign.model_validate(item.payload)
+    except ValidationError as exc:
+        raise ConflictException("系统设计正文不符合要求") from exc
+    app_item, app_task, app_plan, spec = load_approved_app_spec(
+        db, project_id, run_id, item.upstream_item_ids[0], lock=lock
+    )
+    return EngineeringSource(
+        input_item=item,
+        source_task=task,
+        source_plan=plan,
+        app_spec_item=app_item,
+        app_spec_task=app_task,
+        app_spec_plan=app_plan,
+        app_spec=spec,
+        system_design=design,
+    )
 
 
 def _is_engineering_delivery_task(task: Task, item_id: str) -> bool:
     return (
         task.task_key == ENGINEERING_TASK_KEY
-        and task.recipient == TaskRecipient.SOFTWARE_ENGINEER.value
+        and task.recipient == TaskRecipient.CODE_ENGINEER.value
         and task.expected_output_type == "code"
         and task.status == TaskStatus.PENDING.value
         and task.input_configuration_item_ids == [item_id]
@@ -72,7 +132,7 @@ def _is_engineering_delivery_task(task: Task, item_id: str) -> bool:
 def _is_claimed_engineering_delivery_task(task: Task, item_id: str) -> bool:
     return (
         task.task_key == ENGINEERING_TASK_KEY
-        and task.recipient == TaskRecipient.SOFTWARE_ENGINEER.value
+        and task.recipient == TaskRecipient.CODE_ENGINEER.value
         and task.expected_output_type == "code"
         and task.status == TaskStatus.RUNNING.value
         and task.input_configuration_item_ids == [item_id]
@@ -80,24 +140,54 @@ def _is_claimed_engineering_delivery_task(task: Task, item_id: str) -> bool:
     )
 
 
-def _is_legacy_design_task(task: Task, item_id: str) -> bool:
-    return (
-        task.task_key == LEGACY_DESIGN_TASK_KEY
-        and task.recipient == TaskRecipient.SOLUTION_ARCHITECT.value
-        and task.expected_output_type == "system_design"
-        and task.status == TaskStatus.PENDING.value
-        and task.input_configuration_item_ids == [item_id]
-        and not task.depends_on_task_ids
+def find_architecture_task(
+    db: Session, source_plan: Plan, item_id: str, *, lock: bool = False
+) -> Task | None:
+    """Find the exact Architect assignment derived from one approved app_spec."""
+
+    statement = (
+        select(Plan)
+        .where(
+            Plan.project_id == source_plan.project_id,
+            Plan.build_run_id == source_plan.build_run_id,
+            Plan.version > source_plan.version,
+            Plan.cause_message_id == source_plan.cause_message_id,
+        )
+        .order_by(Plan.version.asc())
     )
+    if lock:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    for plan in db.scalars(statement).all():
+        tasks_query = select(Task).where(Task.plan_id == plan.plan_id)
+        if lock:
+            tasks_query = tasks_query.with_for_update().execution_options(populate_existing=True)
+        tasks = list(db.scalars(tasks_query).all())
+        if len(tasks) != 1:
+            continue
+        task = tasks[0]
+        if (
+            task.task_key == ARCHITECTURE_TASK_KEY
+            and task.recipient == TaskRecipient.ARCHITECT.value
+            and task.expected_output_type == "system_design"
+            and task.input_configuration_item_ids == [item_id]
+            and not task.depends_on_task_ids
+            and task.status
+            in {
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.SUCCEEDED.value,
+            }
+        ):
+            return task
+    return None
 
 
 def find_pending_engineering_task(
     db: Session, source_plan: Plan, item_id: str, *, lock: bool = False
 ) -> Task | None:
-    """Find a replayable pending engineering delivery for this approved intent.
+    """Find a replayable pending engineering delivery for this completed design.
 
-    Also recognizes unfinished legacy SolutionArchitect design tasks so callers can
-    convert them without inventing a second delivery for the same approval.
+    Only Code Engineer delivery tasks are considered.
     """
     statement = (
         select(Plan)
@@ -112,7 +202,6 @@ def find_pending_engineering_task(
         statement = statement.with_for_update().execution_options(populate_existing=True)
     plans = list(db.scalars(statement).all())
     engineering: Task | None = None
-    legacy: Task | None = None
     for plan in plans:
         tasks_query = select(Task).where(Task.plan_id == plan.plan_id)
         if lock:
@@ -126,9 +215,6 @@ def find_pending_engineering_task(
         if plan.status == "pending" and _is_engineering_delivery_task(task, item_id):
             engineering = task
             break
-        if plan.status == "pending" and _is_legacy_design_task(task, item_id):
-            legacy = task
-            continue
         if plan.status == "running" and _is_claimed_engineering_delivery_task(task, item_id):
             # Already claimed; create_engineering_delivery_task uses find_claimed separately.
             continue
@@ -136,7 +222,7 @@ def find_pending_engineering_task(
             raise ConflictException("已有后续任务与本次工程交付不一致")
         if task.status not in (TaskStatus.CANCELLED.value, TaskStatus.FAILED.value):
             raise ConflictException("已有其他后续计划，不能重复派工")
-    return engineering or legacy
+    return engineering
 
 
 def find_claimed_engineering_task(
@@ -169,33 +255,8 @@ def find_claimed_engineering_task(
     return None
 
 
-def find_pending_design_task(
-    db: Session, source_plan: Plan, item_id: str, *, lock: bool = False
-) -> Task | None:
-    """兼容旧调用名。"""
-    return find_pending_engineering_task(db, source_plan, item_id, lock=lock)
-
-
-def cancel_legacy_design_task(db: Session, task: Task) -> None:
-    """Cancel an unfinished SolutionArchitect handoff before creating engineering delivery."""
-    if not (
-        task.task_key == LEGACY_DESIGN_TASK_KEY
-        and task.recipient == TaskRecipient.SOLUTION_ARCHITECT.value
-        and task.status == TaskStatus.PENDING.value
-    ):
-        raise ConflictException("只能取消未开始的旧设计任务")
-    plan = db.scalar(select(Plan).where(Plan.plan_id == task.plan_id).with_for_update())
-    if plan is None or plan.status != "pending":
-        raise ConflictException("旧设计计划状态不允许转换")
-    task.status = TaskStatus.CANCELLED.value
-    plan.status = "cancelled"
-
-
 def prepare_requirements_followup(db: Session, source: Plan, item_id: str) -> int:
-    """Reserve the next version after retiring only an exact pending legacy assignment.
-
-    The caller holds the run lock and commits the replacement in the same transaction.
-    """
+    """Reserve the next version while no downstream plan exists."""
     latest = db.scalar(
         select(Plan)
         .where(Plan.build_run_id == source.build_run_id, Plan.project_id == source.project_id)
@@ -206,12 +267,5 @@ def prepare_requirements_followup(db: Session, source: Plan, item_id: str) -> in
     if latest is None:
         raise ConflictException("需求计划不存在")
     if latest.plan_id != source.plan_id:
-        legacy = find_pending_engineering_task(db, source, item_id, lock=True)
-        if (
-            legacy is None
-            or legacy.task_key != LEGACY_DESIGN_TASK_KEY
-            or legacy.plan_id != latest.plan_id
-        ):
-            raise ConflictException("已有后续计划，请刷新后继续")
-        cancel_legacy_design_task(db, legacy)
+        raise ConflictException("已有后续计划，请刷新后继续")
     return latest.version + 1

@@ -23,10 +23,10 @@ from app.db.database import Base
 class TaskRecipient(StrEnum):
     """本阶段可接收定向任务的岗位；不是 Agent 实例或进程 ID。"""
 
-    PRODUCT_MANAGER = "ProductManager"
-    SOLUTION_ARCHITECT = "SolutionArchitect"
-    SOFTWARE_ENGINEER = "SoftwareEngineer"
-    QA_ENGINEER = "QAEngineer"
+    PRODUCT_MANAGER = "Product Manager"
+    ARCHITECT = "Architect"
+    CODE_ENGINEER = "Code Engineer"
+    TEST_ENGINEER = "Test Engineer"
 
 
 class TaskStatus(StrEnum):
@@ -46,8 +46,7 @@ class Task(Base):
     __table_args__ = (
         CheckConstraint("position > 0", name="ck_task_positive_position"),
         CheckConstraint(
-            "recipient IN ('ProductManager', 'SolutionArchitect', "
-            "'SoftwareEngineer', 'QAEngineer')",
+            "recipient IN ('Product Manager', 'Architect', 'Code Engineer', 'Test Engineer')",
             name="ck_task_recipient",
         ),
         CheckConstraint(
@@ -83,7 +82,7 @@ class Task(Base):
         Integer, nullable=False, comment="计划内从 1 开始的展示顺序；不是强制执行顺序"
     )
     recipient: Mapped[str] = mapped_column(
-        String(32), nullable=False, comment="唯一接收岗位：ProductManager 等 TaskRecipient 值"
+        String(32), nullable=False, comment="唯一接收岗位：与 TaskRecipient / display_name 相同"
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False, comment="任务标题")
     instructions: Mapped[str] = mapped_column(

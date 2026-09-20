@@ -24,11 +24,11 @@ from app.schemas.plan import PlanCreate
 from app.schemas.product_manager_workflow import ProductManagerWorkflowResult
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.task import TaskCreate
+from app.services import manager, product_manager
 from app.services import plan as plan_service
-from app.services import product_manager, project_manager
 from app.services import task as task_service
+from app.services.app_spec import approve_requirements
 from app.services.engineering import APPROVAL_VERSION
-from app.services.requirement_approval import approve_requirements
 from app.services.requirements import get_requirements_status
 from app.services.task_execution import utc_now
 
@@ -128,7 +128,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                         ),
                     )
                     item_id = approved_id
-            return project_manager.create_engineering_delivery_task(
+            return manager.create_architecture_task(
                 db,
                 user or self.owner,
                 self.project.id,
@@ -154,9 +154,9 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
             self.assertEqual(plan.cause_message_id, self.message.id)
             self.assertEqual((plan.status, design_task.status), ("pending", "pending"))
             self.assertEqual(design_task.plan_id, plan.plan_id)
-            self.assertEqual(design_task.recipient, "SoftwareEngineer")
-            self.assertEqual(design_task.expected_output_type, "code")
-            self.assertEqual(design_task.task_key, "engineering_delivery")
+            self.assertEqual(design_task.recipient, "Architect")
+            self.assertEqual(design_task.expected_output_type, "system_design")
+            self.assertEqual(design_task.task_key, "system_design")
             self.assertEqual(design_task.input_configuration_item_ids, [result.item_id])
             self.assertEqual(design_task.depends_on_task_ids, [])
             run = db.get(BuildRun, self.run.id)
@@ -369,8 +369,8 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
     def test_handoff_failure_retries_only_dispatch_not_product_manager(self):
         item = self._publish_only()
         with patch.object(
-            project_manager,
-            "create_engineering_delivery_task",
+            manager,
+            "create_architecture_task",
             side_effect=RuntimeError("dispatch failed"),
         ):
             with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
@@ -453,14 +453,14 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                     for entry in spec["acceptance_criteria"]
                 )
             )
-            delivery = project_manager.create_engineering_delivery_task(
+            delivery = manager.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
-            self.assertEqual(delivery.recipient, "SoftwareEngineer")
-            self.assertEqual(delivery.expected_output_type, "code")
+            self.assertEqual(delivery.recipient, "Architect")
+            self.assertEqual(delivery.expected_output_type, "system_design")
             self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
 
-    def test_legacy_solution_architect_pending_converts_to_engineering_delivery(self):
+    def test_existing_architecture_task_replays_without_code_bypass(self):
         item = self._publish_only()
         with self.session_factory() as db:
             plan_service.save_plan(
@@ -474,7 +474,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                     tasks=[
                         TaskCreate(
                             task_key="system_design",
-                            recipient=TaskRecipient.SOLUTION_ARCHITECT,
+                            recipient=TaskRecipient.ARCHITECT,
                             title="旧设计任务",
                             instructions="legacy",
                             expected_output_type="system_design",
@@ -483,23 +483,22 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                     ],
                 ),
             )
-        converted = self._assign(item.item_id)
+        replayed = self._assign(item.item_id)
         with self.session_factory() as db:
-            legacy = db.scalar(
+            architecture = db.scalar(
                 select(Task).where(
                     Task.task_key == "system_design",
-                    Task.recipient == "SolutionArchitect",
+                    Task.recipient == "Architect",
                 )
             )
-            engineering = db.get(Task, converted.id)
-            self.assertEqual(legacy.status, "cancelled")
-            self.assertEqual(engineering.recipient, "SoftwareEngineer")
-            self.assertEqual(engineering.expected_output_type, "code")
-            self.assertEqual(engineering.input_configuration_item_ids, [item.item_id])
-            replay = project_manager.create_engineering_delivery_task(
+            self.assertEqual(replayed.task_id, architecture.task_id)
+            self.assertEqual(architecture.status, "pending")
+            self.assertEqual(architecture.expected_output_type, "system_design")
+            self.assertEqual(architecture.input_configuration_item_ids, [item.item_id])
+            replay = manager.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, item.item_id
             )
-            self.assertEqual(replay.task_id, engineering.task_id)
+            self.assertEqual(replay.task_id, architecture.task_id)
         self.assertEqual(self._status().state, "design_pending")
 
     def test_side_artifacts_can_register_beside_main_result(self):
