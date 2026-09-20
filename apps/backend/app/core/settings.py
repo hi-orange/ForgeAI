@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
 
+    tavily_api_key: str | None = None
+    tavily_base_url: str = "https://api.tavily.com"
+
     upload_root: str = "uploads"
     max_resume_size_mb: int = 10
     # Isolated engineering workspaces: runtime-data/work/{project}/{execution}

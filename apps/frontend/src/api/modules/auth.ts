@@ -27,6 +27,7 @@ export type LoginPayload = {
 export function register(payload: RegisterPayload) {
   return apiRequest<User>('/api/v1/auth/register', {
     method: 'POST',
+    auth: false,
     body: payload,
   })
 }
@@ -34,14 +35,14 @@ export function register(payload: RegisterPayload) {
 export function login(payload: LoginPayload) {
   return apiRequest<TokenOut>('/api/v1/auth/login', {
     method: 'POST',
+    auth: false,
     body: payload,
   })
 }
 
-export function fetchMe(token: string) {
+export function fetchMe() {
   return apiRequest<User>('/api/v1/auth/me', {
     method: 'GET',
-    token,
   })
 }
 
@@ -49,10 +50,9 @@ export type UsernameUpdatePayload = {
   username: string
 }
 
-export function updateUsername(token: string, payload: UsernameUpdatePayload) {
+export function updateUsername(payload: UsernameUpdatePayload) {
   return apiRequest<User>('/api/v1/auth/username', {
     method: 'PATCH',
-    token,
     body: payload,
   })
 }
@@ -62,10 +62,9 @@ export type ChangePasswordPayload = {
   new_password: string
 }
 
-export function changePassword(token: string, payload: ChangePasswordPayload) {
+export function changePassword(payload: ChangePasswordPayload) {
   return apiRequest<null>('/api/v1/auth/password', {
     method: 'PATCH',
-    token,
     body: payload,
   })
 }

@@ -1,5 +1,6 @@
 import { onBeforeUnmount, ref, watch } from 'vue'
 import * as workspaceApi from '@/api/modules/workspace'
+import { useAuthStore } from '@/stores'
 
 export type WorkspaceSourceInput = {
   projectId: number
@@ -11,7 +12,8 @@ export type WorkspaceSourceInput = {
   requestSequence?: number
 }
 
-export function useWorkspaceSource(input: WorkspaceSourceInput, token: () => string | null) {
+export function useWorkspaceSource(input: WorkspaceSourceInput) {
+  const auth = useAuthStore()
   const files = ref<workspaceApi.WorkspaceFileEntry[]>([])
   const selectedPath = ref<string | null>(null)
   const fileContent = ref<string | null>(null)
@@ -24,8 +26,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput, token: () => str
   let fileRequest = 0
 
   async function selectFile(path: string, manual = true) {
-    const accessToken = token()
-    if (!accessToken || !input.ready) return
+    if (!auth.token || !input.ready) return
     if (manual) following.value = false
     const request = ++fileRequest
     const runId = input.runId
@@ -34,7 +35,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput, token: () => str
     fileLoading.value = fileContent.value === null
     fileError.value = ''
     try {
-      const file = await workspaceApi.getWorkspaceFile(accessToken, input.projectId, path)
+      const file = await workspaceApi.getWorkspaceFile(input.projectId, path)
       if (request !== fileRequest || runId !== input.runId) return
       fileContent.value = file.content
     } catch (err) {
@@ -56,15 +57,14 @@ export function useWorkspaceSource(input: WorkspaceSourceInput, token: () => str
       fileError.value = ''
       fileLoading.value = false
     }
-    const accessToken = token()
-    if (!input.ready || !accessToken) {
+    if (!input.ready || !auth.token) {
       loading.value = false
       return
     }
     loading.value = files.value.length === 0
     error.value = ''
     try {
-      const listing = await workspaceApi.getWorkspace(accessToken, input.projectId)
+      const listing = await workspaceApi.getWorkspace(input.projectId)
       if (request !== listingRequest || (input.runId && listing.run_id !== input.runId)) return
       files.value = listing.files
       const preferred = following.value ? input.writtenPath : selectedPath.value
@@ -94,7 +94,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput, token: () => str
     void loadListing()
   }
   watch(
-    () => [input.projectId, input.runId, input.ready, token()] as const,
+    () => [input.projectId, input.runId, input.ready, auth.token] as const,
     () => {
       void loadListing(true)
     },

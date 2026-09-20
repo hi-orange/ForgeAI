@@ -22,7 +22,7 @@ from app.models.task_result import TaskResult
 from app.models.user import User
 from app.orchestration import product_manager as product_manager_workflow
 from app.schemas.product_manager_workflow import ProductManagerWorkflowOutcome
-from app.services import project_manager as project_manager_service
+from app.services import manager as manager_service
 from app.services import task as task_service
 from app.services import task_execution
 
@@ -178,7 +178,7 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
 
     def _create_plan(self) -> tuple[Plan, Task]:
         with self.session_factory() as db:
-            plan = project_manager_service.create_initial_plan(
+            plan = manager_service.create_initial_plan(
                 db, self.owner, self.project.id, self.run.run_id, self.message.id
             )
             task = task_service.list_user_plan_tasks(db, self.owner, self.project.id, plan.plan_id)[
@@ -319,32 +319,23 @@ class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
         self.assertEqual(self.chat.call_count, 1)
         self._assert_published(completed, run_state=("failed", "pm", None))
 
-    def test_graph_contains_explicit_resume_and_question_routes(self):
-        graph = product_manager_workflow.build_product_manager_workflow(self.session_factory)
-        drawable = graph.get_graph()
+    def test_resume_entry_follows_task_status_and_saved_spec(self):
+        """Document the sequential branches that replaced the LangGraph routes."""
 
-        self.assertEqual(
-            {
-                "ensure_plan",
-                "claim_task",
-                "start_execution",
-                "generate_app_spec",
-                "complete_app_spec",
-                "load_saved_app_spec",
-                "needs_user_input",
-                "awaiting_approval",
-                "ready_for_design",
-                "assign_design_task",
-            },
-            {name for name in drawable.nodes if not name.startswith("__")},
-        )
-        edges = {(edge.source, edge.target, edge.conditional) for edge in drawable.edges}
-        self.assertIn(("ensure_plan", "claim_task", True), edges)
-        self.assertIn(("ensure_plan", "load_saved_app_spec", True), edges)
-        self.assertIn(("load_saved_app_spec", "needs_user_input", True), edges)
-        self.assertIn(("load_saved_app_spec", "awaiting_approval", True), edges)
-        self.assertIn(("load_saved_app_spec", "ready_for_design", True), edges)
-        self.assertIn(("ready_for_design", "assign_design_task", False), edges)
+        plan, task = self._create_plan()
+        self.assertEqual(task.status, "pending")
+
+        # pending → claim → generate → awaiting_approval
+        first = self._run()
+        self.assertEqual(first.outcome, ProductManagerWorkflowOutcome.AWAITING_APPROVAL)
+        self.assertEqual((first.plan_id, first.task_id), (plan.plan_id, task.task_id))
+        self.chat.assert_called_once()
+
+        # succeeded → skip generate, reload saved spec
+        replay = self._run()
+        self.assertEqual(replay.outcome, ProductManagerWorkflowOutcome.AWAITING_APPROVAL)
+        self.assertEqual(self.chat.call_count, 1)
+        self._assert_published(replay)
 
 
 if __name__ == "__main__":

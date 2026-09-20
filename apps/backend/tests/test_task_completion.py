@@ -33,10 +33,10 @@ from app.schemas.project import ProjectCreate
 from app.schemas.task import TaskCreate
 from app.services import build_run as build_run_service
 from app.services import configuration_manager
+from app.services import manager as manager_service
 from app.services import plan as plan_service
 from app.services import product_manager as product_manager_service
 from app.services import project as project_service
-from app.services import project_manager as project_manager_service
 from app.services import task as task_service
 
 
@@ -102,7 +102,7 @@ class TaskCompletionTests(unittest.TestCase):
             )
         )
         db.commit()
-        plan = project_manager_service.create_initial_plan(
+        plan = manager_service.create_initial_plan(
             db, self.owner, project.id, run.run_id, message.id
         )
         task = task_service.list_user_plan_tasks(db, self.owner, project.id, plan.plan_id)[0]
@@ -149,7 +149,7 @@ class TaskCompletionTests(unittest.TestCase):
                 tasks=[
                     TaskCreate(
                         task_key=key,
-                        recipient="ProductManager",
+                        recipient="Product Manager",
                         title=key,
                         instructions="整理指定需求",
                         expected_output_type="app_spec",

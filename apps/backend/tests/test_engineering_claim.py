@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from sqlalchemy import select, update
+from test_architect import valid_design
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
     approval_payload,
@@ -20,17 +22,18 @@ from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.schemas.app_spec import AppSpec
 from app.schemas.requirements import RequirementsApproval
-from app.services import product_manager, project_manager
+from app.schemas.system_design import SystemDesign
+from app.services import architect, manager, product_manager
 from app.services import task as task_service
+from app.services.app_spec import approve_requirements
 from app.services.engineering import (
     APPROVAL_VERSION,
     INPUT_SNAPSHOT_KIND,
     TOOL_STRATEGY_VERSION,
     approved_spec_digest,
-    claim_software_engineer_task,
+    claim_code_engineer_task,
     read_frozen_input_snapshot,
 )
-from app.services.requirement_approval import approve_requirements
 from app.services.requirements import get_requirements_status, pause_active_execution
 
 
@@ -90,12 +93,35 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
                             )
                         ),
                     )
-            return project_manager.create_engineering_delivery_task(
+            architecture = manager.create_architecture_task(
                 db,
                 self.owner,
                 self.project.id,
                 self.run.run_id,
                 item_id,
+            )
+            architecture, execution = architect.claim_architect_task(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                architecture.task_id,
+            )
+            design = architect.complete_architect_task(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                architecture.task_id,
+                execution.execution_id,
+                SystemDesign.model_validate(valid_design()),
+            )
+            return manager.create_engineering_delivery_task(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                design.item_id,
             )
 
     def _status(self):
@@ -104,7 +130,7 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
 
     def _claim(self, task_id: str):
         with self.session_factory() as db:
-            return claim_software_engineer_task(
+            return claim_code_engineer_task(
                 db,
                 self.owner,
                 self.project.id,
@@ -133,7 +159,11 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         self.assertTrue(snapshot["acceptance_requirements"])
         self.assertEqual(
             snapshot["call_budget"],
-            {"max_model_turns": 40, "max_tool_calls": 120, "max_repair_rounds": 8},
+            {
+                "max_model_turns": 40,
+                "max_tool_calls": 120,
+                "max_repair_rounds": 8,
+            },
         )
 
         with self.session_factory() as db:
@@ -166,8 +196,17 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
             read_frozen_input_snapshot(second_exec),
         )
         with self.session_factory() as db:
-            self.assertEqual(db.scalar(select(TaskExecution)).execution_id, first_exec.execution_id)
-            count = len(list(db.scalars(select(TaskExecution)).all()))
+            code_execution = db.scalar(
+                select(TaskExecution).where(TaskExecution.task_id == delivery.task_id)
+            )
+            self.assertEqual(code_execution.execution_id, first_exec.execution_id)
+            count = len(
+                list(
+                    db.scalars(
+                        select(TaskExecution).where(TaskExecution.task_id == delivery.task_id)
+                    ).all()
+                )
+            )
             self.assertEqual(count, 1)
 
         progress = self._status()
@@ -211,7 +250,16 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         self.assertEqual(before.state, "engineering_running")
         self.assertEqual(after.execution_id, before.execution_id)
         with self.session_factory() as db:
-            self.assertEqual(len(list(db.scalars(select(TaskExecution)).all())), 1)
+            self.assertEqual(
+                len(
+                    list(
+                        db.scalars(
+                            select(TaskExecution).where(TaskExecution.task_id == delivery.task_id)
+                        ).all()
+                    )
+                ),
+                1,
+            )
             self.assertEqual(
                 db.get(TaskExecution, execution.execution_id).execution_id,
                 after.execution_id,
@@ -225,10 +273,12 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
             paused = pause_active_execution(db, self.owner, self.project.id, self.run.run_id)
         self.assertEqual(paused.state, "retry_available")
         self.assertEqual(paused.execution_id, execution.execution_id)
+        with self.session_factory() as db:
+            self.assertEqual(db.get(TaskExecution, execution.execution_id).status, "failed")
         with self.assertRaises(ConflictException):
             self._claim(delivery.task_id)
         with self.session_factory() as db:
-            _, recovered = claim_software_engineer_task(
+            _, recovered = claim_code_engineer_task(
                 db,
                 self.owner,
                 self.project.id,
@@ -244,3 +294,69 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         progress = self._status()
         self.assertEqual(progress.state, "engineering_running")
         self.assertEqual(progress.execution_id, recovered.execution_id)
+
+    def test_pause_rejects_a_generated_checkpoint(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        _, execution = self._claim(delivery.task_id)
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, execution.execution_id)
+            snapshot = dict(row.draft)
+            snapshot["checkpoint"] = {
+                "kind": "engineering_checkpoint",
+                "schema_version": 1,
+                "work_items": [],
+                "activity": [],
+                "outcome": "generated",
+            }
+            row.draft = snapshot
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(row, "draft")
+            db.commit()
+        with self.session_factory() as db, self.assertRaises(ConflictException):
+            pause_active_execution(db, self.owner, self.project.id, self.run.run_id)
+        with self.session_factory() as db:
+            self.assertEqual(db.get(TaskExecution, execution.execution_id).status, "running")
+
+    def test_pause_only_clears_the_worker_marker_after_persisting_the_fence(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        _, execution = self._claim(delivery.task_id)
+        with (
+            self.session_factory() as db,
+            patch("app.services.requirements.fail_execution", return_value=False),
+            patch("app.services.requirements.mark_engineering_inactive") as mark_inactive,
+            self.assertRaises(ConflictException),
+        ):
+            pause_active_execution(db, self.owner, self.project.id, self.run.run_id)
+        mark_inactive.assert_not_called()
+        with self.session_factory() as db:
+            self.assertEqual(db.get(TaskExecution, execution.execution_id).status, "running")
+
+    def test_blocked_checkpoint_is_reported_as_retry_available(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        _, execution = self._claim(delivery.task_id)
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, execution.execution_id)
+            snapshot = dict(row.draft)
+            snapshot["checkpoint"] = {
+                "kind": "engineering_checkpoint",
+                "schema_version": 1,
+                "work_items": [],
+                "activity": [],
+                "outcome": "blocked",
+                "blocked_reason": "模型调用预算已用尽",
+                "model_turns": 40,
+                "tool_calls": 40,
+            }
+            row.draft = snapshot
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(row, "draft")
+            db.commit()
+        progress = self._status()
+        self.assertEqual(progress.state, "retry_available")
+        self.assertIn("预算", progress.error or "")
+        self.assertEqual(progress.execution_id, execution.execution_id)

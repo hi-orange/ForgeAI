@@ -9,7 +9,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import sessionmaker
 
-from app.agents.prompts.project_manager import MESSAGE_CLASSIFICATION_PROMPT_VERSION
+from app.agents.prompts.manager import MESSAGE_CLASSIFICATION_PROMPT_VERSION
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.db.database import Base
 from app.models.build_run import BuildRun
@@ -26,8 +26,8 @@ from app.models.user import User
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
 from app.schemas.task import TaskCreate
+from app.services import manager as manager_service
 from app.services import plan as plan_service
-from app.services import project_manager as project_manager_service
 from app.services import project_message_classification as project_message_classification_service
 from app.services import task as task_service
 
@@ -51,7 +51,7 @@ class ProjectManagerPlanningTests(unittest.TestCase):
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.llm = self.enterContext(
             patch(
-                "app.agents.project_manager.chat_completion",
+                "app.agents.manager.chat_completion",
                 side_effect=AssertionError("创建初始计划不应调用模型"),
             )
         )
@@ -115,7 +115,7 @@ class ProjectManagerPlanningTests(unittest.TestCase):
         )
 
     def _create(self, db, **overrides) -> Plan:
-        return project_manager_service.create_initial_plan(
+        return manager_service.create_initial_plan(
             db,
             overrides.get("user", self.owner),
             overrides.get("project_id", self.project.id),
@@ -160,7 +160,7 @@ class ProjectManagerPlanningTests(unittest.TestCase):
                 tasks=[
                     TaskCreate(
                         task_key="custom",
-                        recipient="ProductManager",
+                        recipient="Product Manager",
                         title="已安排的工作",
                         instructions="已有任务，不能被初始规划覆盖",
                         expected_output_type="app_spec",
@@ -184,7 +184,7 @@ class ProjectManagerPlanningTests(unittest.TestCase):
             self.assertEqual(len(tasks), 1)
             task = tasks[0]
             self.assertEqual(task.task_key, "requirements")
-            self.assertEqual(task.recipient, "ProductManager")
+            self.assertEqual(task.recipient, "Product Manager")
             self.assertEqual(task.expected_output_type, "app_spec")
             self.assertEqual(task.status, "pending")
             self.assertEqual(task.position, 1)
@@ -407,7 +407,7 @@ class ProjectManagerPlanningTests(unittest.TestCase):
                 decision_summary="首次提出应用需求",
             )
             with patch.object(
-                project_message_classification_service.project_manager_agent,
+                project_message_classification_service.manager_agent,
                 "classify_message",
                 return_value=decision,
             ) as classify:

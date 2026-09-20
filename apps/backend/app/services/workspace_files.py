@@ -75,7 +75,7 @@ def list_project_workspace(db: Session, user: User, project_id: int) -> Workspac
     status = get_requirements_status(db, user, project_id)
     if (
         status.run_id is None
-        or not status.code_ready
+        or not status.workspace_ready
         or not workspace_is_ready(project_id, status.run_id)
     ):
         return WorkspaceListing(ready=False, run_id=status.run_id)
@@ -111,10 +111,10 @@ def read_project_workspace_file(
     status = get_requirements_status(db, user, project_id)
     if (
         status.run_id is None
-        or not status.code_ready
+        or not status.workspace_ready
         or not workspace_is_ready(project_id, status.run_id)
     ):
-        raise ConflictException("应用代码尚未生成")
+        raise ConflictException("应用工作区尚未准备好")
     root = default_workspace_path(settings.runtime_data_root, project_id, status.run_id)
     target = _safe_file_under_root(root, relative_path)
     if not target.is_file():

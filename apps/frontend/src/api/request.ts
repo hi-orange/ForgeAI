@@ -20,11 +20,22 @@ const baseURL = import.meta.env.VITE_API_BASE_URL ?? ''
 
 type RequestOptions = Omit<RequestInit, 'body'> & {
   body?: unknown
-  token?: string | null
+  /** Default true. Set false for login/register and other anonymous calls. */
+  auth?: boolean
+}
+
+async function resolveAccessToken(): Promise<string | null> {
+  // Lazy import avoids a static cycle: request → auth store → auth api → request.
+  const { useAuthStore } = await import('@/stores/modules/auth')
+  return useAuthStore().token
 }
 
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { body, token, headers, ...rest } = options
+  const { body, auth = true, headers, ...rest } = options
+  const token = auth ? await resolveAccessToken() : null
+  if (auth && !token) {
+    throw new ApiError(401, '请先登录')
+  }
 
   const response = await fetch(`${baseURL}${path}`, {
     ...rest,
@@ -37,7 +48,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
 
-  if (token && response.status === 401) {
+  if (auth && response.status === 401) {
     notifyAuthExpired()
   }
 
@@ -49,7 +60,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   }
 
   if (!response.ok || payload.code !== 0) {
-    if (token && response.status !== 401 && payload.code === 401) {
+    if (auth && response.status !== 401 && payload.code === 401) {
       notifyAuthExpired()
     }
     throw new ApiError(payload.code || response.status, payload.msg || '请求失败')

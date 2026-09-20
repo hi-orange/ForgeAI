@@ -7,9 +7,10 @@
       @click="manualExpanded = !expanded"
     >
       <span>{{ running ? '◌' : '✓' }}</span>
-      {{ running ? '正在处理' : '已处理' }} {{ groups.length }} 步
+      {{ running ? '正在处理' : '已处理' }} {{ processedCount }} 步
       <span>{{ expanded ? '⌃' : '⌄' }}</span>
     </button>
+    <p v-if="!expanded" class="timeline-current" role="status">{{ currentSummary }}</p>
     <div v-if="expanded" class="timeline-groups">
       <article v-for="group in groups" :key="group.id" class="build-group">
         <p class="group-summary">{{ group.title }}</p>
@@ -63,14 +64,18 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { EngineeringActivity } from '@/api/modules/requirements'
-import { buildGroups, type BuildGroup } from '../buildTimeline'
+import { buildGroups, timelineSteps, type BuildGroup } from '../buildTimeline'
 
 const props = defineProps<{ activities: EngineeringActivity[]; running: boolean }>()
 defineEmits<{ 'open-file': [path: string] }>()
-const manualExpanded = ref<boolean | null>(null)
-const expanded = computed(() => manualExpanded.value ?? props.running)
+const manualExpanded = ref(false)
+const expanded = computed(() => manualExpanded.value)
 const openGroups = ref(new Set<string>())
 const groups = computed(() => buildGroups(props.activities))
+const processedCount = computed(() => timelineSteps(props.activities).length)
+const currentSummary = computed(
+  () => groups.value.at(-1)?.title || (props.running ? '正在准备工作区…' : '本轮处理记录已收起'),
+)
 function visibleSteps(group: BuildGroup) {
   return openGroups.value.has(group.id) ? group.steps : group.steps.slice(0, 1)
 }
@@ -105,6 +110,14 @@ button {
   margin: 12px 0 0 5px;
   padding-left: 16px;
   border-left: 1px solid #e4e4e8;
+}
+.timeline-current {
+  margin: 8px 0 0 22px;
+  color: #5d6478;
+  line-height: 1.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .build-group {
   position: relative;

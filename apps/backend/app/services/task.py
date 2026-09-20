@@ -2,16 +2,54 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
-from app.models.build_run import ACTIVE_BUILD_RUN_STATUSES, BuildRun, BuildRunStage, BuildRunStatus
+from app.models.build_run import BuildRun, BuildRunStage
 from app.models.configuration_item import ConfigurationItemType
 from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_result import TaskResult
 from app.models.user import User
+from app.services import build_run as build_run_service
 from app.services import plan as plan_service
 from app.services import project as project_service
-from app.services.requirement_inputs import load_previous_app_spec
+
+
+def stage_running(db: Session, task: Task) -> None:
+    """Atomically claim one pending task without committing."""
+
+    if task.status != TaskStatus.PENDING.value:
+        raise ConflictException("任务已被领取或已结束，不能重复领取")
+    claimed = db.connection().execute(
+        update(Task)
+        .where(
+            Task.task_id == task.task_id,
+            Task.plan_id == task.plan_id,
+            Task.status == TaskStatus.PENDING.value,
+        )
+        .values(status=TaskStatus.RUNNING.value)
+    )
+    if claimed.rowcount != 1:
+        raise ConflictException("任务已被其他请求领取或状态已改变")
+    db.expire(task)
+
+
+def stage_succeeded(task: Task, *, allow_pending: bool = False) -> None:
+    """Mark a task successful; user-authored tasks may complete without an execution lease."""
+
+    allowed = {TaskStatus.RUNNING.value}
+    if allow_pending:
+        allowed.add(TaskStatus.PENDING.value)
+    if task.status not in allowed:
+        raise ConflictException("当前任务状态不能标记为完成")
+    task.status = TaskStatus.SUCCEEDED.value
+
+
+def stage_cancelled(task: Task) -> None:
+    """Cancel only an unclaimed task without committing."""
+
+    if task.status != TaskStatus.PENDING.value:
+        raise ConflictException("只能取消尚未领取的任务")
+    task.status = TaskStatus.CANCELLED.value
 
 
 def list_user_plan_tasks(db: Session, user: User, project_id: int, plan_id: str) -> list[Task]:
@@ -76,28 +114,6 @@ def claim_product_manager_task(
         )
         if run is None:
             raise NotFoundException("构建任务不存在")
-        if run.status not in ACTIVE_BUILD_RUN_STATUSES or run.active_slot != 1:
-            raise ConflictException("构建任务已结束，不能领取任务")
-        if run.status == BuildRunStatus.RUNNING.value and run.stage != BuildRunStage.PM.value:
-            raise ConflictException("构建已进入其他阶段，不能领取初始需求任务")
-
-        # 先取得运行的写锁，再检查计划和任务；后续任何失败都会回滚这次状态修改。
-        # 条件更新还能防止使用过时状态，并让 SQLite 并发测试不依赖 FOR UPDATE。
-        reserved = db.connection().execute(
-            update(BuildRun)
-            .where(
-                BuildRun.project_id == project_id,
-                BuildRun.run_id == run_id,
-                BuildRun.status == run.status,
-                BuildRun.stage == run.stage,
-                BuildRun.active_slot == 1,
-            )
-            .values(status=BuildRunStatus.RUNNING.value, stage=BuildRunStage.PM.value)
-        )
-        if reserved.rowcount != 1:
-            raise ConflictException("构建状态已改变，请重新读取后再领取")
-        db.expire(run)
-
         result = db.execute(
             select(Task, Plan)
             .join(Plan, Task.plan_id == Plan.plan_id)
@@ -113,41 +129,25 @@ def claim_product_manager_task(
             raise NotFoundException("任务不存在或不属于指定构建")
         task, plan = result
         if task.recipient != TaskRecipient.PRODUCT_MANAGER.value:
-            raise BusinessException("该任务不是分配给 ProductManager 的")
+            raise BusinessException("该任务不是分配给 Product Manager 的")
         if task.expected_output_type != ConfigurationItemType.APP_SPEC.value:
             raise BusinessException("需求整理任务的预期成果必须是 app_spec")
         if task.status != TaskStatus.PENDING.value:
             raise ConflictException("任务已被领取或已结束，不能重复领取")
         if plan.status not in (PlanStatus.PENDING.value, PlanStatus.RUNNING.value):
             raise ConflictException("计划已结束，不能领取其中的任务")
+        from app.services.app_spec import load_previous_app_spec
+
         load_previous_app_spec(db, task, lock=True)
 
-        other_running_plan = db.scalar(
-            select(Plan.plan_id)
-            .where(
-                Plan.build_run_id == run_id,
-                Plan.plan_id != plan.plan_id,
-                Plan.status == PlanStatus.RUNNING.value,
-            )
-            .limit(1)
-            .with_for_update()
+        build_run_service.stage_running(
+            db,
+            run,
+            stage=BuildRunStage.PM,
+            allowed_running_stages={BuildRunStage.PM},
         )
-        if other_running_plan is not None:
-            raise ConflictException("该构建已有另一份计划正在执行，不能混用计划")
-
-        claimed = db.connection().execute(
-            update(Task)
-            .where(
-                Task.task_id == task_id,
-                Task.plan_id == plan.plan_id,
-                Task.status == TaskStatus.PENDING.value,
-            )
-            .values(status=TaskStatus.RUNNING.value)
-        )
-        if claimed.rowcount != 1:
-            raise ConflictException("任务已被其他请求领取或状态已改变")
-        db.expire(task)
-        plan.status = PlanStatus.RUNNING.value
+        plan_service.stage_running(db, plan)
+        stage_running(db, task)
         db.commit()
     except Exception:
         db.rollback()

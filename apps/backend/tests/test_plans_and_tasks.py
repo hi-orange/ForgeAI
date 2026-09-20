@@ -28,6 +28,7 @@ from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.user import User
 from app.schemas.plan import PlanCreate, PlanOut
 from app.schemas.task import TaskCreate, TaskOut
+from app.services import build_run as build_run_service
 from app.services import plan as plan_service
 from app.services import task as task_service
 
@@ -175,7 +176,7 @@ class PlanTaskTests(unittest.TestCase):
             tasks=[
                 self._task(
                     "design",
-                    recipient="SolutionArchitect",
+                    recipient="Architect",
                     expected_output_type="system_design",
                     input_configuration_item_ids=[],
                     depends_on_task_keys=["spec"],
@@ -199,9 +200,7 @@ class PlanTaskTests(unittest.TestCase):
             self.assertTrue(all(task.status == TaskStatus.PENDING.value for task in tasks))
             self.assertTrue(all(task.task_id.startswith("task_") for task in tasks))
             self.assertEqual(PlanOut.model_validate(plan).version, 1)
-            self.assertEqual(
-                TaskOut.model_validate(tasks[0]).recipient, TaskRecipient.SOLUTION_ARCHITECT
-            )
+            self.assertEqual(TaskOut.model_validate(tasks[0]).recipient, TaskRecipient.ARCHITECT)
             llm.assert_not_called()
             self.assertEqual(db.get(BuildRun, self.run.id).status, BuildRunStatus.QUEUED.value)
             self.assertEqual(db.get(Project, self.project.id).status, "available")
@@ -235,6 +234,39 @@ class PlanTaskTests(unittest.TestCase):
             with self.assertRaises(NotFoundException):
                 plan_service.list_user_plans(db, self.owner, self.project.id, self.other_run.run_id)
 
+    def test_lifecycle_services_own_run_plan_and_task_transitions(self) -> None:
+        with self.session_factory() as db:
+            plan = self._save(db)
+            task = self._tasks(db, plan.plan_id)[0]
+            run = db.get(BuildRun, self.run.id)
+            assert run is not None
+
+            build_run_service.stage_running(
+                db,
+                run,
+                stage=BuildRunStage.PM,
+                allowed_running_stages={BuildRunStage.PM},
+            )
+            plan_service.stage_running(db, plan)
+            task_service.stage_running(db, task)
+            db.commit()
+            db.refresh(run)
+            db.refresh(plan)
+            db.refresh(task)
+            self.assertEqual((run.status, run.stage), ("running", "pm"))
+            self.assertEqual(plan.status, "running")
+            self.assertEqual(task.status, "running")
+
+            task_service.stage_succeeded(task)
+            self.assertTrue(plan_service.stage_succeeded_if_tasks_complete(db, plan))
+            db.commit()
+            self.assertEqual(plan.status, "succeeded")
+            self.assertEqual(task.status, "succeeded")
+            with self.assertRaises(ConflictException):
+                task_service.stage_cancelled(task)
+            with self.assertRaises(ConflictException):
+                plan_service.stage_cancelled(plan)
+
     def test_replay_returns_original_ids_even_after_run_finishes(self) -> None:
         with self.session_factory() as db:
             payload = self._payload()
@@ -262,7 +294,7 @@ class PlanTaskTests(unittest.TestCase):
             for changed in (
                 self._task(title="Different title"),
                 self._task(input_configuration_item_ids=[]),
-                self._task(recipient="SoftwareEngineer"),
+                self._task(recipient="Code Engineer"),
             ):
                 with self.subTest(task=changed), self.assertRaises(ConflictException):
                     self._save(db, self._payload(tasks=[changed]))
@@ -404,7 +436,7 @@ class PlanTaskTests(unittest.TestCase):
             (Plan, plan.id, "build_run_id", self.other_run.run_id),
             (Plan, plan.id, "cause_message_id", self.other_message.id),
             (Plan, plan.id, "definition_hash", "0" * 64),
-            (Task, task_id, "recipient", "QAEngineer"),
+            (Task, task_id, "recipient", "Test Engineer"),
             (Task, task_id, "instructions", "changed"),
             (Task, task_id, "input_configuration_item_ids", []),
             (Task, task_id, "depends_on_task_ids", ["task_missing"]),
@@ -454,7 +486,7 @@ class PlanTaskTests(unittest.TestCase):
             "plan_id": plan.plan_id,
             "task_key": "another",
             "position": 2,
-            "recipient": "ProductManager",
+            "recipient": "Product Manager",
             "title": "Another",
             "instructions": "Do the task",
             "expected_output_type": "app_spec",

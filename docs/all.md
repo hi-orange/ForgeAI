@@ -7,12 +7,12 @@
 ## 一、需求整理、批准与派工
 
 1. 保存用户消息。
-2. ProjectManager 把消息分类为 `product_change`。
+2. Manager 把消息分类为 `product_change`。
 3. 创建或复用同一项目的 queued BuildRun。
 4. 针对指定消息建立初始 Plan 和需求 Task。
 5. 领取 Task，登记唯一有效执行编号。
 6. 模型调用期间不持有数据库事务。
-7. ProductManager 生成经过结构校验的 `app_spec`，条目带稳定 ID。
+7. Product Manager 生成经过结构校验的 `app_spec`，条目带稳定 ID。
 8. 先保存执行草稿。
 9. 在同一事务中保存正式成果、TaskResult，完成 Task、Plan 和本次执行。
 10. 有可执行功能建议时，进入 `awaiting_approval`。
@@ -24,24 +24,25 @@
 16. 只有未修改且仍选中的功能可以沿用原验收条件。
 17. 新增、修改或不再有有效验收条件的功能，用户必须在清单内填写“怎样算完成”。
 18. 批准接口通过对应功能条目的 `acceptance` 字段接收正文，不调用模型猜测，也不复制过期的验收标准。
-19. 批准保存成功后，安排 SoftwareEngineer 的工程交付任务，输入为批准后的 `app_spec`。
-20. 页面刷新只读取进度，不会再次触发模型或重复派工。
+19. 批准保存成功后，安排 Architect，输入为批准后的 `app_spec`。
+20. Architect 产出并登记 `system_design` 后，才安排 Code Engineer；编码输入固定为该设计成果。
+21. 页面刷新只读取进度，不会再次触发模型或重复派工。
 
 状态含义：
 
 - `awaiting_approval`：等用户批准。
 - `needs_user_input`：无法理解目标，需要用户补充。
-- `design_pending`：工程交付任务已创建，等待处理。
+- `design_pending`：Architect 任务已创建，等待处理。
+- `design_running`：Architect 正在生成系统设计。
+- `engineering_running`：Code Engineer 正在实现代码。
 - `ready_for_design`：已批准但派工未成功，可重试。
 
 边界：
 
-- 这一步只保存任务，不调用工程师模型、不生成代码、不代表应用完成。
-- 未开始的旧 SolutionArchitect / `system_design` 待处理任务可幂等转换为工程交付任务。
-- 尚无用户批准记录的旧任务先回到批准清单。
-- 批准或补充需求时，取消旧待执行任务并在同一事务保存后续计划。
-- 历史自动派工不视为用户同意。
-- 工程计划和任务保持 `pending`，BuildRun 仍为 `running / pm`。
+- 批准步骤只保存 Architect 任务，不调用设计或编码模型，不代表应用完成。
+- `app_spec` 不能直接交给 Code Engineer；Code Engineer 只接收已完成的 `system_design`。
+- 未批准即创建的 Architect 运行和 PRD 直达编码运行由迁移删除，不在运行时兼容。
+- Architect 计划和任务保持 `pending` 时，BuildRun 仍为 `running / pm`。
 - 重复批准或派工只返回原结果。
 - 若批准已保存但派工失败，页面显示 `ready_for_design`，可重试派工，不会重新调用需求模型。
 - 历史 v1 字符串列表通过共享读取函数转换成带稳定 ID 的结构，不覆盖原产物、内容哈希和来源。
@@ -74,6 +75,7 @@
 1. 新增 `build_engineering_context()` 和 `plan_delivery()`。
 2. 每次执行的固定输入包括：
    - 获批 `app_spec` ID
+   - Architect 产出的 `system_design` ID
    - 基础 Revision 或模板 digest
    - 应用栈
    - 工具策略版本
@@ -81,7 +83,7 @@
    - 调用预算
 3. 这些输入写入输入快照，恢复时不能换成最新消息。
 4. `plan_delivery()` 按业务闭环拆工作单元。
-5. 工程工作单元是 SoftwareEngineer 任务内部进度，不默认给每个页面再建一套顶层 Plan/Task。
+5. 工程工作单元是 Code Engineer 任务内部进度，不默认给每个页面再建一套顶层 Plan/Task。
 6. 工作单元可放在 Execution 草稿中，工程任务的固定定义仍不可修改。
 7. 执行中可以调整“先改哪个文件”，不能删除或改变已批准功能。
 8. 设计先确定数据库字段、接口请求响应、前端消费者和权限。
@@ -150,7 +152,7 @@
 
 ### 2.5 LangGraph 工程循环
 
-1. 新增 `apps/backend/app/orchestration/software_engineer.py`。
+1. 使用 `apps/backend/app/orchestration/code_engineer.py` 执行工程循环。
 2. 实现 `build_engineering_workflow()`。
 3. 图节点按普通 Python 函数组装，使用已有 httpx 模型适配与自写的领域工具执行器，不必整体切换 LangChain 高层 Agent 框架。
 4. 建议状态只保存可序列化字段：
@@ -351,13 +353,14 @@
 ```text
 短事务 claim：
   校验项目、run、plan、task 的关联与状态
-  校验 task.recipient == SoftwareEngineer 且 input 为已批准 app_spec
+  校验 task.recipient == Code Engineer 且 input 为已完成 system_design
+  沿 system_design 上游校验并冻结准确的已批准 app_spec
   冻结 base_revision/template/输入 item IDs；创建 execution_id 和租约
   设置 running；提交事务
 
 事务外执行：
   复制明确 base_revision 至隔离工作目录（首次则使用固定模板）
-  从 approved app_spec 派生 system_design；登记附属成果
+  按冻结的 system_design 和 approved app_spec 实现代码
   在策略内生成/修改源码；计算不可变 manifest
   登记精确 code identity（还未标用户可用）
   静态/接口/业务检查 → 保存绑定该 code 的 test_report

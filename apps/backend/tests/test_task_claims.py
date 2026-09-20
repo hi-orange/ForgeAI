@@ -22,8 +22,8 @@ from app.models.task import Task
 from app.models.user import User
 from app.schemas.plan import PlanCreate, PlanOut
 from app.schemas.task import TaskCreate, TaskOut
+from app.services import manager as manager_service
 from app.services import plan as plan_service
-from app.services import project_manager as project_manager_service
 from app.services import task as task_service
 
 
@@ -46,7 +46,7 @@ class TaskClaimTests(unittest.TestCase):
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.llm = self.enterContext(
             patch(
-                "app.agents.project_manager.chat_completion",
+                "app.agents.manager.chat_completion",
                 side_effect=AssertionError("领取任务不能调用模型"),
             )
         )
@@ -90,10 +90,10 @@ class TaskClaimTests(unittest.TestCase):
                 for message in (self.message, self.other_message)
             )
             db.commit()
-            self.plan = project_manager_service.create_initial_plan(
+            self.plan = manager_service.create_initial_plan(
                 db, self.owner, self.project.id, self.run.run_id, self.message.id
             )
-            other_plan = project_manager_service.create_initial_plan(
+            other_plan = manager_service.create_initial_plan(
                 db, self.owner, self.other_project.id, self.other_run.run_id, self.other_message.id
             )
             self.task = self._tasks(db, self.plan)[0]
@@ -123,7 +123,7 @@ class TaskClaimTests(unittest.TestCase):
         return TaskCreate.model_validate(
             {
                 "task_key": key,
-                "recipient": "ProductManager",
+                "recipient": "Product Manager",
                 "title": "整理需求",
                 "instructions": "只使用计划记录的原始需求",
                 "expected_output_type": "app_spec",
@@ -262,9 +262,9 @@ class TaskClaimTests(unittest.TestCase):
 
     def test_rejects_other_roles_and_wrong_output_type(self):
         for overrides in (
-            {"recipient": "SolutionArchitect"},
-            {"recipient": "SoftwareEngineer"},
-            {"recipient": "QAEngineer"},
+            {"recipient": "Architect"},
+            {"recipient": "Code Engineer"},
+            {"recipient": "Test Engineer"},
             {"expected_output_type": "system_design"},
         ):
             with self.subTest(overrides=overrides), self.session_factory() as db:

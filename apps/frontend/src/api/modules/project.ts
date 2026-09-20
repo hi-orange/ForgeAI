@@ -18,24 +18,21 @@ export type ProjectCreatePayload = {
   description?: string
 }
 
-export function createProject(token: string, payload: ProjectCreatePayload) {
+export function createProject(payload: ProjectCreatePayload) {
   return apiRequest<Project>('/api/v1/projects', {
     method: 'POST',
-    token,
     body: payload,
   })
 }
 
-export function listProjects(token: string) {
+export function listProjects() {
   return apiRequest<Project[]>('/api/v1/projects', {
     method: 'GET',
-    token,
   })
 }
 
-export function getProject(token: string, id: number) {
+export function getProject(id: number) {
   return apiRequest<Project>(`/api/v1/projects/${id}`, {
     method: 'GET',
-    token,
   })
 }

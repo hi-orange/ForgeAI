@@ -25,8 +25,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.agents import project_manager as project_manager_agent
-from app.agents.prompts.project_manager import MESSAGE_CLASSIFICATION_PROMPT_VERSION
+from app.agents import manager as manager_agent
+from app.agents.prompts.manager import MESSAGE_CLASSIFICATION_PROMPT_VERSION
 from app.api.deps import get_current_user
 from app.api.v1.project_messages import router
 from app.core.exceptions import BusinessException, register_exception_handlers
@@ -164,7 +164,7 @@ class ProjectManagerClassificationTests(unittest.TestCase):
         )
 
         with patch.object(
-            project_message_classification_service.project_manager_agent,
+            project_message_classification_service.manager_agent,
             "classify_message",
             return_value=decision,
         ) as classify:
@@ -215,7 +215,7 @@ class ProjectManagerClassificationTests(unittest.TestCase):
         )
 
         with patch.object(
-            project_message_classification_service.project_manager_agent,
+            project_message_classification_service.manager_agent,
             "classify_message",
             return_value=decision,
         ) as classify:
@@ -409,7 +409,7 @@ class ProjectManagerClassificationTests(unittest.TestCase):
                 return_value=[],
             ),
             patch.object(
-                project_message_classification_service.project_manager_agent,
+                project_message_classification_service.manager_agent,
                 "classify_message",
                 return_value=decision,
             ),
@@ -431,8 +431,8 @@ class ProjectManagerClassificationTests(unittest.TestCase):
             '"decision_summary":"现有登录行为没有正常工作。"}\n'
             "```"
         )
-        with patch.object(project_manager_agent, "chat_completion", return_value=raw) as chat:
-            decision = project_manager_agent.classify_message(
+        with patch.object(manager_agent, "chat_completion", return_value=raw) as chat:
+            decision = manager_agent.classify_message(
                 project_name="Demo",
                 project_status=ProjectStatus.AVAILABLE.value,
                 recent_messages=[{"sequence": 1, "sender": "user", "content": "Login is required"}],
@@ -460,10 +460,10 @@ class ProjectManagerClassificationTests(unittest.TestCase):
         for raw in invalid_responses:
             with (
                 self.subTest(raw=raw),
-                patch.object(project_manager_agent, "chat_completion", return_value=raw),
-                self.assertRaisesRegex(BusinessException, "ProjectManager 消息分类返回格式异常"),
+                patch.object(manager_agent, "chat_completion", return_value=raw),
+                self.assertRaisesRegex(BusinessException, "Manager 消息分类返回格式异常"),
             ):
-                project_manager_agent.classify_message(
+                manager_agent.classify_message(
                     project_name="Demo",
                     project_status=ProjectStatus.DRAFT.value,
                     recent_messages=[],

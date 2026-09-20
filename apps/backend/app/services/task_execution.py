@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 from uuid import uuid4
 
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -166,21 +168,25 @@ def fail_execution(
     execution_id: str,
     *,
     error: str = "任务未完成，可重试恢复；已保存的成果不受影响。",
-) -> None:
+) -> bool:
     # 只结束自己的执行；旧执行的异常不能把恢复后的执行标记为失败。
-    db.execute(
-        update(TaskExecution)
-        .where(
-            TaskExecution.task_id == task_id,
-            TaskExecution.execution_id == execution_id,
-            TaskExecution.status == "running",
-            TaskExecution.active_slot == 1,
-        )
-        .values(
-            status="failed",
-            active_slot=None,
-            finished_at=utc_now(),
-            error=error,
-        )
+    updated = cast(
+        CursorResult[Any],
+        db.execute(
+            update(TaskExecution)
+            .where(
+                TaskExecution.task_id == task_id,
+                TaskExecution.execution_id == execution_id,
+                TaskExecution.status == "running",
+                TaskExecution.active_slot == 1,
+            )
+            .values(
+                status="failed",
+                active_slot=None,
+                finished_at=utc_now(),
+                error=error,
+            )
+        ),
     )
     db.commit()
+    return updated.rowcount == 1

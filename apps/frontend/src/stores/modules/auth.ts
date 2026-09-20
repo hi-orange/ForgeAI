@@ -71,7 +71,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
 
     try {
-      user.value = await authApi.fetchMe(token.value)
+      user.value = await authApi.fetchMe()
     } catch {
       setToken(null)
       user.value = null
@@ -95,7 +95,7 @@ export const useAuthStore = defineStore('auth', () => {
       } else {
         setRememberedEmail(null)
       }
-      user.value = await authApi.fetchMe(result.access_token)
+      user.value = await authApi.fetchMe()
     } catch (err) {
       error.value = err instanceof Error ? err.message : '登录失败'
       throw err
@@ -120,7 +120,7 @@ export const useAuthStore = defineStore('auth', () => {
       } else {
         setRememberedEmail(null)
       }
-      user.value = await authApi.fetchMe(result.access_token)
+      user.value = await authApi.fetchMe()
     } catch (err) {
       error.value = err instanceof Error ? err.message : '注册失败'
       throw err
@@ -136,7 +136,7 @@ export const useAuthStore = defineStore('auth', () => {
     loading.value = true
     error.value = null
     try {
-      user.value = await authApi.updateUsername(token.value, payload)
+      user.value = await authApi.updateUsername(payload)
       return user.value
     } catch (err) {
       error.value = err instanceof Error ? err.message : '修改用户名失败'
@@ -153,7 +153,7 @@ export const useAuthStore = defineStore('auth', () => {
     loading.value = true
     error.value = null
     try {
-      await authApi.changePassword(token.value, payload)
+      await authApi.changePassword(payload)
       logout()
     } catch (err) {
       error.value = err instanceof Error ? err.message : '修改密码失败'

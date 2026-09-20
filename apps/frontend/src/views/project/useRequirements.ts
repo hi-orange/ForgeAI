@@ -1,5 +1,4 @@
 import * as api from '@/api/modules/requirements'
-import { useAuthStore } from '@/stores'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 export type RequirementPlanItem = {
@@ -11,7 +10,6 @@ export type RequirementPlanItem = {
 }
 
 export function useRequirements(projectId: number) {
-  const auth = useAuthStore()
   const name = ref('项目需求')
   const status = ref<api.RequirementsStatus | null>(null)
   const messages = ref<api.RequirementMessage[]>([])
@@ -24,11 +22,11 @@ export function useRequirements(projectId: number) {
   const planItems = ref<RequirementPlanItem[]>([])
   let draftItemId: string | null = null
   let lastApproval: { signature: string; key: string } | null = null
-  let pendingAssistantReply: string | null = null
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let inFlight: Promise<void> | null = null
   let lastRequest: { content: string; itemId: string | null; key: string } | null = null
+  let mutationVersion = 0
 
   const canWrite = computed(() =>
     ['not_started', 'needs_user_input', 'awaiting_approval'].includes(status.value?.state ?? ''),
@@ -43,32 +41,6 @@ export function useRequirements(projectId: number) {
       planItems.value.filter((item) => item.kind === 'feature' && item.checked && item.label.trim())
         .length,
   )
-
-  function guidanceForCategory(category: string): string {
-    if (category === 'inquiry') {
-      return '先具体描述一下你想做的应用或功能，我再帮你整理构建计划。'
-    }
-    if (category === 'stop') {
-      return '当前还没有开始构建。描述你想做的应用后，就可以开始了。'
-    }
-    if (category === 'implementation_repair') {
-      return '现在还没有可修复的实现。先描述你想做的应用，我会整理一份构建计划。'
-    }
-    return '请描述你要做的应用或功能，我再开始整理需求。'
-  }
-
-  function appendPendingAssistantReply() {
-    if (!pendingAssistantReply) return
-    const content = pendingAssistantReply
-    pendingAssistantReply = null
-    messages.value.push({
-      id: -Date.now(),
-      sequence: (messages.value.at(-1)?.sequence ?? 0) + 1,
-      sender: 'assistant',
-      content,
-      client_message_id: null,
-    })
-  }
 
   function loadPlan(current: api.RequirementsStatus) {
     const itemId = current.result?.configuration_item_id ?? null
@@ -138,25 +110,24 @@ export function useRequirements(projectId: number) {
         criterion.source_ids.every((id) => unchanged.has(id)),
     )
   }
+
   const canResume = computed(
     () =>
       status.value?.state === 'pending' ||
       status.value?.state === 'retry_available' ||
       status.value?.state === 'ready_for_design' ||
+      status.value?.state === 'design_pending' ||
       (status.value?.state === 'engineering_running' &&
         (Boolean(status.value.error) || !status.value.activities?.length)),
   )
   const canPause = computed(
     () =>
-      status.value?.state === 'running' ||
-      status.value?.state === 'engineering_running' ||
-      status.value?.state === 'engineering_generated',
+      Boolean(status.value?.run_id && status.value.task_id && status.value.execution_id) &&
+      (status.value?.state === 'running' ||
+        status.value?.state === 'design_running' ||
+        status.value?.state === 'engineering_running') &&
+      !status.value.error,
   )
-
-  function token() {
-    if (!auth.token) throw new Error('请先登录')
-    return auth.token
-  }
 
   function schedule() {
     clearTimeout(timer)
@@ -164,7 +135,8 @@ export function useRequirements(projectId: number) {
       !disposed &&
       (busy.value ||
         status.value?.state === 'running' ||
-        status.value?.state === 'engineering_running')
+        status.value?.state === 'design_running' ||
+        (status.value?.state === 'engineering_running' && !status.value.error))
     ) {
       timer = setTimeout(
         () => void refresh(),
@@ -176,18 +148,14 @@ export function useRequirements(projectId: number) {
   async function load() {
     refreshing.value = true
     try {
-      const current = await api.getRequirements(token(), projectId)
+      const current = await api.getRequirements(projectId)
       if (disposed) return
       status.value = current
       loadPlan(current)
       // 消息只追加，分页读取可以恢复刷新前的对话，不把后来的消息作为任务输入。
       let page: api.RequirementMessage[]
       do {
-        page = await api.getRequirementMessages(
-          token(),
-          projectId,
-          messages.value.at(-1)?.sequence ?? 0,
-        )
+        page = await api.getRequirementMessages(projectId, messages.value.at(-1)?.sequence ?? 0)
         if (disposed) return
         messages.value.push(...page)
       } while (page.length === 200)
@@ -211,6 +179,7 @@ export function useRequirements(projectId: number) {
 
   async function perform(work: () => Promise<unknown>) {
     if (busy.value || disposed) return
+    const version = mutationVersion
     busy.value = true
     error.value = ''
     schedule()
@@ -221,7 +190,9 @@ export function useRequirements(projectId: number) {
         lastRequest = null
       }
     } catch (err) {
-      if (!disposed)
+      // A pause fences the request that was already running. Its eventual conflict is expected
+      // and must not replace the user-facing paused state with a stale error.
+      if (!disposed && version === mutationVersion)
         error.value = err instanceof Error ? err.message : '需求处理失败，请刷新进度后重试'
     } finally {
       busy.value = false
@@ -229,20 +200,7 @@ export function useRequirements(projectId: number) {
       // 先等旧轮询结束，再重新读库，避免旧响应盖住刚刚完成的结果。
       if (inFlight) await inFlight
       await refresh()
-      if (!disposed) appendPendingAssistantReply()
     }
-  }
-
-  async function startFromMessage(messageId: number, current: api.RequirementsStatus) {
-    // 初始计划只接受已落库的 product_change；首页已保存的 prompt 也要先分类。
-    const classification = await api.classifyRequirementMessage(token(), projectId, messageId)
-    if (classification.category !== 'product_change') {
-      // 问询/停止/修复等不进入构建；用助手回复引导，而不是红色错误条。
-      pendingAssistantReply = guidanceForCategory(classification.category)
-      return
-    }
-    const runId = current.run_id ?? (await api.createRequirementsRun(token(), projectId)).run_id
-    await api.executeRequirements(token(), projectId, runId, messageId)
   }
 
   async function submit() {
@@ -255,48 +213,27 @@ export function useRequirements(projectId: number) {
     }
     const key = lastRequest.key
     await perform(async () => {
-      if (
-        ['needs_user_input', 'awaiting_approval'].includes(current.state) &&
-        current.run_id &&
-        itemId
-      ) {
-        await api.answerRequirements(token(), projectId, current.run_id, itemId, content, key)
-        return
-      }
-      const message = await api.createRequirementMessage(token(), projectId, content, key)
-      await startFromMessage(message.id, current)
+      status.value = await api.submitRequirements(projectId, content, key)
+      loadPlan(status.value)
     })
   }
 
   async function resume() {
-    const current = status.value
-    if (!current?.run_id || !canResume.value) return
-    if (
-      current.state === 'engineering_running' ||
-      (current.state === 'retry_available' && current.result?.design_task_id)
-    ) {
-      await perform(() => api.continueEngineering(token(), projectId, current.run_id!))
-      return
-    }
-    if (!current.message_id) return
-    await perform(() =>
-      api.executeRequirements(
-        token(),
-        projectId,
-        current.run_id!,
-        current.message_id!,
-        current.state === 'retry_available' ? current.execution_id : null,
-      ),
-    )
+    if (!status.value?.run_id || !canResume.value) return
+    await perform(async () => {
+      status.value = await api.continueRequirements(projectId)
+      loadPlan(status.value)
+    })
   }
 
   async function pause() {
     const current = status.value
     if (!current?.run_id || !canPause.value || pausing.value || disposed) return
+    mutationVersion += 1
     pausing.value = true
     error.value = ''
     try {
-      status.value = await api.pauseBuildRun(token(), projectId, current.run_id)
+      status.value = await api.pauseBuildRun(projectId, current.run_id)
       loadPlan(status.value)
     } catch (err) {
       if (!disposed) error.value = err instanceof Error ? err.message : '暂停失败，请刷新进度后重试'
@@ -336,30 +273,26 @@ export function useRequirements(projectId: number) {
       lastApproval = { signature, key: crypto.randomUUID() }
     const payload = { ...selection, client_message_id: lastApproval.key }
     await perform(async () => {
-      await api.approveRequirements(token(), projectId, current.run_id!, itemId, payload)
+      status.value = await api.approveRequirements(projectId, current.run_id!, itemId, payload)
+      loadPlan(status.value)
       lastApproval = null
     })
   }
 
   onMounted(async () => {
     try {
-      const project = await api.getRequirementsProject(token(), projectId)
+      const project = await api.getRequirementsProject(projectId)
       if (disposed) return
       name.value = project.name
       await refresh()
       if (disposed || status.value?.state !== 'not_started') return
-      const current = status.value
-      const initial = messages.value.find((message) => message.sender === 'user')
-      if (initial) {
-        void perform(async () => {
-          await startFromMessage(initial.id, current)
-        })
+      if (!messages.value.some((message) => message.sender === 'user') && !project.prompt?.trim()) {
         return
       }
-      if (project.prompt?.trim()) {
-        text.value = project.prompt
-        void submit()
-      }
+      await perform(async () => {
+        status.value = await api.startRequirements(projectId)
+        loadPlan(status.value)
+      })
     } catch (err) {
       if (!disposed) error.value = err instanceof Error ? err.message : '读取项目失败'
     }

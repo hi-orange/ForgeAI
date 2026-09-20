@@ -2,8 +2,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.agents import project_manager as project_manager_agent
-from app.agents.prompts.project_manager import MESSAGE_CLASSIFICATION_PROMPT_VERSION
+from app.agents import manager as manager_agent
+from app.agents.prompts.manager import MESSAGE_CLASSIFICATION_PROMPT_VERSION
 from app.core.exceptions import BusinessException, NotFoundException
 from app.core.settings import settings
 from app.models.project_message import ProjectMessage, ProjectMessageSender
@@ -46,7 +46,7 @@ def get_stored_classification(
 def _recent_context(
     db: Session,
     message: ProjectMessage,
-) -> list[project_manager_agent.ProjectMessageContext]:
+) -> list[manager_agent.ProjectMessageContext]:
     """取待分类消息之前的最近对话，供模型理解「这个」「还是不对」等指代。"""
 
     # 先按 sequence 倒序取最近 N 条，再在内存里正序返回。
@@ -63,7 +63,7 @@ def _recent_context(
     )
 
     remaining_chars = MAX_CONTEXT_CHARS
-    context: list[project_manager_agent.ProjectMessageContext] = []
+    context: list[manager_agent.ProjectMessageContext] = []
     for candidate in candidates:
         if remaining_chars <= 0:
             break
@@ -101,7 +101,7 @@ def classify_user_message(
     if existing is not None:
         return existing
 
-    decision = project_manager_agent.classify_message(
+    decision = manager_agent.classify_message(
         project_name=project.name,
         project_status=project.status,
         recent_messages=_recent_context(db, message),

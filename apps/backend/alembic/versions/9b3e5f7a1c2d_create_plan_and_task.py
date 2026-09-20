@@ -126,7 +126,7 @@ def upgrade() -> None:
             "recipient",
             sa.String(32),
             nullable=False,
-            comment="唯一接收岗位：ProductManager 等 TaskRecipient 值",
+            comment="唯一接收岗位：与 TaskRecipient / display_name 相同",
         ),
         sa.Column("title", sa.String(200), nullable=False, comment="任务标题"),
         sa.Column("instructions", sa.Text(), nullable=False, comment="本任务具体要完成的工作"),
@@ -171,8 +171,7 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint("position > 0", name="ck_task_positive_position"),
         sa.CheckConstraint(
-            "recipient IN ('ProductManager', 'SolutionArchitect', "
-            "'SoftwareEngineer', 'QAEngineer')",
+            "recipient IN ('Product Manager', 'Architect', 'Code Engineer', 'Test Engineer')",
             name="ck_task_recipient",
         ),
         sa.CheckConstraint(

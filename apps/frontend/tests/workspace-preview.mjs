@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 const fixtureApi = `
 export const contents = { 'frontend/src/App.vue': '<template>\\n  <main>应用初始模板</main>\\n</template>', 'backend/app/main.py': 'from fastapi import FastAPI\\napp = FastAPI()' }
 export async function getWorkspace() { return { ready: true, run_id: 'fixture', files: Object.keys(contents).map(path => ({ path, size_bytes: contents[path].length })) } }
-export async function getWorkspaceFile(_token, _id, path) { return { run_id: 'fixture', path, content: contents[path] } }
+export async function getWorkspaceFile(_id, path) { return { run_id: 'fixture', path, content: contents[path] } }
 `
 const fixtureApp = `
 import { createApp, h, reactive } from 'vue'

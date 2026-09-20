@@ -8,11 +8,10 @@ from typing import Any
 
 from app.core.exceptions import BusinessException, ConflictException
 from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
+from app.tools import checks as check_tools
 from app.tools import files as file_tools
 
-WRITE_TOOLS = {"apply_patch"}
-
-ENGINEERING_TOOLS: list[ToolDefinition] = [
+CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="list_files",
         description="列出当前生成应用工作区内的文本文件。path 为相对目录，默认根目录。",
@@ -64,6 +63,21 @@ ENGINEERING_TOOLS: list[ToolDefinition] = [
         },
     ),
     ToolDefinition(
+        name="run_check",
+        description="在离线隔离环境中检查数据库迁移、后端启动和前端构建；完成前使用 all。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "check_id": {
+                    "type": "string",
+                    "enum": ["database", "backend", "frontend", "all"],
+                }
+            },
+            "required": ["check_id"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
         name="complete_work_item",
         description="当前工作单元的代码已写入工作区。不能把整个工程任务标为用户可用，也不能跳过未实现的需求。",
         parameters={
@@ -88,7 +102,7 @@ ENGINEERING_TOOLS: list[ToolDefinition] = [
     ),
 ]
 
-ALLOWED_TOOL_NAMES = {tool.name for tool in ENGINEERING_TOOLS}
+ALLOWED_TOOL_NAMES = {tool.name for tool in CODE_ENGINEER_TOOLS}
 
 
 def execute_tool_call(
@@ -135,6 +149,12 @@ def execute_tool_call(
                 path=str(args.get("path") or ""),
                 content=str(args.get("content") or ""),
                 expected_hash=str(args["expected_hash"]) if args.get("expected_hash") else None,
+                tool_call_id=call.id,
+            )
+        if call.name == "run_check":
+            return check_tools.run_check(
+                workspace_root,
+                check_id=str(args.get("check_id") or ""),
                 tool_call_id=call.id,
             )
         if call.name == "complete_work_item":

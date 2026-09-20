@@ -1,11 +1,17 @@
+from collections.abc import Collection
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictException, NotFoundException
-from app.models.build_run import ACTIVE_BUILD_RUN_STATUSES, BuildRun, BuildRunStatus
+from app.models.build_run import (
+    ACTIVE_BUILD_RUN_STATUSES,
+    BuildRun,
+    BuildRunStage,
+    BuildRunStatus,
+)
 from app.models.user import User
 from app.services import project as project_service
 
@@ -47,6 +53,52 @@ def create_build_run(db: Session, user: User, project_id: int) -> BuildRun:
 
     db.refresh(build_run)
     return build_run
+
+
+def stage_running(
+    db: Session,
+    build_run: BuildRun,
+    *,
+    stage: BuildRunStage,
+    allowed_running_stages: Collection[BuildRunStage],
+) -> None:
+    """Atomically move an active run to one execution stage without committing.
+
+    The caller owns the surrounding transaction. Keeping this compare-and-set here makes
+    BuildRun the single owner of run lifecycle transitions while task claim services only
+    coordinate their own assignment.
+    """
+
+    require_active_for_stages(build_run, allowed_running_stages)
+
+    previous_status = build_run.status
+    previous_stage = build_run.stage
+    reserved = db.connection().execute(
+        update(BuildRun)
+        .where(
+            BuildRun.id == build_run.id,
+            BuildRun.status == previous_status,
+            BuildRun.stage == previous_stage,
+            BuildRun.active_slot == 1,
+        )
+        .values(status=BuildRunStatus.RUNNING.value, stage=stage.value)
+    )
+    if reserved.rowcount != 1:
+        raise ConflictException("构建状态已改变，请重新读取后再领取")
+    db.expire(build_run)
+
+
+def require_active_for_stages(
+    build_run: BuildRun,
+    allowed_running_stages: Collection[BuildRunStage],
+) -> None:
+    """Validate run eligibility without mutating it."""
+
+    if build_run.status not in ACTIVE_BUILD_RUN_STATUSES or build_run.active_slot != 1:
+        raise ConflictException("构建任务已结束，不能开始新的执行阶段")
+    allowed_values = {value.value for value in allowed_running_stages}
+    if build_run.status == BuildRunStatus.RUNNING.value and build_run.stage not in allowed_values:
+        raise ConflictException("构建已进入其他阶段，不能切换当前执行阶段")
 
 
 def get_user_build_run(db: Session, user: User, project_id: int, run_id: str) -> BuildRun:

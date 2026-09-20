@@ -57,6 +57,7 @@ export type RequirementsStatus = {
     | 'awaiting_approval'
     | 'ready_for_design'
     | 'design_pending'
+    | 'design_running'
     | 'engineering_running'
     | 'engineering_generated'
   execution_id: string | null
@@ -91,22 +92,50 @@ export type RequirementApproval = {
   client_message_id: string
 }
 
-export function continueEngineering(token: string, id: number, runId: string) {
-  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/build-runs/${runId}/engineering`, {
+export function getRequirementsProject(id: number) {
+  return apiRequest<{ id: number; name: string; prompt: string | null }>(`/api/v1/projects/${id}`)
+}
+
+export function getRequirements(id: number) {
+  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/requirements`)
+}
+
+export function getRequirementMessages(id: number, after = 0) {
+  return apiRequest<RequirementMessage[]>(
+    `/api/v1/projects/${id}/messages?limit=200&after_sequence=${after}`,
+  )
+}
+
+/** Persist a turn and advance planning when the server decides it should. */
+export function submitRequirements(id: number, content: string, key: string) {
+  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/requirements/submit`, {
     method: 'POST',
-    token,
+    body: { content, client_message_id: key },
   })
 }
 
-export function pauseBuildRun(token: string, id: number, runId: string) {
+/** Start from an existing user message (home prompt) when still not_started. */
+export function startRequirements(id: number, messageId?: number) {
+  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/requirements/start`, {
+    method: 'POST',
+    body: messageId != null ? { message_id: messageId } : {},
+  })
+}
+
+/** Resume PM recovery or engineering from current project status. */
+export function continueRequirements(id: number) {
+  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/requirements/continue`, {
+    method: 'POST',
+  })
+}
+
+export function pauseBuildRun(id: number, runId: string) {
   return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/build-runs/${runId}/pause`, {
     method: 'POST',
-    token,
   })
 }
 
 export function approveRequirements(
-  token: string,
   id: number,
   runId: string,
   itemId: string,
@@ -114,76 +143,6 @@ export function approveRequirements(
 ) {
   return apiRequest<RequirementsStatus>(
     `/api/v1/projects/${id}/build-runs/${runId}/requirements/${itemId}/approval`,
-    { method: 'POST', token, body: payload },
-  )
-}
-
-export function getRequirementsProject(token: string, id: number) {
-  return apiRequest<{ id: number; name: string; prompt: string | null }>(`/api/v1/projects/${id}`, {
-    token,
-  })
-}
-
-export function getRequirements(token: string, id: number) {
-  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/requirements`, { token })
-}
-
-export function getRequirementMessages(token: string, id: number, after = 0) {
-  return apiRequest<RequirementMessage[]>(
-    `/api/v1/projects/${id}/messages?limit=200&after_sequence=${after}`,
-    { token },
-  )
-}
-
-export function createRequirementMessage(token: string, id: number, content: string, key: string) {
-  return apiRequest<RequirementMessage>(`/api/v1/projects/${id}/messages`, {
-    method: 'POST',
-    token,
-    body: { content, client_message_id: key },
-  })
-}
-
-export function classifyRequirementMessage(token: string, id: number, messageId: number) {
-  return apiRequest<{
-    category: 'inquiry' | 'stop' | 'product_change' | 'implementation_repair'
-    decision_summary: string
-  }>(`/api/v1/projects/${id}/messages/${messageId}/classification`, {
-    method: 'POST',
-    token,
-  })
-}
-
-export function createRequirementsRun(token: string, id: number) {
-  return apiRequest<{ run_id: string }>(`/api/v1/projects/${id}/build-runs`, {
-    method: 'POST',
-    token,
-  })
-}
-
-export function executeRequirements(
-  token: string,
-  id: number,
-  runId: string,
-  messageId: number,
-  recoveryId: string | null = null,
-) {
-  return apiRequest<RequirementsResult>(`/api/v1/projects/${id}/build-runs/${runId}/requirements`, {
-    method: 'POST',
-    token,
-    body: { message_id: messageId, recovery_execution_id: recoveryId },
-  })
-}
-
-export function answerRequirements(
-  token: string,
-  id: number,
-  runId: string,
-  itemId: string,
-  content: string,
-  key: string,
-) {
-  return apiRequest<RequirementsResult>(
-    `/api/v1/projects/${id}/build-runs/${runId}/requirements/${itemId}/answers`,
-    { method: 'POST', token, body: { content, client_message_id: key } },
+    { method: 'POST', body: payload },
   )
 }

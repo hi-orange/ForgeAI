@@ -70,6 +70,23 @@
       <path d="m4 10.5 8-6.5 8 6.5" />
       <path d="M6 9.5V20h12V9.5" />
     </template>
+    <template v-else-if="name === 'desktop'">
+      <rect x="3" y="4" width="18" height="12" rx="1.5" />
+      <path d="M8 20h8M12 16v4" />
+    </template>
+    <template v-else-if="name === 'tablet'">
+      <rect x="5" y="2.5" width="14" height="19" rx="2" />
+      <path d="M10 18.5h4" />
+    </template>
+    <template v-else-if="name === 'mobile'">
+      <rect x="7" y="2.5" width="10" height="19" rx="2" />
+      <path d="M11 18.5h2" />
+    </template>
+    <template v-else-if="name === 'external-link'">
+      <path d="M14 4h6v6" />
+      <path d="m20 4-9 9" />
+      <path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" />
+    </template>
   </svg>
 </template>
 
@@ -92,6 +109,10 @@ export type WorkbenchIconName =
   | 'chevron-right'
   | 'download'
   | 'home'
+  | 'desktop'
+  | 'tablet'
+  | 'mobile'
+  | 'external-link'
 
 const props = withDefaults(
   defineProps<{

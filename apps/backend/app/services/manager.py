@@ -2,7 +2,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.agents.prompts.project_manager import (
+from app.agents.prompts.manager import (
+    ARCHITECTURE_TASK_INSTRUCTIONS,
     CLARIFICATION_TASK_INSTRUCTIONS,
     ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
     INITIAL_REQUIREMENTS_TASK_INSTRUCTIONS,
@@ -23,13 +24,16 @@ from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.task import TaskCreate
 from app.services import plan as plan_service
 from app.services import project as project_service
+from app.services.app_spec import read_app_spec
 from app.services.engineering import (
     APPROVAL_VERSION,
+    ARCHITECTURE_TASK_KEY,
     ENGINEERING_TASK_KEY,
-    cancel_legacy_design_task,
+    find_architecture_task,
     find_claimed_engineering_task,
     find_pending_engineering_task,
     load_approved_app_spec,
+    load_engineering_source,
     prepare_requirements_followup,
 )
 from app.services.project_message import stage_user_project_message
@@ -37,38 +41,119 @@ from app.services.project_message_classification import (
     get_stored_classification,
     require_project_message,
 )
-from app.services.requirement_inputs import read_app_spec
 from app.services.task_execution import lock_run
+
+
+def create_architecture_task(
+    db: Session, user: User, project_id: int, run_id: str, item_id: str
+) -> Task:
+    """Create the Architect assignment for one exact approved app_spec."""
+
+    try:
+        run = lock_run(db, user, project_id, run_id)
+        if run.status != "running" or run.stage != "pm" or run.active_slot != 1:
+            raise ConflictException("当前构建不能进行需求到架构设计的交接")
+        _, source_task, source_plan, approved_spec = load_approved_app_spec(
+            db, project_id, run_id, item_id, lock=True
+        )
+        source_result = db.get(TaskResult, source_task.task_id)
+        if source_result is None or source_result.prompt_version != APPROVAL_VERSION:
+            raise ConflictException("请先勾选并批准需求计划")
+        existing = find_architecture_task(db, source_plan, item_id, lock=True)
+        if existing is not None:
+            architecture_plan = db.scalar(
+                select(Plan).where(Plan.plan_id == existing.plan_id).with_for_update()
+            )
+            assert architecture_plan is not None
+            blocking = db.scalar(
+                select(Plan.plan_id)
+                .where(
+                    Plan.project_id == project_id,
+                    Plan.build_run_id == run_id,
+                    Plan.version > architecture_plan.version,
+                    Plan.status.in_(("pending", "running", "succeeded")),
+                )
+                .limit(1)
+            )
+            if blocking is not None:
+                raise ConflictException("需求已进入其他后续计划，请刷新进度")
+            db.commit()
+            db.refresh(existing)
+            task = existing
+        else:
+            latest_version = db.scalar(
+                select(Plan.version)
+                .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
+                .order_by(Plan.version.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if latest_version != source_plan.version:
+                raise ConflictException("需求已进入其他后续计划，请刷新进度")
+            plan = plan_service.stage_plan(
+                db,
+                user,
+                project_id,
+                run_id,
+                PlanCreate(
+                    version=source_plan.version + 1,
+                    cause_message_id=source_plan.cause_message_id,
+                    tasks=[
+                        TaskCreate(
+                            task_key=ARCHITECTURE_TASK_KEY,
+                            recipient=TaskRecipient.ARCHITECT,
+                            title="根据已批准需求设计系统",
+                            instructions=ARCHITECTURE_TASK_INSTRUCTIONS,
+                            expected_output_type=ConfigurationItemType.SYSTEM_DESIGN,
+                            input_configuration_item_ids=[item_id],
+                        )
+                    ],
+                ),
+            )
+            created_task = db.scalar(select(Task).where(Task.plan_id == plan.plan_id))
+            assert created_task is not None
+            task = created_task
+            db.commit()
+            db.refresh(task)
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictException("架构设计派工保存冲突，请重试") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    prepare_engineering_workspace(
+        project_id,
+        run_id,
+        task_id=task.task_id,
+        approved_item_id=item_id,
+        app_spec=approved_spec.model_dump(mode="json"),
+    )
+    return task
 
 
 def create_engineering_delivery_task(
     db: Session, user: User, project_id: int, run_id: str, item_id: str
 ) -> Task:
-    """批准后原子安排工程交付；创建 pending 计划/任务，并物化 fullstack 工作区。
-
-    主结果约定为 code。必要的设计与验证可作为附属产物登记到同一任务。
-    未开始的旧 SolutionArchitect 设计任务会被取消并转换为工程交付，转换幂等。
-    工作区复制在 DB 提交之后进行；失败时可重试派工以补齐目录。
-    """
+    """Create Code Engineer delivery from an exact system_design."""
     delivery_task: Task | None = None
     approved_payload: dict | None = None
     try:
         run = lock_run(db, user, project_id, run_id)
         if run.status != "running" or run.active_slot != 1:
             raise ConflictException("当前构建不能进行需求到工程交付的交接")
-        if run.stage not in ("pm", "developer"):
+        if run.stage not in ("architect", "developer"):
             raise ConflictException("当前构建不能进行需求到工程交付的交接")
-        _, source_task, source_plan, approved_spec = load_approved_app_spec(
-            db, project_id, run_id, item_id, lock=True
-        )
-        approved_payload = approved_spec.model_dump(mode="json")
+        source = load_engineering_source(db, project_id, run_id, item_id, lock=True)
+        source_plan = source.source_plan
+        approved_payload = source.app_spec.model_dump(mode="json")
         claimed = find_claimed_engineering_task(db, source_plan, item_id, lock=True)
         if claimed is not None:
             db.commit()
             db.refresh(claimed)
             delivery_task = claimed
         else:
-            if run.stage != "pm":
+            if run.stage != "architect":
                 raise ConflictException("当前构建不能进行需求到工程交付的交接")
             latest = db.scalar(
                 select(Plan)
@@ -102,9 +187,6 @@ def create_engineering_delivery_task(
                     db.commit()
                     db.refresh(existing)
                     delivery_task = existing
-                else:
-                    cancel_legacy_design_task(db, existing)
-                    db.flush()
             if delivery_task is None:
                 if existing is None:
                     blocking = db.scalar(
@@ -119,9 +201,6 @@ def create_engineering_delivery_task(
                     )
                     if blocking is not None:
                         raise ConflictException("需求已进入其他后续计划，请刷新进度")
-                source_result = db.get(TaskResult, source_task.task_id)
-                if source_result is None or source_result.prompt_version != APPROVAL_VERSION:
-                    raise ConflictException("请先勾选并批准需求计划")
                 next_version = (
                     db.scalar(
                         select(Plan.version)
@@ -142,8 +221,8 @@ def create_engineering_delivery_task(
                         tasks=[
                             TaskCreate(
                                 task_key=ENGINEERING_TASK_KEY,
-                                recipient=TaskRecipient.SOFTWARE_ENGINEER,
-                                title="根据已批准需求交付应用代码",
+                                recipient=TaskRecipient.CODE_ENGINEER,
+                                title="根据系统设计交付应用代码",
                                 instructions=ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
                                 expected_output_type=ConfigurationItemType.CODE,
                                 input_configuration_item_ids=[item_id],
@@ -168,15 +247,10 @@ def create_engineering_delivery_task(
         project_id,
         run_id,
         task_id=delivery_task.task_id,
-        approved_item_id=item_id,
+        approved_item_id=source.app_spec_item.item_id,
         app_spec=approved_payload,
     )
     return delivery_task
-
-
-def create_design_task(db: Session, user: User, project_id: int, run_id: str, item_id: str) -> Task:
-    """兼容旧调用名；现安排工程交付任务。"""
-    return create_engineering_delivery_task(db, user, project_id, run_id, item_id)
 
 
 def create_initial_plan(

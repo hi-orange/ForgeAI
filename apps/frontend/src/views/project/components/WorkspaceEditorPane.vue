@@ -5,7 +5,7 @@
         <input v-model="query" type="search" placeholder="搜索文件" aria-label="搜索文件" />
       </div>
       <div class="file-tree" role="tree">
-        <p v-if="!ready" class="tree-empty">应用开始写入业务代码后，这里会显示前后端文件。</p>
+        <p v-if="!ready" class="tree-empty">计划获批并创建工作区后，这里会显示前后端文件。</p>
         <p v-else-if="loading" class="tree-empty">正在读取工作区…</p>
         <p v-else-if="error" class="tree-error">{{ error }}</p>
         <template v-else>
@@ -55,6 +55,9 @@
           <span>{{ selectedName }}</span>
         </div>
         <span v-else class="code-tab-placeholder">选择左侧文件查看源码</span>
+        <button v-if="!following" type="button" class="follow-btn" @click="followWrites">
+          跟随写入
+        </button>
       </header>
       <div class="code-scroll">
         <p v-if="fileLoading" class="tree-empty">加载文件中…</p>
@@ -65,7 +68,7 @@
           </div>
           <pre class="code-body"><code>{{ fileContent }}</code></pre>
         </template>
-        <p v-else class="tree-empty">业务代码写入工作区后，可在此只读浏览源码。</p>
+        <p v-else class="tree-empty">选择文件后可在此查看源码。</p>
       </div>
       <div class="upgrade-banner" role="note">要进行编辑，请升级到付费计划</div>
     </div>
@@ -73,9 +76,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
-import { useAuthStore } from '@/stores'
-import * as workspaceApi from '@/api/modules/workspace'
+import { computed, ref } from 'vue'
+import { useWorkspaceSource } from '../useWorkspaceSource'
 import WorkbenchIcon from './WorkbenchIcon.vue'
 
 type TreeNode =
@@ -85,20 +87,29 @@ type TreeNode =
 const props = defineProps<{
   projectId: number
   ready: boolean
+  runId?: string | null
+  generation?: number
+  writtenPath?: string | null
+  requestedPath?: string | null
+  requestSequence?: number
 }>()
 
 defineEmits<{ download: [] }>()
 
-const auth = useAuthStore()
 const query = ref('')
-const loading = ref(false)
-const error = ref('')
-const files = ref<workspaceApi.WorkspaceFileEntry[]>([])
 const expanded = ref(new Set<string>(['frontend', 'backend', 'frontend/src', 'backend/app']))
-const selectedPath = ref<string | null>(null)
-const fileContent = ref<string | null>(null)
-const fileLoading = ref(false)
-const fileError = ref('')
+const {
+  files,
+  selectedPath,
+  fileContent,
+  loading,
+  error,
+  fileLoading,
+  fileError,
+  following,
+  selectFile,
+  followWrites,
+} = useWorkspaceSource(props)
 
 const selectedName = computed(() => selectedPath.value?.split('/').at(-1) ?? '')
 const lineCount = computed(() => Math.max(1, (fileContent.value ?? '').split('\n').length))
@@ -156,52 +167,6 @@ function toggleDir(path: string) {
   else next.add(path)
   expanded.value = next
 }
-
-async function loadListing() {
-  if (!props.ready || !auth.token) {
-    files.value = []
-    selectedPath.value = null
-    fileContent.value = null
-    return
-  }
-  loading.value = true
-  error.value = ''
-  try {
-    const listing = await workspaceApi.getWorkspace(auth.token, props.projectId)
-    files.value = listing.files
-    if (!selectedPath.value && listing.files[0]) {
-      await selectFile(listing.files[0].path)
-    }
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : '读取工作区失败'
-  } finally {
-    loading.value = false
-  }
-}
-
-async function selectFile(path: string) {
-  if (!auth.token) return
-  selectedPath.value = path
-  fileLoading.value = true
-  fileError.value = ''
-  try {
-    const file = await workspaceApi.getWorkspaceFile(auth.token, props.projectId, path)
-    fileContent.value = file.content
-  } catch (err) {
-    fileContent.value = null
-    fileError.value = err instanceof Error ? err.message : '读取文件失败'
-  } finally {
-    fileLoading.value = false
-  }
-}
-
-watch(
-  () => [props.projectId, props.ready] as const,
-  () => {
-    void loadListing()
-  },
-  { immediate: true },
-)
 </script>
 
 <style scoped lang="scss">
@@ -322,6 +287,15 @@ watch(
   padding: 0 0.75rem;
   border-bottom: 1px solid #ececf0;
   background: #fafafa;
+}
+.follow-btn {
+  margin-left: auto;
+  border: 1px solid #e4e4e7;
+  border-radius: 999px;
+  background: #fff;
+  padding: 0.25rem 0.55rem;
+  color: #52525b;
+  font-size: 0.7rem;
 }
 
 .code-tab {

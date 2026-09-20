@@ -17,7 +17,7 @@ from app.db.database import Base
 
 
 class ProjectMessageCategory(StrEnum):
-    """ProjectManager 对用户消息作出的唯一分类。"""
+    """Manager 对用户消息作出的唯一分类。"""
 
     # 询问进度/解释/确认等，不改变应用行为
     INQUIRY = "inquiry"
@@ -42,7 +42,7 @@ class ProjectMessageClassification(Base):
             "message_id",
             name="uq_project_message_classification_message_id",
         ),
-        {"comment": "用户消息的 ProjectManager 分类结果"},
+        {"comment": "用户消息的 Manager 分类结果"},
     )
 
     id: Mapped[int] = mapped_column(

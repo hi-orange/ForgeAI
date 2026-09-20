@@ -1,8 +1,16 @@
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    computed_field,
+    field_validator,
+)
 
+from app.agents.roles import get_role_profile
 from app.models.configuration_item import ConfigurationItemType
 from app.models.task import TaskRecipient, TaskStatus
 
@@ -56,3 +64,8 @@ class TaskOut(BaseModel):
     status: TaskStatus
     created_at: datetime
     updated_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]  # Pydantic runtime supports this decorator stack.
+    @property
+    def recipient_name(self) -> str:
+        return get_role_profile(self.recipient).display_name

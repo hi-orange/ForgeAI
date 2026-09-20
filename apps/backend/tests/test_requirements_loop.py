@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
+from test_architect import valid_design
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
     approval_payload,
@@ -41,8 +42,9 @@ from app.orchestration.product_manager import run_product_manager_workflow
 from app.schemas.product_manager import ProductManagerResult
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import RequirementsApproval
-from app.services import product_manager, project_manager, task, task_execution
-from app.services.requirement_approval import approve_requirements
+from app.schemas.system_design import SystemDesign
+from app.services import manager, product_manager, task, task_execution
+from app.services.app_spec import approve_requirements
 from app.services.requirements import get_requirements_status, pause_active_execution
 
 
@@ -170,7 +172,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
 
     def _answer(self, item_id, content="CSV", key="answer-1", user=None):
         with self.session_factory() as db:
-            return project_manager.create_clarification_plan(
+            return manager.create_clarification_plan(
                 db,
                 user or self.owner,
                 self.project.id,
@@ -575,14 +577,29 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
             json=approval_payload(client_message_id="api-approval"),
         )
         self.assertEqual(approval.status_code, 200, approval.text)
-        self.assertEqual(approval.json()["data"]["state"], "engineering_running")
-        self.assertIsNotNone(approval.json()["data"]["execution_id"])
+        self.assertEqual(approval.json()["data"]["state"], "design_pending")
+        self.assertIsNone(approval.json()["data"]["execution_id"])
         replay_approval = self.client.post(
             f"{self.execute}/{current['result']['configuration_item_id']}/approval",
             json=approval_payload(client_message_id="api-approval"),
         )
         self.assertEqual(replay_approval.status_code, 200, replay_approval.text)
         self.assertEqual(replay_approval.json(), approval.json())
+        with (
+            patch(
+                "app.orchestration.architect.generate_system_design",
+                return_value=SystemDesign.model_validate(valid_design()),
+            ),
+            patch(
+                "app.orchestration.architect.start_claimed_engineering",
+                return_value={"started": True},
+            ),
+        ):
+            started = self.client.post(
+                f"{self.base}/build-runs/{approval.json()['data']['run_id']}/engineering"
+            )
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.json()["data"]["state"], "engineering_running")
         self.assertEqual(self.chat.call_count, 2)
 
     def test_http_retries_dispatch_from_approved_requirements_without_another_model_call(self):
@@ -592,7 +609,7 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         with (
             self.assertLogs("forgeai", level="ERROR"),
             patch(
-                "app.api.v1.requirements.create_engineering_delivery_task",
+                "app.services.requirements.create_architecture_task",
                 side_effect=RuntimeError("dispatch failed"),
             ),
         ):
@@ -643,15 +660,28 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
             json=approval_payload(client_message_id="pause-approval"),
         )
         self.assertEqual(approval.status_code, 200, approval.text)
-        self.assertEqual(approval.json()["data"]["state"], "engineering_running")
+        self.assertEqual(approval.json()["data"]["state"], "design_pending")
         run_id = approval.json()["data"]["run_id"]
+        with (
+            patch(
+                "app.orchestration.architect.generate_system_design",
+                return_value=SystemDesign.model_validate(valid_design()),
+            ),
+            patch(
+                "app.orchestration.architect.start_claimed_engineering",
+                return_value={"started": True},
+            ),
+        ):
+            started = self.client.post(f"{self.base}/build-runs/{run_id}/engineering")
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.json()["data"]["state"], "engineering_running")
         paused = self.client.post(f"{self.base}/build-runs/{run_id}/pause")
         self.assertEqual(paused.status_code, 200, paused.text)
         body = paused.json()["data"]
         self.assertEqual(body["state"], "retry_available")
         self.assertIn("暂停", body["error"] or "")
         with patch(
-            "app.api.v1.requirements.engineering.start_claimed_engineering",
+            "app.services.requirements.engineering.start_claimed_engineering",
             return_value={"started": True, "execution_id": "exec_test"},
         ) as start:
             resumed = self.client.post(f"{self.base}/build-runs/{run_id}/engineering")

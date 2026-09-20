@@ -19,14 +19,13 @@ export type WorkspaceFileContent = {
   size_bytes: number
 }
 
-export function getWorkspace(token: string, projectId: number) {
-  return apiRequest<WorkspaceListing>(`/api/v1/projects/${projectId}/workspace`, { token })
+export function getWorkspace(projectId: number) {
+  return apiRequest<WorkspaceListing>(`/api/v1/projects/${projectId}/workspace`)
 }
 
-export function getWorkspaceFile(token: string, projectId: number, path: string) {
+export function getWorkspaceFile(projectId: number, path: string) {
   const query = new URLSearchParams({ path })
   return apiRequest<WorkspaceFileContent>(
     `/api/v1/projects/${projectId}/workspace/file?${query.toString()}`,
-    { token },
   )
 }

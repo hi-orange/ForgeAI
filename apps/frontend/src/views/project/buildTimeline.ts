@@ -45,7 +45,7 @@ export function timelineSteps(events: TimelineInput[]): TimelineStep[] {
       label: labels[step.name] || step.label,
       path:
         step.path ||
-        (['read_file', 'apply_patch'].includes(step.name) ? step.detail || null : null),
+        (step.ok && ['read_file', 'apply_patch'].includes(step.name) ? step.detail || null : null),
       work_item_title: step.work_item_title || '',
       work_item_id: step.work_item_id || '',
     }))
