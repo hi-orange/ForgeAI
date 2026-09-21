@@ -31,7 +31,7 @@ from app.schemas.product_manager_workflow import (
 )
 from app.services import build_run as build_run_service
 from app.services import configuration_manager, engineering, task_execution
-from app.services import manager as manager_service
+from app.services import leader as leader_service
 from app.services import plan as plan_service
 from app.services import product_manager as product_manager_service
 from app.services import task as task_service
@@ -96,7 +96,7 @@ class _ProductManagerWorkflow:
                 )
             )
             if plan is None:
-                plan = manager_service.create_initial_plan(
+                plan = leader_service.create_initial_plan(
                     db, user, state["project_id"], state["build_run_id"], state["cause_message_id"]
                 )
             tasks = task_service.list_user_plan_tasks(db, user, state["project_id"], plan.plan_id)
@@ -241,31 +241,34 @@ class _ProductManagerWorkflow:
                 .order_by(Plan.version.desc())
                 .limit(1)
             )
+            approved = result.prompt_version == engineering.APPROVAL_VERSION
             if latest_plan_id != plan.plan_id:
-                design_task = engineering.find_architecture_task(db, plan, item.item_id)
-                if (
-                    app_spec.open_questions
-                    or design_task is None
-                    or design_task.plan_id != latest_plan_id
-                ):
+                latest_tasks = list(
+                    db.scalars(select(Task).where(Task.plan_id == latest_plan_id)).all()
+                )
+                downstream = latest_tasks[0] if len(latest_tasks) == 1 else None
+                valid_leader_dispatch = downstream is not None and (
+                    (
+                        downstream.task_key == engineering.ARCHITECTURE_TASK_KEY
+                        and downstream.recipient == TaskRecipient.ARCHITECT.value
+                        and downstream.expected_output_type
+                        == ConfigurationItemType.SYSTEM_DESIGN.value
+                        and downstream.input_configuration_item_ids == [item.item_id]
+                    )
+                    or (
+                        downstream.task_key == engineering.ENGINEERING_TASK_KEY
+                        and downstream.recipient == TaskRecipient.CODE_ENGINEER.value
+                        and downstream.expected_output_type == ConfigurationItemType.CODE.value
+                        and downstream.input_configuration_item_ids == [item.item_id]
+                    )
+                )
+                if not approved or not valid_leader_dispatch:
                     raise ConflictException("需求已进入后续计划，请刷新进度")
             return {
                 "configuration_item_id": item.item_id,
                 "app_spec": app_spec.model_dump(mode="json"),
-                "approved": result.prompt_version == engineering.APPROVAL_VERSION,
+                "approved": approved,
             }
-
-    def assign_design_task(self, state: WorkflowState) -> dict[str, object]:
-        with self._session_factory() as db:
-            user = _get_user(db, state["user_id"])
-            task = manager_service.create_architecture_task(
-                db,
-                user,
-                state["project_id"],
-                state["build_run_id"],
-                state["configuration_item_id"],
-            )
-            return {"design_plan_id": task.plan_id, "design_task_id": task.task_id}
 
     def run(self, state: WorkflowState) -> ProductManagerWorkflowResult:
         state.update(self.ensure_plan(state))
@@ -291,7 +294,6 @@ class _ProductManagerWorkflow:
         if state.get("approved"):
             state["outcome"] = ProductManagerWorkflowOutcome.READY_FOR_DESIGN
             state["open_questions"] = []
-            state.update(self.assign_design_task(state))
         elif app_spec.features:
             state["outcome"] = ProductManagerWorkflowOutcome.AWAITING_APPROVAL
             state["open_questions"] = list(app_spec.open_questions)

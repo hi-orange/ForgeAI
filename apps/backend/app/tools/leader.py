@@ -1,4 +1,4 @@
-"""Bounded planning and dispatch tools for Manager."""
+"""Bounded planning and dispatch tools for Leader."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ from app.models.configuration_item import ConfigurationItemType
 from app.models.project_message_classification import ProjectMessageCategory
 from app.models.task import TaskRecipient, TaskStatus
 from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
-from app.schemas.manager import (
-    ManagerContext,
-    ManagerIntentDecision,
-    ManagerOutcome,
+from app.schemas.leader import (
+    LeaderContext,
+    LeaderIntentDecision,
+    LeaderOutcome,
 )
 from app.schemas.plan import PlanCreate
 
 _PLAN_SCHEMA = PlanCreate.model_json_schema()
-_INTENT_SCHEMA = ManagerIntentDecision.model_json_schema()
+_INTENT_SCHEMA = LeaderIntentDecision.model_json_schema()
 
-MANAGER_TOOLS: list[ToolDefinition] = [
+LEADER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="read_project_context",
         description="读取本轮冻结的项目、目标消息、历史消息、运行、计划和任务摘要。",
@@ -120,9 +120,9 @@ MANAGER_TOOLS: list[ToolDefinition] = [
 
 
 @dataclass(slots=True)
-class ManagerToolState:
-    context: ManagerContext
-    intent: ManagerIntentDecision | None = None
+class LeaderToolState:
+    context: LeaderContext
+    intent: LeaderIntentDecision | None = None
     draft: PlanCreate | None = None
     dispatched_task_keys: list[str] = field(default_factory=list)
 
@@ -151,11 +151,11 @@ def _tool_result(
     )
 
 
-def _validate_plan(state: ManagerToolState, value: Any) -> PlanCreate:
+def _validate_plan(state: LeaderToolState, value: Any) -> PlanCreate:
     try:
         plan = PlanCreate.model_validate(value)
     except ValidationError as exc:
-        raise BusinessException("Manager 计划缺少有效任务、角色或依赖关系") from exc
+        raise BusinessException("Leader 计划缺少有效任务、角色或依赖关系") from exc
     if plan.cause_message_id != state.context.target_message.id:
         raise BusinessException("计划必须由本轮目标用户消息触发")
     for task in plan.tasks:
@@ -166,11 +166,11 @@ def _validate_plan(state: ManagerToolState, value: Any) -> PlanCreate:
     return plan
 
 
-def _next_plan_version(state: ManagerToolState) -> int:
+def _next_plan_version(state: LeaderToolState) -> int:
     return max((plan.version for plan in state.context.plans), default=0) + 1
 
 
-def _find_snapshot_task(state: ManagerToolState, task_key: str):
+def _find_snapshot_task(state: LeaderToolState, task_key: str):
     for plan in reversed(state.context.plans):
         for task in plan.tasks:
             if task.task_key == task_key:
@@ -178,7 +178,7 @@ def _find_snapshot_task(state: ManagerToolState, task_key: str):
     return None
 
 
-def _dispatch_task(state: ManagerToolState, task_key: str) -> dict[str, Any]:
+def _dispatch_task(state: LeaderToolState, task_key: str) -> dict[str, Any]:
     if task_key in state.dispatched_task_keys:
         raise BusinessException("该任务已在本轮分派")
     if state.draft is not None:
@@ -222,16 +222,16 @@ def _dispatch_task(state: ManagerToolState, task_key: str) -> dict[str, Any]:
     }
 
 
-def _require_intent(state: ManagerToolState) -> ManagerIntentDecision:
+def _require_intent(state: LeaderToolState) -> LeaderIntentDecision:
     if state.intent is None:
-        raise BusinessException("Manager 必须先判断意图和优先级")
+        raise BusinessException("Leader 必须先判断意图和优先级")
     return state.intent
 
 
-def execute_manager_tool(
+def execute_leader_tool(
     call: ToolCall,
-    state: ManagerToolState,
-) -> tuple[ToolExecutionResult, ManagerOutcome | None]:
+    state: LeaderToolState,
+) -> tuple[ToolExecutionResult, LeaderOutcome | None]:
     try:
         if call.name == "read_project_context":
             return (
@@ -244,9 +244,9 @@ def execute_manager_tool(
             )
         if call.name == "classify_intent":
             try:
-                state.intent = ManagerIntentDecision.model_validate(call.arguments.get("intent"))
+                state.intent = LeaderIntentDecision.model_validate(call.arguments.get("intent"))
             except ValidationError as exc:
-                raise BusinessException("Manager 意图或优先级格式异常") from exc
+                raise BusinessException("Leader 意图或优先级格式异常") from exc
             return (
                 _tool_result(
                     call,
@@ -354,7 +354,7 @@ def execute_manager_tool(
             intent = _require_intent(state)
             question = str(call.arguments.get("question") or "").strip()
             summary = str(call.arguments.get("summary") or "").strip()
-            outcome = ManagerOutcome(
+            outcome = LeaderOutcome(
                 intent=intent,
                 action="wait_user",
                 summary=summary,
@@ -382,7 +382,7 @@ def execute_manager_tool(
                 ]
                 if unfinished:
                     raise BusinessException("仍有未结束任务，不能收尾")
-            outcome = ManagerOutcome.model_validate(
+            outcome = LeaderOutcome.model_validate(
                 {
                     "intent": intent,
                     "action": action,
@@ -391,8 +391,8 @@ def execute_manager_tool(
                     "dispatched_task_keys": list(state.dispatched_task_keys),
                 }
             )
-            return _tool_result(call, summary="Manager 已结束本轮管理"), outcome
-        raise BusinessException(f"Manager 无权使用工具：{call.name}")
+            return _tool_result(call, summary="Leader 已结束本轮管理"), outcome
+        raise BusinessException(f"Leader 无权使用工具：{call.name}")
     except (BusinessException, ValidationError, ValueError) as exc:
         return (
             ToolExecutionResult(

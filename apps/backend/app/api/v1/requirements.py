@@ -12,7 +12,7 @@ from app.schemas.requirements import (
     RequirementsSubmit,
 )
 from app.schemas.response import ApiResponse, success
-from app.services.manager import create_clarification_plan
+from app.services.leader import create_clarification_plan
 from app.services.requirements import (
     approve_requirement_plan,
     continue_engineering,

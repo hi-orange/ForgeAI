@@ -13,7 +13,7 @@ from app.models.project_message_classification import ProjectMessageCategory
 from app.models.task import Task
 from app.models.task_result import TaskResult
 from app.models.user import User
-from app.orchestration.architect import run_architecture_and_start_engineering
+from app.orchestration.leader import run_architect_and_continue
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowOutcome,
@@ -23,6 +23,7 @@ from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import EngineeringActivity, RequirementsApproval, RequirementsStatus
 from app.services import build_run as build_run_service
 from app.services import engineering
+from app.services import leader as leader_service
 from app.services import project as project_service
 from app.services import project_message as project_message_service
 from app.services import project_message_classification as classification_service
@@ -40,7 +41,7 @@ from app.services.engineering import (
     mark_engineering_inactive,
     read_frozen_input_snapshot,
 )
-from app.services.manager import create_architecture_task, create_clarification_plan
+from app.services.leader import create_clarification_plan
 from app.services.task_execution import fail_execution, latest_execution, lock_run, utc_now
 
 WRITABLE_STATES = frozenset({"not_started", "needs_user_input", "awaiting_approval"})
@@ -152,6 +153,16 @@ def continue_requirements(db: Session, user: User, project_id: int) -> Requireme
     ):
         return continue_engineering(db, user, project_id, status.run_id)
 
+    if status.state == "ready_for_design" and status.result:
+        leader_service.dispatch_approved_requirements(
+            db,
+            user,
+            project_id,
+            status.run_id,
+            status.result.configuration_item_id,
+        )
+        return get_requirements_status(db, user, project_id)
+
     if status.state in CONTINUE_PM_STATES and status.message_id:
         recovery = status.execution_id if status.state == "retry_available" else None
         run_product_manager_workflow(
@@ -178,7 +189,7 @@ def approve_requirement_plan(
     """Persist explicit approval, freeze it as engineering input, and start delivery."""
 
     approved_id = persist_approved_requirements(db, user, project_id, run_id, item_id, approval)
-    create_architecture_task(db, user, project_id, run_id, approved_id)
+    leader_service.dispatch_approved_requirements(db, user, project_id, run_id, approved_id)
     return get_requirements_status(db, user, project_id)
 
 
@@ -197,7 +208,7 @@ def continue_engineering(
     if current_task is not None and current_task.recipient == "Architect":
         if status.state not in ("design_pending", "retry_available"):
             raise BusinessException("当前没有可继续的 Architect 任务")
-        run_architecture_and_start_engineering(
+        run_architect_and_continue(
             db,
             user,
             project_id,
@@ -208,6 +219,15 @@ def continue_engineering(
             ),
         )
         return get_requirements_status(db, user, project_id)
+    if current_task is not None and current_task.recipient == "Code Engineer":
+        if status.state == "design_pending":
+            task, execution = engineering.claim_code_engineer_task(
+                db, user, project_id, run_id, current_task.task_id
+            )
+            engineering.start_claimed_engineering(db, user, project_id, run_id, task, execution)
+            return get_requirements_status(db, user, project_id)
+        if status.state not in ("engineering_running", "retry_available"):
+            raise BusinessException("当前没有可继续的 Code Engineer 任务")
     if status.state == "retry_available" and status.result and status.result.design_task_id:
         return _resume_engineering_from_retry(db, user, project_id, run_id, status)
     if status.state != "engineering_running":
@@ -366,7 +386,11 @@ def _checkpoint_has_written_code(checkpoint: object) -> bool:
     if checkpoint.get("outcome") == "generated":
         return True
     for item in checkpoint.get("observations") or []:
-        if isinstance(item, dict) and item.get("name") == "apply_patch" and item.get("ok"):
+        if (
+            isinstance(item, dict)
+            and item.get("name") in {"edit_file_by_replace", "write_new_code"}
+            and item.get("ok")
+        ):
             return True
     return False
 

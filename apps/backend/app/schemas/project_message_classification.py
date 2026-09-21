@@ -6,7 +6,7 @@ from app.models.project_message_classification import ProjectMessageCategory
 
 
 class ProjectMessageClassificationDecision(BaseModel):
-    """Manager 模型调用经过校验后的最小决策。"""
+    """Leader 模型调用经过校验后的最小决策。"""
 
     model_config = ConfigDict(extra="forbid")
 

@@ -54,7 +54,10 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
                 "list_files",
                 "read_file",
                 "search_code",
-                "apply_patch",
+                "retrieve_code_context",
+                "write_new_code",
+                "edit_file_by_replace",
+                "record_engineering_memory",
                 "run_check",
                 "complete_work_item",
                 "report_blocked",
@@ -79,13 +82,13 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
     ),
 }
 
-MANAGER_PROFILE = AgentRoleProfile(
-    display_name="Manager",
+LEADER_PROFILE = AgentRoleProfile(
+    display_name="Leader",
     goal=(
         "接收用户信息，判断意图和优先级，拆解任务并分发给合适角色；"
         "持续跟踪计划和岗位结果，决定继续分派、向用户追问或收尾。"
     ),
-    deliverables=("classification", "plan", "task_assignment", "management_outcome"),
+    deliverables=("classification", "plan", "task_assignment", "leadership_outcome"),
     allowed_tools=frozenset(
         {
             "read_project_context",

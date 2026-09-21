@@ -7,8 +7,10 @@ from pathlib import Path
 from app.core.exceptions import ConflictException
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.paths import (
-    MAX_FILE_BYTES,
+    MAX_FULL_READ_BYTES,
+    MAX_FULL_READ_LINES,
     MAX_LISTED_FILES,
+    MAX_READ_RANGE_LINES,
     MAX_SEARCH_HITS,
     MAX_WRITE_BYTES,
     SKIP_DIRS,
@@ -70,15 +72,6 @@ def read_file(
     if not is_text_file(target):
         raise ConflictException("该文件不是可编辑的文本文件")
     raw = target.read_bytes()
-    if len(raw) > MAX_FILE_BYTES:
-        return ToolExecutionResult(
-            tool_call_id=tool_call_id,
-            name="read_file",
-            ok=False,
-            error_code="FILE_TOO_LARGE",
-            summary=f"{path} 超过读取上限",
-            data={"size_bytes": len(raw), "content_hash": sha256_bytes(raw)},
-        )
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -90,11 +83,54 @@ def read_file(
             summary=f"{path} 不是 UTF-8 文本",
         )
     lines = text.splitlines()
+    if end_line is None and (len(raw) > MAX_FULL_READ_BYTES or len(lines) > MAX_FULL_READ_LINES):
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=False,
+            error_code="FILE_TOO_LARGE",
+            summary=f"{path} 过大，请先搜索符号或指定不超过 {MAX_READ_RANGE_LINES} 行的范围",
+            data={
+                "path": path.replace("\\", "/"),
+                "size_bytes": len(raw),
+                "line_count": len(lines),
+                "content_hash": sha256_bytes(raw),
+                "max_range_lines": MAX_READ_RANGE_LINES,
+            },
+        )
     start = max(1, start_line)
     end = min(len(lines), end_line) if end_line is not None else len(lines)
     if end < start:
         raise ConflictException("行范围无效")
+    if end_line is not None and end - start + 1 > MAX_READ_RANGE_LINES:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=False,
+            error_code="RANGE_TOO_LARGE",
+            summary=f"单次最多读取 {MAX_READ_RANGE_LINES} 行，请缩小范围",
+            data={
+                "path": path.replace("\\", "/"),
+                "line_count": len(lines),
+                "content_hash": sha256_bytes(raw),
+                "max_range_lines": MAX_READ_RANGE_LINES,
+            },
+        )
     excerpt = "\n".join(lines[start - 1 : end])
+    if len(excerpt.encode("utf-8")) > MAX_FULL_READ_BYTES:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=False,
+            error_code="RANGE_TOO_LARGE",
+            summary="所选范围内容仍过大，请继续缩小范围",
+            data={
+                "path": path.replace("\\", "/"),
+                "line_count": len(lines),
+                "content_hash": sha256_bytes(raw),
+                "max_range_lines": MAX_READ_RANGE_LINES,
+            },
+        )
     return ToolExecutionResult(
         tool_call_id=tool_call_id,
         name="read_file",
@@ -180,7 +216,16 @@ def apply_patch(
     if target.exists():
         current = target.read_bytes()
         current_hash = sha256_bytes(current)
-        if expected_hash and expected_hash != current_hash:
+        if not expected_hash:
+            return ToolExecutionResult(
+                tool_call_id=tool_call_id,
+                name="apply_patch",
+                ok=False,
+                error_code="READ_REQUIRED",
+                summary=f"写入已有文件 {path} 前必须先读取并提供 expected_hash",
+                data={"path": path, "content_hash": current_hash},
+            )
+        if expected_hash != current_hash:
             return ToolExecutionResult(
                 tool_call_id=tool_call_id,
                 name="apply_patch",
@@ -210,5 +255,89 @@ def apply_patch(
         name="apply_patch",
         ok=True,
         summary=f"已写入 {path}",
+        data={"path": path.replace("\\", "/"), "content_hash": sha256_bytes(payload)},
+    )
+
+
+def edit_file_by_replace(
+    root: Path,
+    *,
+    path: str,
+    old_text: str,
+    new_text: str,
+    expected_hash: str,
+    tool_call_id: str = "call_replace",
+) -> ToolExecutionResult:
+    """Replace one exact block in an observed UTF-8 file."""
+
+    target = safe_path_under_root(root, path)
+    if not is_text_file(target):
+        raise ConflictException("该文件不是可编辑的文本文件")
+    raw = target.read_bytes()
+    current_hash = sha256_bytes(raw)
+    if not expected_hash:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="edit_file_by_replace",
+            ok=False,
+            error_code="READ_REQUIRED",
+            summary=f"修改已有文件 {path} 前必须先读取并提供 expected_hash",
+            data={"path": path.replace("\\", "/"), "content_hash": current_hash},
+        )
+    if expected_hash != current_hash:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="edit_file_by_replace",
+            ok=False,
+            error_code="HASH_CONFLICT",
+            summary=f"{path} 已变化，请重新读取后再修改",
+            data={"path": path.replace("\\", "/"), "content_hash": current_hash},
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="edit_file_by_replace",
+            ok=False,
+            error_code="NOT_TEXT",
+            summary=f"{path} 不是 UTF-8 文本",
+        )
+    if not old_text:
+        raise ConflictException("替换原文不能为空")
+    match_count = text.count(old_text)
+    if match_count == 0:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="edit_file_by_replace",
+            ok=False,
+            error_code="NO_MATCH",
+            summary="替换原文未精确匹配，请重新读取目标范围",
+            data={"path": path.replace("\\", "/"), "content_hash": current_hash},
+        )
+    if match_count > 1:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="edit_file_by_replace",
+            ok=False,
+            error_code="AMBIGUOUS_MATCH",
+            summary=f"替换原文命中 {match_count} 处，请扩大上下文使其唯一",
+            data={"path": path.replace("\\", "/"), "content_hash": current_hash},
+        )
+    payload = text.replace(old_text, new_text, 1).encode("utf-8")
+    if len(payload) > MAX_WRITE_BYTES:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="edit_file_by_replace",
+            ok=False,
+            error_code="FILE_TOO_LARGE",
+            summary="修改后的文件超过写入上限",
+        )
+    target.write_bytes(payload)
+    return ToolExecutionResult(
+        tool_call_id=tool_call_id,
+        name="edit_file_by_replace",
+        ok=True,
+        summary=f"已局部修改 {path}",
         data={"path": path.replace("\\", "/"), "content_hash": sha256_bytes(payload)},
     )

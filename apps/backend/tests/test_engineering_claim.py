@@ -23,7 +23,7 @@ from app.models.task_result import TaskResult
 from app.schemas.app_spec import AppSpec
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.system_design import SystemDesign
-from app.services import architect, manager, product_manager
+from app.services import architect, leader, product_manager
 from app.services import task as task_service
 from app.services.app_spec import approve_requirements
 from app.services.engineering import (
@@ -93,7 +93,7 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
                             )
                         ),
                     )
-            architecture = manager.create_architecture_task(
+            architecture = leader.create_architecture_task(
                 db,
                 self.owner,
                 self.project.id,
@@ -116,7 +116,7 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
                 execution.execution_id,
                 SystemDesign.model_validate(valid_design()),
             )
-            return manager.create_engineering_delivery_task(
+            return leader.create_engineering_delivery_task(
                 db,
                 self.owner,
                 self.project.id,

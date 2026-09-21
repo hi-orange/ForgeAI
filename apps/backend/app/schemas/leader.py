@@ -1,4 +1,4 @@
-"""Bounded context and outcome contracts for the Manager role."""
+"""Bounded context and outcome contracts for Leader."""
 
 from __future__ import annotations
 
@@ -11,20 +11,20 @@ from app.models.project_message_classification import ProjectMessageCategory
 from app.models.task import TaskRecipient, TaskStatus
 from app.schemas.plan import PlanCreate
 
-ManagerText = Annotated[
+LeaderText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
 ]
 
 
-class ManagerPriority(StrEnum):
+class LeaderPriority(StrEnum):
     LOW = "low"
     NORMAL = "normal"
     HIGH = "high"
     URGENT = "urgent"
 
 
-class ManagerMessageSnapshot(BaseModel):
+class LeaderMessageSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: int = Field(gt=0)
@@ -33,7 +33,7 @@ class ManagerMessageSnapshot(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
 
 
-class ManagerTaskSnapshot(BaseModel):
+class LeaderTaskSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: str = Field(min_length=1, max_length=40)
@@ -45,16 +45,16 @@ class ManagerTaskSnapshot(BaseModel):
     result: dict[str, JsonValue] | None = None
 
 
-class ManagerPlanSnapshot(BaseModel):
+class LeaderPlanSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     plan_id: str = Field(min_length=1, max_length=40)
     version: int = Field(ge=1)
     status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
-    tasks: list[ManagerTaskSnapshot] = Field(default_factory=list, max_length=100)
+    tasks: list[LeaderTaskSnapshot] = Field(default_factory=list, max_length=100)
 
 
-class ManagerContext(BaseModel):
+class LeaderContext(BaseModel):
     """Frozen data for one management turn; callers select the exact message and run."""
 
     model_config = ConfigDict(extra="forbid")
@@ -64,14 +64,14 @@ class ManagerContext(BaseModel):
     project_status: str = Field(min_length=1, max_length=32)
     run_id: str = Field(min_length=1, max_length=40)
     run_status: str = Field(min_length=1, max_length=32)
-    target_message: ManagerMessageSnapshot
-    recent_messages: list[ManagerMessageSnapshot] = Field(default_factory=list, max_length=20)
-    plans: list[ManagerPlanSnapshot] = Field(default_factory=list, max_length=20)
+    target_message: LeaderMessageSnapshot
+    recent_messages: list[LeaderMessageSnapshot] = Field(default_factory=list, max_length=20)
+    plans: list[LeaderPlanSnapshot] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def validate_frozen_context(self) -> Self:
         if self.target_message.sender != "user":
-            raise ValueError("Manager 只能处理用户目标消息")
+            raise ValueError("Leader 只能处理用户目标消息")
         message_keys = [(message.id, message.sequence) for message in self.recent_messages]
         if len(message_keys) != len(set(message_keys)):
             raise ValueError("历史消息不能重复")
@@ -89,20 +89,20 @@ class ManagerContext(BaseModel):
         return self
 
 
-class ManagerIntentDecision(BaseModel):
+class LeaderIntentDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     category: ProjectMessageCategory
-    priority: ManagerPriority
-    summary: ManagerText
+    priority: LeaderPriority
+    summary: LeaderText
 
 
-class ManagerOutcome(BaseModel):
+class LeaderOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    intent: ManagerIntentDecision
+    intent: LeaderIntentDecision
     action: Literal["dispatch", "continue", "wait_user", "finish", "cancel"]
-    summary: ManagerText
+    summary: LeaderText
     plan: PlanCreate | None = None
     dispatched_task_keys: list[str] = Field(default_factory=list, max_length=100)
     question: str | None = Field(default=None, max_length=2000)

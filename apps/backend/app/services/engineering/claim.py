@@ -29,7 +29,8 @@ from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_engineer
 from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_now
 
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
-INPUT_SNAPSHOT_SCHEMA_VERSION = 1
+INPUT_SNAPSHOT_SCHEMA_VERSION = 2
+SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2})
 TOOL_STRATEGY_VERSION = "engineering_tools_v3"
 
 DEFAULT_CALL_BUDGET: dict[str, int] = {
@@ -61,8 +62,8 @@ def build_frozen_input_snapshot(
     task_id: str,
     approved_item_id: str,
     spec: AppSpec,
-    design_item_id: str,
-    system_design: SystemDesign,
+    design_item_id: str | None,
+    system_design: SystemDesign | None,
     template_version: str = DEFAULT_TEMPLATE_VERSION,
     base_revision_id: str | None = None,
     call_budget: dict[str, int] | None = None,
@@ -79,8 +80,11 @@ def build_frozen_input_snapshot(
         "task_id": task_id,
         "approved_item_id": approved_item_id,
         "approved_spec_digest": approved_spec_digest(spec),
+        "delivery_path": "designed" if system_design is not None else "direct",
         "design_item_id": design_item_id,
-        "system_design": system_design.model_dump(mode="json"),
+        "system_design": (
+            system_design.model_dump(mode="json") if system_design is not None else None
+        ),
         "base_revision_id": base_revision_id,
         "template_version": template_version,
         "template_digest": template_digest(template_version),
@@ -104,7 +108,7 @@ def read_frozen_input_snapshot(execution: TaskExecution) -> dict[str, Any] | Non
         return None
     if draft.get("kind") != INPUT_SNAPSHOT_KIND:
         return None
-    if draft.get("schema_version") != INPUT_SNAPSHOT_SCHEMA_VERSION:
+    if draft.get("schema_version") not in SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS:
         return None
     return draft
 
@@ -143,7 +147,7 @@ def claim_code_engineer_task(
             raise NotFoundException("构建任务不存在")
         build_run_service.require_active_for_stages(
             run,
-            {BuildRunStage.ARCHITECT, BuildRunStage.DEVELOPER},
+            {BuildRunStage.PM, BuildRunStage.ARCHITECT, BuildRunStage.DEVELOPER},
         )
         result = db.execute(
             select(Task, Plan)
@@ -174,7 +178,7 @@ def claim_code_engineer_task(
         input_item_id = task.input_configuration_item_ids[0]
         source = load_engineering_source(db, project_id, run_id, input_item_id, lock=True)
         approved_item_id = source.app_spec_item.item_id
-        design_item_id = source.input_item.item_id
+        design_item_id = source.input_item.item_id if source.system_design is not None else None
         spec = source.app_spec
 
         if task.status == TaskStatus.RUNNING.value and plan.status == PlanStatus.RUNNING.value:
@@ -246,6 +250,7 @@ def claim_code_engineer_task(
             run,
             stage=BuildRunStage.DEVELOPER,
             allowed_running_stages={
+                BuildRunStage.PM,
                 BuildRunStage.ARCHITECT,
                 BuildRunStage.DEVELOPER,
             },

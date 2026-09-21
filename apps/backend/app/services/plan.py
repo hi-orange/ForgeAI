@@ -111,6 +111,10 @@ def stage_running(db: Session, plan: Plan) -> None:
 def stage_succeeded_if_tasks_complete(db: Session, plan: Plan) -> bool:
     """Derive plan completion from its task ledger without committing."""
 
+    # Production sessions intentionally disable autoflush. Flush staged task
+    # transitions before deriving the plan state, otherwise a task changed to
+    # succeeded in this transaction is still read back as pending.
+    db.flush()
     statuses = list(
         db.scalars(select(Task.status).where(Task.plan_id == plan.plan_id).with_for_update()).all()
     )

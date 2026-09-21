@@ -24,7 +24,7 @@ from app.schemas.plan import PlanCreate
 from app.schemas.product_manager_workflow import ProductManagerWorkflowResult
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.task import TaskCreate
-from app.services import manager, product_manager
+from app.services import leader, product_manager
 from app.services import plan as plan_service
 from app.services import task as task_service
 from app.services.app_spec import approve_requirements
@@ -128,7 +128,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                         ),
                     )
                     item_id = approved_id
-            return manager.create_architecture_task(
+            return leader.create_architecture_task(
                 db,
                 user or self.owner,
                 self.project.id,
@@ -212,7 +212,8 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
         self.assertEqual(ids[0], ids[1])
         self.assertEqual(self._assign(item.item_id).task_id, ids[0])
         result = self._run()
-        self.assertEqual(result.design_task_id, ids[0])
+        # Product Manager only reports its result; Leader owns downstream dispatch.
+        self.assertIsNone(result.design_task_id)
         self.assertEqual(self._count(Plan), 2)
         self.assertEqual(self._count(Task), 2)
         self.chat.assert_called_once()
@@ -369,7 +370,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
     def test_handoff_failure_retries_only_dispatch_not_product_manager(self):
         item = self._publish_only()
         with patch.object(
-            manager,
+            leader,
             "create_architecture_task",
             side_effect=RuntimeError("dispatch failed"),
         ):
@@ -453,7 +454,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                     for entry in spec["acceptance_criteria"]
                 )
             )
-            delivery = manager.create_architecture_task(
+            delivery = leader.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
             self.assertEqual(delivery.recipient, "Architect")
@@ -495,7 +496,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
             self.assertEqual(architecture.status, "pending")
             self.assertEqual(architecture.expected_output_type, "system_design")
             self.assertEqual(architecture.input_configuration_item_ids, [item.item_id])
-            replay = manager.create_architecture_task(
+            replay = leader.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, item.item_id
             )
             self.assertEqual(replay.task_id, architecture.task_id)

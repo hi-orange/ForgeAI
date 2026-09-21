@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.agents import product_manager as product_manager_agent
 from app.agents.prompts.product_manager import APP_SPEC_PROMPT_VERSION
-from app.agents.roles import MANAGER_PROFILE, get_role_profile
+from app.agents.roles import LEADER_PROFILE, get_role_profile
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.core.settings import settings
 from app.db.database import Base
@@ -29,7 +29,7 @@ from app.schemas.product_manager import (
     ProductManagerInput,
     ProductManagerResult,
 )
-from app.services import manager as manager_service
+from app.services import leader as leader_service
 from app.services import product_manager as product_manager_service
 from app.services import task as task_service
 
@@ -161,7 +161,7 @@ class ProductManagerAgentTests(unittest.TestCase):
         chat.assert_called_once()
 
     def test_role_names_and_tool_boundaries_are_centralized(self):
-        self.assertEqual(MANAGER_PROFILE.display_name, "Manager")
+        self.assertEqual(LEADER_PROFILE.display_name, "Leader")
         expected_names = {
             TaskRecipient.PRODUCT_MANAGER: "Product Manager",
             TaskRecipient.ARCHITECT: "Architect",
@@ -417,10 +417,10 @@ class ProductManagerServiceTests(unittest.TestCase):
                 for message in (self.source, self.other_source)
             )
             db.commit()
-            self.plan = manager_service.create_initial_plan(
+            self.plan = leader_service.create_initial_plan(
                 db, self.owner, self.project.id, self.run.run_id, self.source.id
             )
-            other_plan = manager_service.create_initial_plan(
+            other_plan = leader_service.create_initial_plan(
                 db, self.owner, self.other_project.id, self.other_run.run_id, self.other_source.id
             )
             self.task = task_service.list_user_plan_tasks(
