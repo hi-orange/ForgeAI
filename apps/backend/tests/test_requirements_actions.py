@@ -45,7 +45,7 @@ class RequirementsActionsTests(ProductManagerWorkflowFixture):
         )
         with (
             patch(
-                "app.agents.manager.classify_message",
+                "app.agents.leader.classify_message",
                 return_value=decision,
             ),
             self.session_factory() as db,
@@ -81,7 +81,7 @@ class RequirementsActionsTests(ProductManagerWorkflowFixture):
         )
         with (
             patch(
-                "app.agents.manager.classify_message",
+                "app.agents.leader.classify_message",
                 return_value=decision,
             ),
             self.session_factory() as db,
@@ -120,7 +120,7 @@ class RequirementsActionsTests(ProductManagerWorkflowFixture):
             category=ProjectMessageCategory.PRODUCT_CHANGE,
             decision_summary="新产品需求",
         )
-        with patch("app.agents.manager.classify_message", return_value=decision):
+        with patch("app.agents.leader.classify_message", return_value=decision):
             with self.session_factory() as db:
                 first = requirements.submit_requirements(
                     db, self.owner, self.project.id, "做一个记账应用", "submit-replay"
@@ -160,7 +160,7 @@ class RequirementsActionsTests(ProductManagerWorkflowFixture):
             category=ProjectMessageCategory.PRODUCT_CHANGE,
             decision_summary="新产品需求",
         )
-        with patch("app.agents.manager.classify_message", return_value=decision):
+        with patch("app.agents.leader.classify_message", return_value=decision):
             with self.session_factory() as db:
                 requirements.submit_requirements(
                     db, self.owner, self.project.id, "做一个记账应用", "submit-collision"

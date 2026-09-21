@@ -5,26 +5,24 @@ from typing import Any, TypedDict
 
 from pydantic import ValidationError
 
-from app.agents.prompts.manager import (
-    MANAGER_SYSTEM_PROMPT,
+from app.agents.prompts.leader import (
+    LEADER_SYSTEM_PROMPT,
     MESSAGE_CLASSIFICATION_SYSTEM_PROMPT,
 )
-from app.agents.roles import MANAGER_PROFILE
+from app.agents.roles import LEADER_PROFILE
 from app.agents.tool_protocol import append_tool_exchange, require_single_tool_call
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_completion, chat_with_tools
-from app.schemas.manager import ManagerContext, ManagerOutcome
+from app.schemas.leader import LeaderContext, LeaderOutcome
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
-from app.tools.manager import (
-    MANAGER_TOOLS,
-    ManagerToolState,
-    execute_manager_tool,
+from app.tools.leader import (
+    LEADER_TOOLS,
+    LeaderToolState,
+    execute_leader_tool,
 )
 
-MAX_MANAGER_TOOL_TURNS = 12
-ALLOWED_MANAGER_TOOLS = [
-    tool for tool in MANAGER_TOOLS if tool.name in MANAGER_PROFILE.allowed_tools
-]
+MAX_LEADER_TOOL_TURNS = 12
+ALLOWED_LEADER_TOOLS = [tool for tool in LEADER_TOOLS if tool.name in LEADER_PROFILE.allowed_tools]
 
 
 class ProjectMessageContext(TypedDict):
@@ -57,7 +55,7 @@ def _parse_decision(raw: str) -> ProjectMessageClassificationDecision:
         payload = json.loads(_remove_json_fence(raw))
         return ProjectMessageClassificationDecision.model_validate(payload)
     except (json.JSONDecodeError, TypeError, ValidationError) as exc:
-        raise BusinessException("Manager 消息分类返回格式异常") from exc
+        raise BusinessException("Leader 消息分类返回格式异常") from exc
 
 
 def classify_message(
@@ -96,11 +94,11 @@ def classify_message(
     return _parse_decision(raw)
 
 
-def _management_messages(context: ManagerContext) -> list[dict[str, Any]]:
+def _leadership_messages(context: LeaderContext) -> list[dict[str, Any]]:
     return [
         {
             "role": "system",
-            "content": f"{MANAGER_SYSTEM_PROMPT}\n角色目标：{MANAGER_PROFILE.goal}",
+            "content": f"{LEADER_SYSTEM_PROMPT}\n角色目标：{LEADER_PROFILE.goal}",
         },
         {
             "role": "user",
@@ -117,29 +115,29 @@ def _management_messages(context: ManagerContext) -> list[dict[str, Any]]:
     ]
 
 
-def manage_project_turn(context: ManagerContext) -> ManagerOutcome:
+def lead_project_turn(context: LeaderContext) -> LeaderOutcome:
     """Run one bounded management turn; callers persist validated plan/outcome separately."""
 
     try:
-        context = ManagerContext.model_validate(context.model_dump())
+        context = LeaderContext.model_validate(context.model_dump())
     except ValidationError as exc:
-        raise BusinessException("Manager 项目上下文不符合要求") from exc
-    state = ManagerToolState(context=context)
-    messages = _management_messages(context)
-    for _turn in range(MAX_MANAGER_TOOL_TURNS):
+        raise BusinessException("Leader 项目上下文不符合要求") from exc
+    state = LeaderToolState(context=context)
+    messages = _leadership_messages(context)
+    for _turn in range(MAX_LEADER_TOOL_TURNS):
         result = chat_with_tools(
             messages=list(messages),
-            tools=ALLOWED_MANAGER_TOOLS,
+            tools=ALLOWED_LEADER_TOOLS,
             temperature=0.0,
             max_tokens=8192,
         )
         call = require_single_tool_call(
             result,
-            role_name="Manager",
-            allowed_tools=MANAGER_PROFILE.allowed_tools,
-            missing_message="Manager 未调用工具更新计划或结束本轮",
+            role_name="Leader",
+            allowed_tools=LEADER_PROFILE.allowed_tools,
+            missing_message="Leader 未调用工具更新计划或结束本轮",
         )
-        observation, outcome = execute_manager_tool(call, state)
+        observation, outcome = execute_leader_tool(call, state)
         if outcome is not None:
             return outcome
         append_tool_exchange(
@@ -148,4 +146,4 @@ def manage_project_turn(context: ManagerContext) -> ManagerOutcome:
             call=call,
             observation=observation,
         )
-    raise BusinessException("Manager 工具调用预算已用尽，尚未结束本轮管理")
+    raise BusinessException("Leader 工具调用预算已用尽，尚未结束本轮管理")

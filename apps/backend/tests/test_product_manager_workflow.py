@@ -22,7 +22,7 @@ from app.models.task_result import TaskResult
 from app.models.user import User
 from app.orchestration import product_manager as product_manager_workflow
 from app.schemas.product_manager_workflow import ProductManagerWorkflowOutcome
-from app.services import manager as manager_service
+from app.services import leader as leader_service
 from app.services import task as task_service
 from app.services import task_execution
 
@@ -178,7 +178,7 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
 
     def _create_plan(self) -> tuple[Plan, Task]:
         with self.session_factory() as db:
-            plan = manager_service.create_initial_plan(
+            plan = leader_service.create_initial_plan(
                 db, self.owner, self.project.id, self.run.run_id, self.message.id
             )
             task = task_service.list_user_plan_tasks(db, self.owner, self.project.id, plan.plan_id)[

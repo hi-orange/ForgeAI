@@ -28,7 +28,11 @@ class EngineeringSource:
     app_spec_task: Task
     app_spec_plan: Plan
     app_spec: AppSpec
-    system_design: SystemDesign
+    system_design: SystemDesign | None
+
+    @property
+    def delivery_path(self) -> str:
+        return "designed" if self.system_design is not None else "direct"
 
 
 def load_approved_app_spec(
@@ -70,7 +74,33 @@ def load_approved_app_spec(
 def load_engineering_source(
     db: Session, project_id: int, run_id: str, item_id: str, *, lock: bool = False
 ) -> EngineeringSource:
-    """Resolve an exact system design to its approved product intent."""
+    """Resolve one frozen Code Engineer input to its approved product intent.
+
+    Leader may route a small approved app directly to Code Engineer. Larger work
+    still arrives through an immutable ``system_design`` produced by Architect.
+    """
+
+    direct = db.scalar(
+        select(ConfigurationItem).where(
+            ConfigurationItem.item_id == item_id,
+            ConfigurationItem.project_id == project_id,
+            ConfigurationItem.producer_run_id == run_id,
+        )
+    )
+    if direct is not None and direct.semantic_type == "app_spec":
+        app_item, app_task, app_plan, spec = load_approved_app_spec(
+            db, project_id, run_id, item_id, lock=lock
+        )
+        return EngineeringSource(
+            input_item=app_item,
+            source_task=app_task,
+            source_plan=app_plan,
+            app_spec_item=app_item,
+            app_spec_task=app_task,
+            app_spec_plan=app_plan,
+            app_spec=spec,
+            system_design=None,
+        )
 
     statement = (
         select(ConfigurationItem, Task, Plan)

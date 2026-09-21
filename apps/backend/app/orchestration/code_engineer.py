@@ -9,12 +9,13 @@ from typing import Any, TypedDict, cast
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.agents.code_engineer import decide_next_action
+from app.agents.code_engineer import decide_next_action, generate_file_content
 from app.core.exceptions import BusinessException, ConflictException
 from app.core.settings import settings
 from app.generation.delivery import WorkItem, plan_delivery, work_items_to_json
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
+from app.retrieval.code_context import retrieve_code_context as retrieve_workspace_context
 from app.schemas.agent_action import ToolCall, ToolExecutionResult
 from app.schemas.system_design import SystemDesign
 from app.services.engineering.claim import DEFAULT_CALL_BUDGET, read_frozen_input_snapshot
@@ -23,18 +24,24 @@ from app.services.task_execution import latest_execution, renew_execution_lease,
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
 from app.tools.code_engineer import execute_tool_call
+from app.tools.paths import safe_path_under_root, sha256_bytes
 
 CHECKPOINT_KIND = "engineering_checkpoint"
-CHECKPOINT_SCHEMA_VERSION = 1
-MAX_OBSERVATIONS = 12
+CHECKPOINT_SCHEMA_VERSION = 2
+MAX_OBSERVATIONS = 20
+MAX_DETAILED_EDITOR_OBSERVATIONS = 5
 MAX_ACTIVITY = 80
 MAX_CONTEXT_FILES = 160
+MAX_MEMORY_FACTS = 80
 
 _TOOL_LABELS = {
     "list_files": "List files",
     "read_file": "Read file",
     "search_code": "Search code",
-    "apply_patch": "Write file",
+    "retrieve_code_context": "Retrieve context",
+    "write_new_code": "Generate file",
+    "edit_file_by_replace": "Edit file",
+    "record_engineering_memory": "Remember contract",
     "run_check": "Run checks",
     "complete_work_item": "Complete work item",
     "report_blocked": "Report blocked",
@@ -46,11 +53,13 @@ def _activity_entry(call: ToolCall, result: ToolExecutionResult) -> dict[str, An
     detail = ""
     if not result.ok:
         detail = result.summary
-    elif call.name in {"read_file", "apply_patch"}:
+    elif call.name in {"read_file", "edit_file_by_replace", "write_new_code"}:
         detail = str(args.get("path") or "")
     elif call.name == "list_files":
         detail = str(args.get("path") or ".")
     elif call.name == "search_code":
+        detail = str(args.get("query") or "")[:80]
+    elif call.name == "retrieve_code_context":
         detail = str(args.get("query") or "")[:80]
     elif call.name == "complete_work_item":
         detail = str(args.get("work_item_id") or "")
@@ -78,8 +87,15 @@ def _progress_summary(content: str | None, call: ToolCall, work_item: WorkItem) 
         return f"读取 {str(args.get('path') or '现有文件')}，确认实现后再决定修改。"[:200]
     if call.name == "search_code":
         return f"搜索“{str(args.get('query') or '')[:80]}”，定位关联实现。"
-    if call.name == "apply_patch":
-        return f"开始写入 {str(args.get('path') or '目标文件')}，推进“{work_item.title}”。"[:200]
+    if call.name == "retrieve_code_context":
+        return f"RAG 检索“{str(args.get('query') or '')[:80]}”，补充候选上下文。"
+    if call.name == "edit_file_by_replace":
+        return f"局部修改 {str(args.get('path') or '目标文件')}，推进“{work_item.title}”。"[:200]
+    if call.name == "write_new_code":
+        target = str(args.get("path") or "目标文件")
+        return f"生成完整文件 {target}，推进“{work_item.title}”。"[:200]
+    if call.name == "record_engineering_memory":
+        return f"记录已确认的工程契约：{str(args.get('subject') or '')[:100]}。"
     if call.name == "complete_work_item":
         return f"“{work_item.title}”已完成，记录结果并继续下一项。"[:200]
     if call.name == "run_check":
@@ -114,6 +130,109 @@ def _build_workspace_file_index(root: Path) -> dict[str, Any]:
     }
 
 
+def _new_long_term_memory() -> dict[str, Any]:
+    return {"facts": [], "files": {}}
+
+
+def _update_file_memory(
+    checkpoint: dict[str, Any], result: ToolExecutionResult, work_item_id: str
+) -> None:
+    if not result.ok or result.name not in {
+        "read_file",
+        "edit_file_by_replace",
+        "write_new_code",
+    }:
+        return
+    path = str(result.data.get("path") or result.arguments.get("path") or "").replace("\\", "/")
+    content_hash = result.data.get("content_hash")
+    if not path or not isinstance(content_hash, str):
+        return
+    memory = checkpoint.setdefault("long_term_memory", _new_long_term_memory())
+    files = memory.setdefault("files", {})
+    if not isinstance(files, dict):
+        files = {}
+        memory["files"] = files
+    files[path] = {
+        "content_hash": content_hash,
+        "last_action": result.name,
+        "line_count": result.data.get("line_count"),
+        "work_item_id": work_item_id,
+    }
+    if len(files) > MAX_CONTEXT_FILES:
+        for stale_path in list(files)[: len(files) - MAX_CONTEXT_FILES]:
+            files.pop(stale_path, None)
+
+
+def _has_current_file_evidence(
+    observations: list[ToolExecutionResult],
+    *,
+    path: str,
+    content_hash: str,
+) -> bool:
+    """Require current-turn source evidence; RAG excerpts never authorize writes."""
+
+    normalized_path = path.replace("\\", "/").strip()
+    for observation in reversed(observations):
+        if not observation.ok or observation.name not in {
+            "read_file",
+            "edit_file_by_replace",
+            "write_new_code",
+        }:
+            continue
+        observed_path = str(
+            observation.data.get("path") or observation.arguments.get("path") or ""
+        ).replace("\\", "/")
+        if observed_path != normalized_path:
+            continue
+        return observation.data.get("content_hash") == content_hash
+    return False
+
+
+def _compact_observation_history(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    history = items[-MAX_OBSERVATIONS:]
+    editor_names = {
+        "read_file",
+        "search_code",
+        "retrieve_code_context",
+        "edit_file_by_replace",
+        "write_new_code",
+    }
+    detailed_indices = [
+        index for index, item in enumerate(history) if item.get("name") in editor_names
+    ][-MAX_DETAILED_EDITOR_OBSERVATIONS:]
+    keep_details = set(detailed_indices)
+    compacted: list[dict[str, Any]] = []
+    for index, item in enumerate(history):
+        current = json.loads(json.dumps(item))
+        if current.get("name") in editor_names and index not in keep_details:
+            data = current.get("data") if isinstance(current.get("data"), dict) else {}
+            current["data"] = {
+                key: data[key]
+                for key in (
+                    "path",
+                    "content_hash",
+                    "start_line",
+                    "end_line",
+                    "line_count",
+                    "query",
+                    "truncated",
+                )
+                if key in data
+            }
+            arguments = (
+                current.get("arguments") if isinstance(current.get("arguments"), dict) else {}
+            )
+            current["arguments"] = {
+                key: arguments[key]
+                for key in ("path", "start_line", "end_line", "query", "path_filter")
+                if key in arguments
+            }
+            current["summary"] = f"{current.get('name')} 已执行；详细正文已从短记忆压缩"
+            current["truncated"] = True
+        compacted.append(current)
+    return compacted
+
+
 def _engineering_context(
     root: Path,
     snapshot: dict[str, Any],
@@ -127,7 +246,11 @@ def _engineering_context(
     observed_files: list[str] = []
     for observation in observations:
         path = observation.arguments.get("path")
-        if observation.name in {"read_file", "apply_patch"} and isinstance(path, str):
+        if observation.name in {
+            "read_file",
+            "edit_file_by_replace",
+            "write_new_code",
+        } and isinstance(path, str):
             normalized = path.replace("\\", "/")
             if normalized not in observed_files:
                 observed_files.append(normalized)
@@ -143,6 +266,11 @@ def _engineering_context(
         "workspace_file_index": file_index,
         "files_in_current_tool_history": observed_files,
         "files_modified_in_this_run": list(checkpoint.get("modified_files") or []),
+        "long_term_memory": checkpoint.get("long_term_memory") or _new_long_term_memory(),
+        "short_term_memory": {
+            "observation_count": len(observations),
+            "detailed_editor_observations": MAX_DETAILED_EDITOR_OBSERVATIONS,
+        },
         "inspection_guidance": (
             "目录索引已经提供。根据当前功能、验收条件和交付物选择最小相关文件集；"
             "只有缺少具体契约或实现时才搜索或读取，不要按目录逐个浏览。"
@@ -209,6 +337,9 @@ def _workspace_root(project_id: int, run_id: str):
 def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
     checkpoint = snapshot.get("checkpoint")
     if isinstance(checkpoint, dict) and checkpoint.get("kind") == CHECKPOINT_KIND:
+        checkpoint["schema_version"] = CHECKPOINT_SCHEMA_VERSION
+        checkpoint.setdefault("long_term_memory", _new_long_term_memory())
+        checkpoint.setdefault("writer_model_calls", 0)
         return checkpoint
     return {
         "kind": CHECKPOINT_KIND,
@@ -218,6 +349,8 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
         "model_turns": 0,
         "tool_calls": 0,
         "observations": [],
+        "long_term_memory": _new_long_term_memory(),
+        "writer_model_calls": 0,
         "modified_files": [],
         "blocked_reason": None,
         "outcome": "running",
@@ -281,7 +414,7 @@ class _EngineeringNodes:
                 lock=True,
             )
             design_payload = snapshot.get("system_design")
-            if snapshot.get("design_item_id") and not isinstance(design_payload, dict):
+            if snapshot.get("delivery_path") == "designed" and not isinstance(design_payload, dict):
                 raise ConflictException("工程执行缺少冻结系统设计")
             if isinstance(design_payload, dict):
                 SystemDesign.model_validate(design_payload)
@@ -400,9 +533,11 @@ class _EngineeringNodes:
                 str(snapshot["approved_item_id"]),
             )
             design_payload = snapshot.get("system_design")
-            if not isinstance(design_payload, dict):
-                raise ConflictException("工程执行缺少冻结系统设计")
-            system_design = SystemDesign.model_validate(design_payload)
+            system_design = (
+                SystemDesign.model_validate(design_payload)
+                if isinstance(design_payload, dict)
+                else None
+            )
             if not checkpoint.get("work_items"):
                 raise ConflictException("工程循环尚未规划工作单元")
             current_raw = _current_item(checkpoint["work_items"])
@@ -454,6 +589,8 @@ class _EngineeringNodes:
             _save_snapshot(db, execution.execution_id, snapshot)
             renew_execution_lease(db, state["task_id"], execution.execution_id)
 
+        generated_file_content: str | None = None
+        write_precondition_error: tuple[str, str] | None = None
         try:
             decision = decide_next_action(
                 spec=spec,
@@ -462,6 +599,54 @@ class _EngineeringNodes:
                 observations=observations,
                 system_design=system_design,
             )
+            if decision.tool_calls and decision.tool_calls[0].name == "write_new_code":
+                write_call = decision.tool_calls[0]
+                path = str(write_call.arguments.get("path") or "").strip()
+                description = str(write_call.arguments.get("file_description") or "").strip()
+                if not path or not description:
+                    write_precondition_error = (
+                        "INVALID_ARGUMENTS",
+                        "生成完整文件必须提供 path 和 file_description",
+                    )
+                else:
+                    target = safe_path_under_root(root, path, allow_create=True)
+                    expected_hash = str(write_call.arguments.get("expected_hash") or "").strip()
+                    if target.exists():
+                        current_hash = sha256_bytes(target.read_bytes())
+                        if not expected_hash:
+                            write_precondition_error = (
+                                "READ_REQUIRED",
+                                "整体重写已有文件前必须先读取并提供 expected_hash",
+                            )
+                        elif expected_hash != current_hash:
+                            write_precondition_error = (
+                                "HASH_CONFLICT",
+                                "目标文件已经变化，请重新读取后再生成",
+                            )
+                        elif not _has_current_file_evidence(
+                            observations,
+                            path=path,
+                            content_hash=expected_hash,
+                        ):
+                            write_precondition_error = (
+                                "READ_REQUIRED",
+                                "整体重写已有文件前必须先用 read_file 读取当前版本",
+                            )
+                    elif expected_hash:
+                        write_precondition_error = (
+                            "HASH_CONFLICT",
+                            "目标文件不存在，不能携带旧 expected_hash",
+                        )
+                    if write_precondition_error is None:
+                        generated_file_content = generate_file_content(
+                            spec=spec,
+                            work_item=work_item,
+                            path=path,
+                            file_description=description,
+                            engineering_context=engineering_context,
+                            observations=observations,
+                            system_design=system_design,
+                        )
         except BusinessException as exc:
             with self._session_factory() as db:
                 execution = latest_execution(db, state["task_id"], lock=True)
@@ -502,6 +687,10 @@ class _EngineeringNodes:
             assert snapshot is not None
             checkpoint = _load_checkpoint(snapshot)
             checkpoint["model_turns"] = int(checkpoint.get("model_turns") or 0) + 1
+            if generated_file_content is not None:
+                checkpoint["writer_model_calls"] = (
+                    int(checkpoint.get("writer_model_calls") or 0) + 1
+                )
             checkpoint.pop("last_error", None)
             if not decision.tool_calls:
                 checkpoint["outcome"] = "blocked"
@@ -595,15 +784,149 @@ class _EngineeringNodes:
                     summary=reason[:200],
                 )
 
-            result = execute_tool_call(
-                call,
-                workspace_root=root,
-                complete_work_item=complete_work_item,
-                report_blocked=report_blocked,
-            )
+            def write_new_code(args: dict[str, Any]) -> ToolExecutionResult:
+                if write_precondition_error is not None:
+                    error_code, summary = write_precondition_error
+                    return ToolExecutionResult(
+                        tool_call_id=call.id,
+                        name="write_new_code",
+                        ok=False,
+                        error_code=error_code,
+                        summary=summary,
+                    )
+                if generated_file_content is None:
+                    return ToolExecutionResult(
+                        tool_call_id=call.id,
+                        name="write_new_code",
+                        ok=False,
+                        error_code="GENERATION_FAILED",
+                        summary="写码模型没有生成文件内容",
+                    )
+                written = file_tools.apply_patch(
+                    root,
+                    path=str(args.get("path") or ""),
+                    content=generated_file_content,
+                    expected_hash=(
+                        str(args["expected_hash"]) if args.get("expected_hash") else None
+                    ),
+                    tool_call_id=call.id,
+                )
+                return written.model_copy(
+                    update={
+                        "name": "write_new_code",
+                        "summary": (
+                            f"已生成并写入 {str(args.get('path') or '')}"
+                            if written.ok
+                            else written.summary
+                        ),
+                    }
+                )
+
+            def record_engineering_memory(args: dict[str, Any]) -> ToolExecutionResult:
+                subject = str(args.get("subject") or "").strip()
+                fact = str(args.get("fact") or "").strip()
+                raw_paths = args.get("evidence_paths")
+                evidence_paths = (
+                    [str(path).replace("\\", "/").strip() for path in raw_paths]
+                    if isinstance(raw_paths, list)
+                    else []
+                )
+                if not subject or not fact or not evidence_paths:
+                    return ToolExecutionResult(
+                        tool_call_id=call.id,
+                        name="record_engineering_memory",
+                        ok=False,
+                        error_code="INVALID_MEMORY",
+                        summary="长期工程事实必须包含 subject、fact 和 evidence_paths",
+                    )
+                memory = checkpoint.setdefault("long_term_memory", _new_long_term_memory())
+                files = memory.get("files") if isinstance(memory, dict) else None
+                files = files if isinstance(files, dict) else {}
+                missing = [path for path in evidence_paths if path not in files]
+                if missing:
+                    return ToolExecutionResult(
+                        tool_call_id=call.id,
+                        name="record_engineering_memory",
+                        ok=False,
+                        error_code="UNVERIFIED_MEMORY",
+                        summary=f"请先读取或写入证据文件：{', '.join(missing[:3])}",
+                    )
+                facts = memory.get("facts")
+                facts = facts if isinstance(facts, list) else []
+                entry = {
+                    "subject": subject[:120],
+                    "fact": fact[:600],
+                    "evidence_paths": evidence_paths[:8],
+                    "evidence_hashes": {
+                        path: (
+                            files[path].get("content_hash")
+                            if isinstance(files[path], dict)
+                            else None
+                        )
+                        for path in evidence_paths[:8]
+                    },
+                    "work_item_id": work_item.id,
+                }
+                facts = [
+                    item
+                    for item in facts
+                    if not isinstance(item, dict) or item.get("subject") != entry["subject"]
+                ]
+                facts.append(entry)
+                memory["facts"] = facts[-MAX_MEMORY_FACTS:]
+                return ToolExecutionResult(
+                    tool_call_id=call.id,
+                    name="record_engineering_memory",
+                    ok=True,
+                    summary=f"已记录工程事实：{entry['subject']}",
+                    data={"subject": entry["subject"], "evidence_paths": evidence_paths[:8]},
+                )
+
+            def retrieve_code_context(args: dict[str, Any]) -> ToolExecutionResult:
+                if not any(
+                    observation.name == "search_code" and observation.ok
+                    for observation in observations
+                ):
+                    return ToolExecutionResult(
+                        tool_call_id=call.id,
+                        name="retrieve_code_context",
+                        ok=False,
+                        error_code="EXACT_SEARCH_REQUIRED",
+                        summary="使用 RAG 前必须先调用 search_code 做精确搜索",
+                    )
+                return retrieve_workspace_context(
+                    root,
+                    query=str(args.get("query") or ""),
+                    path_filter=(str(args["path_filter"]) if args.get("path_filter") else None),
+                    max_results=int(args.get("max_results") or 5),
+                    tool_call_id=call.id,
+                )
+
+            if call.name == "edit_file_by_replace" and not _has_current_file_evidence(
+                observations,
+                path=str(call.arguments.get("path") or ""),
+                content_hash=str(call.arguments.get("expected_hash") or ""),
+            ):
+                result = ToolExecutionResult(
+                    tool_call_id=call.id,
+                    name="edit_file_by_replace",
+                    ok=False,
+                    error_code="READ_REQUIRED",
+                    summary="局部修改已有文件前必须先用 read_file 读取当前版本",
+                )
+            else:
+                result = execute_tool_call(
+                    call,
+                    workspace_root=root,
+                    complete_work_item=complete_work_item,
+                    report_blocked=report_blocked,
+                    write_new_code=write_new_code,
+                    record_engineering_memory=record_engineering_memory,
+                    retrieve_code_context=retrieve_code_context,
+                )
             result = result.model_copy(update={"arguments": dict(call.arguments)})
             checkpoint["tool_calls"] = int(checkpoint.get("tool_calls") or 0) + 1
-            if call.name == "apply_patch" and result.ok:
+            if call.name in {"edit_file_by_replace", "write_new_code"} and result.ok:
                 checkpoint.pop("last_successful_check", None)
                 path = str(call.arguments.get("path") or "").replace("\\", "/")
                 modified_files = list(checkpoint.get("modified_files") or [])
@@ -636,9 +959,10 @@ class _EngineeringNodes:
                         }
                 else:
                     checkpoint.pop("last_successful_check", None)
+            _update_file_memory(checkpoint, result, work_item.id)
             saved_observations: list[dict[str, Any]] = list(checkpoint.get("observations") or [])
             saved_observations.append(result.model_dump(mode="json"))
-            checkpoint["observations"] = saved_observations[-MAX_OBSERVATIONS:]
+            checkpoint["observations"] = _compact_observation_history(saved_observations)
             activity = list(checkpoint.get("activity") or [])
             activity.append(_activity_entry(call, result))
             checkpoint["activity"] = activity[-MAX_ACTIVITY:]

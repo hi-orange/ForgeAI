@@ -1,4 +1,8 @@
-"""Run one Architect task, publish its design, then hand off to Code Engineer."""
+"""Run one assigned Architect task and publish its result.
+
+Architect never creates or starts downstream work; Leader consumes the returned
+artifact and decides the next assignment.
+"""
 
 from __future__ import annotations
 
@@ -7,19 +11,14 @@ from sqlalchemy.orm import Session
 from app.agents.architect import generate_system_design
 from app.core.settings import settings
 from app.generation.workspace import default_workspace_path
-from app.models.task import Task
+from app.models.configuration_item import ConfigurationItem
 from app.models.user import User
 from app.services import architect as architect_service
-from app.services import manager as manager_service
-from app.services.engineering import (
-    claim_code_engineer_task,
-    load_approved_app_spec,
-    start_claimed_engineering,
-)
+from app.services.engineering import load_approved_app_spec
 from app.services.task_execution import fail_execution
 
 
-def run_architecture_and_start_engineering(
+def run_architecture_task(
     db: Session,
     user: User,
     project_id: int,
@@ -27,8 +26,8 @@ def run_architecture_and_start_engineering(
     task_id: str,
     *,
     recovery_execution_id: str | None = None,
-) -> Task:
-    """Execute the exact design assignment and start its downstream coding task."""
+) -> ConfigurationItem:
+    """Execute the exact assignment and report the immutable design artifact."""
 
     task, execution = architect_service.claim_architect_task(
         db,
@@ -62,18 +61,4 @@ def run_architecture_and_start_engineering(
         )
         raise
 
-    delivery = manager_service.create_engineering_delivery_task(
-        db, user, project_id, run_id, design_item.item_id
-    )
-    code_task, code_execution = claim_code_engineer_task(
-        db, user, project_id, run_id, delivery.task_id
-    )
-    start_claimed_engineering(
-        db,
-        user,
-        project_id,
-        run_id,
-        code_task,
-        code_execution,
-    )
-    return code_task
+    return design_item

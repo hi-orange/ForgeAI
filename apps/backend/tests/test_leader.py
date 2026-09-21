@@ -3,21 +3,21 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from app.agents import manager as manager_agent
-from app.agents.roles import MANAGER_PROFILE
+from app.agents import leader as leader_agent
+from app.agents.roles import LEADER_PROFILE
 from app.core.exceptions import BusinessException
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall
-from app.schemas.manager import ManagerContext
-from app.tools.manager import ManagerToolState, execute_manager_tool
+from app.schemas.leader import LeaderContext
+from app.tools.leader import LeaderToolState, execute_leader_tool
 
 
-def manager_context(*, plans=None) -> ManagerContext:
-    return ManagerContext.model_validate(
+def leader_context(*, plans=None) -> LeaderContext:
+    return LeaderContext.model_validate(
         {
             "project_id": 7,
             "project_name": "Reading tracker",
             "project_status": "draft",
-            "run_id": "run_manager",
+            "run_id": "run_leader",
             "run_status": "running",
             "target_message": {
                 "id": 2,
@@ -64,12 +64,12 @@ def intent(*, category: str = "product_change", priority: str = "normal") -> dic
     }
 
 
-class ManagerTests(unittest.TestCase):
+class LeaderTests(unittest.TestCase):
     def test_role_goal_and_tools_match_management_boundary(self):
-        self.assertIn("判断意图和优先级", MANAGER_PROFILE.goal)
-        self.assertIn("持续跟踪计划", MANAGER_PROFILE.goal)
+        self.assertIn("判断意图和优先级", LEADER_PROFILE.goal)
+        self.assertIn("持续跟踪计划", LEADER_PROFILE.goal)
         self.assertEqual(
-            MANAGER_PROFILE.allowed_tools,
+            LEADER_PROFILE.allowed_tools,
             frozenset(
                 {
                     "read_project_context",
@@ -84,11 +84,11 @@ class ManagerTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertNotIn("apply_patch", MANAGER_PROFILE.allowed_tools)
-        self.assertNotIn("write_prd", MANAGER_PROFILE.allowed_tools)
+        self.assertNotIn("apply_patch", LEADER_PROFILE.allowed_tools)
+        self.assertNotIn("write_prd", LEADER_PROFILE.allowed_tools)
 
     def test_context_rejects_future_or_non_user_target_messages(self):
-        base = manager_context().model_dump(mode="json")
+        base = leader_context().model_dump(mode="json")
         invalid = [
             {
                 **base,
@@ -101,11 +101,11 @@ class ManagerTests(unittest.TestCase):
         ]
         for payload in invalid:
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
-                ManagerContext.model_validate(payload)
+                LeaderContext.model_validate(payload)
 
-    def test_manager_creates_plan_dispatches_role_and_finishes_turn(self):
-        state = ManagerToolState(context=manager_context())
-        classified, _ = execute_manager_tool(
+    def test_leader_creates_plan_dispatches_role_and_finishes_turn(self):
+        state = LeaderToolState(context=leader_context())
+        classified, _ = execute_leader_tool(
             ToolCall(
                 id="intent",
                 name="classify_intent",
@@ -114,7 +114,7 @@ class ManagerTests(unittest.TestCase):
             state,
         )
         self.assertTrue(classified.ok)
-        created, _ = execute_manager_tool(
+        created, _ = execute_leader_tool(
             ToolCall(
                 id="plan",
                 name="create_plan",
@@ -123,7 +123,7 @@ class ManagerTests(unittest.TestCase):
             state,
         )
         self.assertTrue(created.ok)
-        assigned, _ = execute_manager_tool(
+        assigned, _ = execute_leader_tool(
             ToolCall(
                 id="dispatch",
                 name="dispatch_task",
@@ -133,7 +133,7 @@ class ManagerTests(unittest.TestCase):
         )
         self.assertTrue(assigned.ok)
         self.assertEqual(assigned.data["recipient"], "Product Manager")
-        finished, outcome = execute_manager_tool(
+        finished, outcome = execute_leader_tool(
             ToolCall(
                 id="finish",
                 name="finish_turn",
@@ -148,7 +148,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(outcome.dispatched_task_keys, ["requirements"])
         self.assertEqual(outcome.plan, state.draft)
 
-    def test_manager_tracks_results_before_continuing_or_finishing(self):
+    def test_leader_tracks_results_before_continuing_or_finishing(self):
         plans = [
             {
                 "plan_id": "plan_1",
@@ -176,8 +176,8 @@ class ManagerTests(unittest.TestCase):
                 ],
             }
         ]
-        state = ManagerToolState(context=manager_context(plans=plans))
-        execute_manager_tool(
+        state = LeaderToolState(context=leader_context(plans=plans))
+        execute_leader_tool(
             ToolCall(
                 id="intent",
                 name="classify_intent",
@@ -185,7 +185,7 @@ class ManagerTests(unittest.TestCase):
             ),
             state,
         )
-        result, _ = execute_manager_tool(
+        result, _ = execute_leader_tool(
             ToolCall(
                 id="result",
                 name="read_task_result",
@@ -194,7 +194,7 @@ class ManagerTests(unittest.TestCase):
             state,
         )
         self.assertEqual(result.data["task"]["result"]["item_id"], "ci_app_spec")
-        assigned, _ = execute_manager_tool(
+        assigned, _ = execute_leader_tool(
             ToolCall(
                 id="dispatch",
                 name="dispatch_task",
@@ -203,7 +203,7 @@ class ManagerTests(unittest.TestCase):
             state,
         )
         self.assertTrue(assigned.ok)
-        _, continued = execute_manager_tool(
+        _, continued = execute_leader_tool(
             ToolCall(
                 id="continue",
                 name="finish_turn",
@@ -216,7 +216,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(continued.action, "continue")
         self.assertIsNone(continued.plan)
 
-        blocked_finish, blocked_outcome = execute_manager_tool(
+        blocked_finish, blocked_outcome = execute_leader_tool(
             ToolCall(
                 id="finish_early",
                 name="finish_turn",
@@ -228,8 +228,8 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNone(blocked_outcome)
 
     def test_plan_rejects_role_output_mismatch_and_persisted_version_rewrite(self):
-        state = ManagerToolState(context=manager_context())
-        execute_manager_tool(
+        state = LeaderToolState(context=leader_context())
+        execute_leader_tool(
             ToolCall(
                 id="intent",
                 name="classify_intent",
@@ -239,12 +239,12 @@ class ManagerTests(unittest.TestCase):
         )
         mismatch = product_plan()
         mismatch["tasks"][0]["expected_output_type"] = "code"
-        rejected, _ = execute_manager_tool(
+        rejected, _ = execute_leader_tool(
             ToolCall(id="bad", name="create_plan", arguments={"plan": mismatch}), state
         )
         self.assertFalse(rejected.ok)
 
-        existing = manager_context(
+        existing = leader_context(
             plans=[
                 {
                     "plan_id": "plan_1",
@@ -254,8 +254,8 @@ class ManagerTests(unittest.TestCase):
                 }
             ]
         )
-        state = ManagerToolState(context=existing)
-        execute_manager_tool(
+        state = LeaderToolState(context=existing)
+        execute_leader_tool(
             ToolCall(
                 id="intent_2",
                 name="classify_intent",
@@ -263,7 +263,7 @@ class ManagerTests(unittest.TestCase):
             ),
             state,
         )
-        rewrite, _ = execute_manager_tool(
+        rewrite, _ = execute_leader_tool(
             ToolCall(
                 id="rewrite",
                 name="create_plan",
@@ -298,34 +298,34 @@ class ManagerTests(unittest.TestCase):
             ),
         ]
         turns = [ChatWithToolsResult(tool_calls=[action]) for action in actions]
-        with patch.object(manager_agent, "chat_with_tools", side_effect=turns) as chat:
-            outcome = manager_agent.manage_project_turn(manager_context())
+        with patch.object(leader_agent, "chat_with_tools", side_effect=turns) as chat:
+            outcome = leader_agent.lead_project_turn(leader_context())
         self.assertEqual(outcome.action, "dispatch")
         self.assertEqual(outcome.intent.priority, "normal")
         self.assertEqual(chat.call_count, 5)
         self.assertEqual(
             {tool.name for tool in chat.call_args_list[0].kwargs["tools"]},
-            MANAGER_PROFILE.allowed_tools,
+            LEADER_PROFILE.allowed_tools,
         )
         self.assertEqual(
             [len(call.kwargs["messages"]) for call in chat.call_args_list],
             [2, 4, 6, 8, 10],
         )
 
-    def test_agent_rejects_tools_outside_manager_role(self):
+    def test_agent_rejects_tools_outside_leader_role(self):
         with patch.object(
-            manager_agent,
+            leader_agent,
             "chat_with_tools",
             return_value=ChatWithToolsResult(
                 tool_calls=[ToolCall(id="code", name="apply_patch", arguments={})]
             ),
         ):
             with self.assertRaisesRegex(BusinessException, "无权使用工具"):
-                manager_agent.manage_project_turn(manager_context())
+                leader_agent.lead_project_turn(leader_context())
 
     def test_agent_rejects_parallel_tool_calls(self):
         with patch.object(
-            manager_agent,
+            leader_agent,
             "chat_with_tools",
             return_value=ChatWithToolsResult(
                 tool_calls=[
@@ -335,7 +335,7 @@ class ManagerTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(BusinessException, "每轮只能调用一个工具"):
-                manager_agent.manage_project_turn(manager_context())
+                leader_agent.lead_project_turn(leader_context())
 
 
 if __name__ == "__main__":

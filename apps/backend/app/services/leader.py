@@ -1,8 +1,10 @@
+from enum import StrEnum
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.agents.prompts.manager import (
+from app.agents.prompts.leader import (
     ARCHITECTURE_TASK_INSTRUCTIONS,
     CLARIFICATION_TASK_INSTRUCTIONS,
     ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
@@ -19,6 +21,7 @@ from app.models.requirement_clarification import RequirementClarification
 from app.models.task import Task, TaskRecipient
 from app.models.task_result import TaskResult
 from app.models.user import User
+from app.schemas.app_spec import AppSpec
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.task import TaskCreate
@@ -42,6 +45,63 @@ from app.services.project_message_classification import (
     require_project_message,
 )
 from app.services.task_execution import lock_run
+
+
+class DeliveryPath(StrEnum):
+    DIRECT = "direct"
+    DESIGNED = "designed"
+
+
+_ARCHITECTURE_SENSITIVE_TERMS = frozenset(
+    {
+        "权限",
+        "角色",
+        "登录",
+        "认证",
+        "支付",
+        "外部",
+        "第三方",
+        "实时",
+        "并发",
+        "审批",
+        "多租户",
+        "安全",
+        "隐私",
+        "permission",
+        "role",
+        "login",
+        "auth",
+        "payment",
+        "external",
+        "third-party",
+        "realtime",
+        "concurrency",
+        "multi-tenant",
+        "security",
+        "privacy",
+    }
+)
+
+
+def choose_delivery_path(spec: AppSpec) -> DeliveryPath:
+    """Choose a stable route from one exact approved product-intent version."""
+
+    searchable = " ".join(
+        [spec.goal]
+        + [item.text for item in spec.features]
+        + [item.text for item in spec.constraints]
+    ).lower()
+    architecture_sensitive = any(term in searchable for term in _ARCHITECTURE_SENSITIVE_TERMS)
+    if (
+        len(spec.features) > 3
+        or len(spec.data_requirements) > 6
+        or len(spec.interface_requirements) > 4
+        or len(spec.target_users) > 2
+        or len(spec.constraints) > 1
+        or architecture_sensitive
+    ):
+        return DeliveryPath.DESIGNED
+    return DeliveryPath.DIRECT
 
 
 def create_architecture_task(
@@ -133,18 +193,32 @@ def create_architecture_task(
 
 
 def create_engineering_delivery_task(
-    db: Session, user: User, project_id: int, run_id: str, item_id: str
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    item_id: str,
+    *,
+    allow_direct: bool = False,
 ) -> Task:
-    """Create Code Engineer delivery from an exact system_design."""
+    """Legacy low-level task writer used by Leader.
+
+    Direct ``app_spec`` delivery is intentionally gated so callers cannot bypass
+    Leader's complexity decision.
+    """
     delivery_task: Task | None = None
     approved_payload: dict | None = None
     try:
         run = lock_run(db, user, project_id, run_id)
         if run.status != "running" or run.active_slot != 1:
             raise ConflictException("当前构建不能进行需求到工程交付的交接")
-        if run.stage not in ("architect", "developer"):
-            raise ConflictException("当前构建不能进行需求到工程交付的交接")
         source = load_engineering_source(db, project_id, run_id, item_id, lock=True)
+        direct = source.system_design is None
+        if direct and not allow_direct:
+            raise ConflictException("只有 Leader 可以把简单需求直接交给 Code Engineer")
+        allowed_stages = ("pm", "developer") if direct else ("architect", "developer")
+        if run.stage not in allowed_stages:
+            raise ConflictException("当前构建不能进行需求到工程交付的交接")
         source_plan = source.source_plan
         approved_payload = source.app_spec.model_dump(mode="json")
         claimed = find_claimed_engineering_task(db, source_plan, item_id, lock=True)
@@ -153,7 +227,8 @@ def create_engineering_delivery_task(
             db.refresh(claimed)
             delivery_task = claimed
         else:
-            if run.stage != "architect":
+            expected_stage = "pm" if direct else "architect"
+            if run.stage != expected_stage:
                 raise ConflictException("当前构建不能进行需求到工程交付的交接")
             latest = db.scalar(
                 select(Plan)
@@ -222,7 +297,11 @@ def create_engineering_delivery_task(
                             TaskCreate(
                                 task_key=ENGINEERING_TASK_KEY,
                                 recipient=TaskRecipient.CODE_ENGINEER,
-                                title="根据系统设计交付应用代码",
+                                title=(
+                                    "根据已批准需求直接交付应用代码"
+                                    if direct
+                                    else "根据系统设计交付应用代码"
+                                ),
                                 instructions=ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
                                 expected_output_type=ConfigurationItemType.CODE,
                                 input_configuration_item_ids=[item_id],
@@ -447,3 +526,37 @@ def create_clarification_plan(
     except Exception:
         db.rollback()
         raise
+
+
+def dispatch_approved_requirements(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    approved_item_id: str,
+) -> Task:
+    """Choose and persist the next assignment for one approved specification."""
+
+    _, _, _, spec = load_approved_app_spec(db, project_id, run_id, approved_item_id)
+    if choose_delivery_path(spec) == DeliveryPath.DIRECT:
+        return create_engineering_delivery_task(
+            db,
+            user,
+            project_id,
+            run_id,
+            approved_item_id,
+            allow_direct=True,
+        )
+    return create_architecture_task(db, user, project_id, run_id, approved_item_id)
+
+
+def dispatch_completed_design(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    design_item_id: str,
+) -> Task:
+    """Assign Code Engineer after Architect reports a completed design."""
+
+    return create_engineering_delivery_task(db, user, project_id, run_id, design_item_id)

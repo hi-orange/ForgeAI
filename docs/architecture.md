@@ -52,6 +52,20 @@ Generated code runs only in a restricted execution environment. An unavailable e
 work with an actionable reason. Explicit continuation retains frozen inputs, files and history,
 starts a new execution attempt, and preserves the previous attempt's usage and outcome.
 
+## Leader-directed delivery
+
+Leader is the only role that interprets a user turn as work, creates the next assignment, and
+decides whether a completed result should be followed by another role. Product Manager,
+Architect, Code Engineer, and Test Engineer execute assigned work and publish results; they do not
+create downstream assignments themselves. Non-product conversation is answered without starting a
+delivery run.
+
+Every new or changed product behavior still passes through a user-approved product-intent version.
+After approval, Leader may send a small conventional application directly to Code Engineer using
+the fixed platform stack, or require Architect to publish a system design first when scope or
+constraints warrant it. The chosen path is pinned to the exact approved artifact and remains
+observable in the task and execution inputs.
+
 ## Core concepts
 
 | Concept | Responsibility |

@@ -33,7 +33,7 @@ from app.schemas.project import ProjectCreate
 from app.schemas.task import TaskCreate
 from app.services import build_run as build_run_service
 from app.services import configuration_manager
-from app.services import manager as manager_service
+from app.services import leader as leader_service
 from app.services import plan as plan_service
 from app.services import product_manager as product_manager_service
 from app.services import project as project_service
@@ -102,7 +102,7 @@ class TaskCompletionTests(unittest.TestCase):
             )
         )
         db.commit()
-        plan = manager_service.create_initial_plan(
+        plan = leader_service.create_initial_plan(
             db, self.owner, project.id, run.run_id, message.id
         )
         task = task_service.list_user_plan_tasks(db, self.owner, project.id, plan.plan_id)[0]

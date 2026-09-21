@@ -18,6 +18,7 @@ from test_product_manager_workflow import (
 from app.core.exceptions import ConflictException
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
+from app.models.plan import Plan
 from app.models.project import Project
 from app.models.project_message import ProjectMessage
 from app.models.task_artifact import TaskArtifact
@@ -27,9 +28,10 @@ from app.schemas.plan import PlanCreate
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.task import TaskCreate
-from app.services import manager, product_manager
+from app.services import leader, product_manager
 from app.services import plan as plan_service
 from app.services.app_spec import approve_requirements, read_app_spec
+from app.services.engineering import claim_code_engineer_task, read_frozen_input_snapshot
 from app.services.requirements import get_requirements_status
 from app.services.task_artifact import TaskArtifactRole, stage_task_side_artifact
 
@@ -54,6 +56,19 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             / "alembic/versions/d9e0f1a2b3c4_remove_legacy_delivery_runs.py"
         )
         spec = importlib.util.spec_from_file_location("legacy_delivery_cleanup", path)
+        assert spec is not None and spec.loader is not None
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        with self.engine.begin() as connection:
+            migration.op = Operations(MigrationContext.configure(connection))
+            migration.upgrade()
+
+    def _run_plan_status_repair_migration(self) -> None:
+        path = (
+            Path(__file__).parents[1]
+            / "alembic/versions/f1b2c3d4e5f6_repair_completed_plan_status.py"
+        )
+        spec = importlib.util.spec_from_file_location("completed_plan_status_repair", path)
         assert spec is not None and spec.loader is not None
         migration = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(migration)
@@ -115,18 +130,102 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             self.assertEqual((old.schema_version, old.payload), (1, original))
             self.assertEqual(new.schema_version, 2)
             self.assertEqual(new.upstream_item_ids, [old.item_id])
-            delivery = manager.create_architecture_task(
+            delivery = leader.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
             self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
+
+    def test_approval_completes_plan_when_session_autoflush_is_disabled(self):
+        self.session_factory.configure(autoflush=False)
+        result = self._run()
+        approved_id = self._approve(result, approval_payload())
+
+        with self.session_factory() as db:
+            approved_plan = db.scalar(
+                select(Plan)
+                .where(Plan.build_run_id == self.run.run_id)
+                .order_by(Plan.version.desc())
+                .limit(1)
+            )
+            assert approved_plan is not None
+            self.assertEqual(approved_plan.status, "succeeded")
+            delivery = leader.dispatch_approved_requirements(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                approved_id,
+            )
+            self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
+
+    def test_migration_repairs_plan_when_all_tasks_already_succeeded(self):
+        result = self._run()
+        self._approve(result, approval_payload())
+        with self.session_factory() as db:
+            approved_plan = db.scalar(
+                select(Plan)
+                .where(Plan.build_run_id == self.run.run_id)
+                .order_by(Plan.version.desc())
+                .limit(1)
+            )
+            assert approved_plan is not None
+            approved_plan_id = approved_plan.plan_id
+            approved_plan.status = "pending"
+            db.commit()
+
+        self._run_plan_status_repair_migration()
+
+        with self.session_factory() as db:
+            repaired = db.scalar(select(Plan).where(Plan.plan_id == approved_plan_id))
+            assert repaired is not None
+            self.assertEqual(repaired.status, "succeeded")
 
     def test_code_delivery_rejects_approved_prd_without_system_design(self):
         result = self._run()
         approved_id = self._approve(result, approval_payload())
         with self.session_factory() as db, self.assertRaises(ConflictException):
-            manager.create_engineering_delivery_task(
+            leader.create_engineering_delivery_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
+
+    def test_leader_routes_small_approved_app_directly_to_code(self):
+        simple = {
+            "goal": "记录个人待办事项",
+            "target_users": ["个人用户"],
+            "features": [{"id": "feat_todo", "text": "新增和查看待办"}],
+            "data_requirements": [{"id": "data_title", "text": "待办标题"}],
+            "interface_requirements": [{"id": "ui_list", "text": "待办列表"}],
+            "constraints": [],
+            "acceptance_criteria": [
+                {
+                    "id": "ac_todo",
+                    "text": "新增待办后可以在列表中看到",
+                    "source_ids": ["feat_todo"],
+                }
+            ],
+            "open_questions": [],
+        }
+        self.chat.return_value = json.dumps(simple)
+        proposal = self._run()
+        approved_id = self._approve(proposal, approval_payload(simple))
+        with self.session_factory() as db:
+            delivery = leader.dispatch_approved_requirements(
+                db, self.owner, self.project.id, self.run.run_id, approved_id
+            )
+            self.assertEqual(delivery.recipient, "Code Engineer")
+            self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
+            _, execution = claim_code_engineer_task(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                delivery.task_id,
+            )
+            snapshot = read_frozen_input_snapshot(execution)
+            assert snapshot is not None
+            self.assertEqual(snapshot["delivery_path"], "direct")
+            self.assertIsNone(snapshot["design_item_id"])
+            self.assertIsNone(snapshot["system_design"])
 
     def test_cleanup_migration_deletes_legacy_run_but_keeps_project_messages(self):
         result = self._run()
@@ -168,7 +267,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
         result = self._run()
         approved_id = self._approve(result, approval_payload())
         with self.session_factory() as db:
-            manager.create_architecture_task(
+            leader.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
 
@@ -181,7 +280,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
     def test_v1_clarification_uses_normalized_pinned_input(self):
         result, original = self._legacy_result()
         with self.session_factory() as db:
-            plan = manager.create_clarification_plan(
+            plan = leader.create_clarification_plan(
                 db,
                 self.owner,
                 self.project.id,
@@ -207,7 +306,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             with self.assertRaises(ConflictException):
                 action()
         with self.session_factory() as db, self.assertRaises(ConflictException):
-            manager.create_clarification_plan(
+            leader.create_clarification_plan(
                 db,
                 self.owner,
                 self.project.id,
@@ -333,7 +432,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
         result = self._run()
         approved_id = self._approve(result, approval_payload())
         with self.session_factory() as db:
-            task = manager.create_architecture_task(
+            task = leader.create_architecture_task(
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
             with self.assertRaises(ConflictException):

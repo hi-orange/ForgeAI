@@ -15,9 +15,9 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
-from app.models.plan import Plan
+from app.models.plan import Plan, PlanStatus
 from app.models.requirement_clarification import RequirementClarification
-from app.models.task import Task, TaskRecipient
+from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_result import TaskResult
 from app.models.user import User
 from app.schemas.app_spec import (
@@ -195,17 +195,26 @@ def approve_requirements(
         source = read_app_spec(item)
         link = db.get(RequirementClarification, item_id)
         if link is not None and link.followup_plan_id is not None:
-            approved = db.scalar(
-                select(TaskResult)
+            approved_row = db.execute(
+                select(TaskResult, Task, Plan)
                 .join(Task, Task.task_id == TaskResult.task_id)
+                .join(Plan, Plan.plan_id == Task.plan_id)
                 .where(Task.plan_id == link.followup_plan_id)
-            )
-            if (
-                approved is None
-                or approved.prompt_version != APPROVAL_VERSION
-                or approved.result_hash != result_hash
-            ):
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).one_or_none()
+            if approved_row is None:
                 raise ConflictException("计划已被修改或批准，请刷新后继续")
+            approved, approved_task, approved_plan = approved_row
+            if approved.prompt_version != APPROVAL_VERSION or approved.result_hash != result_hash:
+                raise ConflictException("计划已被修改或批准，请刷新后继续")
+            if approved_task.status == TaskStatus.SUCCEEDED.value and approved_plan.status in {
+                PlanStatus.PENDING.value,
+                PlanStatus.RUNNING.value,
+            }:
+                plan_service.stage_succeeded_if_tasks_complete(db, approved_plan)
+            if approved_plan.status != PlanStatus.SUCCEEDED.value:
+                raise ConflictException("批准计划尚未完整保存，请刷新后重试")
             approved_id = approved.configuration_item_id
             db.commit()
             return approved_id

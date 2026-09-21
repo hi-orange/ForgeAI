@@ -43,7 +43,7 @@ from app.schemas.product_manager import ProductManagerResult
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.system_design import SystemDesign
-from app.services import manager, product_manager, task, task_execution
+from app.services import leader, product_manager, task, task_execution
 from app.services.app_spec import approve_requirements
 from app.services.requirements import get_requirements_status, pause_active_execution
 
@@ -172,7 +172,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
 
     def _answer(self, item_id, content="CSV", key="answer-1", user=None):
         with self.session_factory() as db:
-            return manager.create_clarification_plan(
+            return leader.create_clarification_plan(
                 db,
                 user or self.owner,
                 self.project.id,
@@ -591,7 +591,7 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
                 return_value=SystemDesign.model_validate(valid_design()),
             ),
             patch(
-                "app.orchestration.architect.start_claimed_engineering",
+                "app.orchestration.leader.start_claimed_engineering",
                 return_value={"started": True},
             ),
         ):
@@ -609,7 +609,7 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         with (
             self.assertLogs("forgeai", level="ERROR"),
             patch(
-                "app.services.requirements.create_architecture_task",
+                "app.services.requirements.leader_service.dispatch_approved_requirements",
                 side_effect=RuntimeError("dispatch failed"),
             ),
         ):
@@ -622,12 +622,13 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         self.assertEqual(waiting.status_code, 200)
         saved = waiting.json()["data"]
         self.assertEqual(saved["state"], "ready_for_design")
-        retry = self.client.post(self.execute, json={"message_id": saved["message_id"]})
+        retry = self.client.post(f"{self.base}/requirements/continue")
         self.assertEqual(retry.status_code, 200, retry.text)
         self.assertEqual(
-            retry.json()["data"]["configuration_item_id"], saved["result"]["configuration_item_id"]
+            retry.json()["data"]["result"]["configuration_item_id"],
+            saved["result"]["configuration_item_id"],
         )
-        self.assertIsNotNone(retry.json()["data"]["design_task_id"])
+        self.assertIsNotNone(retry.json()["data"]["result"]["design_task_id"])
         self.chat.assert_called_once()
 
     def test_http_rejects_cross_owner_and_malformed_input(self):
@@ -668,7 +669,7 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
                 return_value=SystemDesign.model_validate(valid_design()),
             ),
             patch(
-                "app.orchestration.architect.start_claimed_engineering",
+                "app.orchestration.leader.start_claimed_engineering",
                 return_value={"started": True},
             ),
         ):
