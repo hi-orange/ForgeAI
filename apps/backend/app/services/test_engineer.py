@@ -121,7 +121,7 @@ def load_test_inputs(
         or code_task.expected_output_type != ConfigurationItemType.CODE.value
         or code_task.status != TaskStatus.SUCCEEDED.value
         or code_plan.status != PlanStatus.SUCCEEDED.value
-        or len(code_item.upstream_item_ids) != 1
+        or len(code_item.upstream_item_ids) not in {1, 2}
     ):
         raise ConflictException("只能验证已完成且可用的准确 code 成果")
     try:
@@ -274,10 +274,19 @@ def complete_test_engineer_task(
             project.status = ProjectStatus.AVAILABLE.value
             run.status = BuildRunStatus.SUCCEEDED.value
             run.error = None
-        else:
-            run.status = BuildRunStatus.FAILED.value
+            run.active_slot = None
+        elif report.quality_conclusion == QualityConclusion.FAILED:
+            # A failed report is structured feedback, not a terminal build state.
+            # Leader will either create a bounded repair assignment or close the
+            # run after the configured number of independent QA cycles.
             run.error = report.summary[:500]
-        run.active_slot = None
+        else:
+            # Missing infrastructure or evidence is not a code defect. Sending it
+            # back to Code Engineer would burn repair rounds without changing the
+            # observation, so close with the actionable blocked reason.
+            run.status = BuildRunStatus.FAILED.value
+            run.active_slot = None
+            run.error = report.summary[:500]
         db.commit()
         db.refresh(item)
         return item

@@ -59,6 +59,12 @@ class EngineeringActivity(BaseModel):
     label: str
     detail: str = ""
     ok: bool = True
+    phase_id: str = ""
+    phase_label: str = ""
+    phase_role: str = ""
+    attempt: int = 1
+    work_item_id: str = ""
+    work_item_title: str = ""
 
 
 class RequirementsStatus(BaseModel):

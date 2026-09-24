@@ -14,6 +14,7 @@ from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_with_tools
 from app.models.task import TaskRecipient
+from app.schemas.agent_action import ToolCall
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import TestReport
@@ -23,7 +24,7 @@ from app.tools.test_engineer import (
     execute_test_engineer_tool,
 )
 
-MAX_TEST_ENGINEER_TOOL_TURNS = 16
+MAX_TEST_ENGINEER_TOOL_TURNS = 24
 TEST_ENGINEER_PROFILE = get_role_profile(TaskRecipient.TEST_ENGINEER)
 ALLOWED_TEST_ENGINEER_TOOLS = [
     tool for tool in TEST_ENGINEER_TOOLS if tool.name in TEST_ENGINEER_PROFILE.allowed_tools
@@ -73,11 +74,35 @@ def verify_code(
                     "source_hash": code_source_hash,
                     "acceptance_ids": [item.id for item in spec.acceptance_criteria],
                     "has_system_design": system_design is not None,
+                    "tool_budget": MAX_TEST_ENGINEER_TOOL_TURNS,
+                    "preferred_next_tools": [
+                        "read_artifact(app_spec)",
+                        'run_check(check_id="all")',
+                        "write_test_report",
+                    ],
                 },
                 ensure_ascii=False,
             ),
         },
     ]
+    turns_used = 0
+
+    def execute(call: ToolCall) -> tuple[Any, TestReport | None]:
+        nonlocal turns_used
+        observation, output = execute_test_engineer_tool(call, state)
+        turns_used += 1
+        remaining = MAX_TEST_ENGINEER_TOOL_TURNS - turns_used
+        if output is None and remaining <= 4:
+            nudge = f"还剩 {remaining} 轮工具预算。" + (
+                '请先 run_check(check_id="all")，再 write_test_report。'
+                if "all" not in state.checks
+                else "请尽快 write_test_report 结束本轮验证。"
+            )
+            observation = observation.model_copy(
+                update={"summary": f"{observation.summary} | {nudge}"}
+            )
+        return observation, output
+
     return run_bounded_tool_loop(
         messages=messages,
         tools=ALLOWED_TEST_ENGINEER_TOOLS,
@@ -88,6 +113,6 @@ def verify_code(
         max_tokens=8192,
         missing_message="Test Engineer 未调用工具验证或提交报告",
         exhausted_message="Test Engineer 工具调用预算已用尽，尚未提交测试报告",
-        execute_tool=lambda call: execute_test_engineer_tool(call, state),
+        execute_tool=execute,
         model_call=chat_with_tools,
     )

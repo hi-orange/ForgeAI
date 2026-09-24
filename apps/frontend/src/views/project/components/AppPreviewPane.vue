@@ -16,17 +16,26 @@
           <span>{{ option.label }}</span>
         </button>
       </div>
-      <div class="viewer-address"><WorkbenchIcon name="home" /> Home</div>
+      <div class="viewer-address">
+        <WorkbenchIcon name="home" />
+        {{ preview?.url || 'Home' }}
+      </div>
       <div class="viewer-actions">
-        <button type="button" :disabled="refreshing" title="重新加载预览状态" @click="reload">
+        <button
+          type="button"
+          :disabled="refreshing || previewBusy"
+          title="重新加载预览"
+          @click="reload"
+        >
           <WorkbenchIcon name="refresh" />
           <span>刷新</span>
         </button>
         <button
           type="button"
-          disabled
-          title="安全预览运行时尚未准备好"
-          aria-label="在新标签页打开（尚不可用）"
+          :disabled="!preview?.url"
+          :title="preview?.url ? '在新标签页打开预览' : '预览尚未就绪'"
+          aria-label="在新标签页打开"
+          @click="openExternal"
         >
           <WorkbenchIcon name="external-link" />
         </button>
@@ -64,6 +73,16 @@
           <p v-if="canApprove">在左侧勾选、编辑或新增需求，批准后继续。</p>
         </div>
 
+        <div v-else-if="preview?.status === 'ready' && preview.url" class="live-preview">
+          <iframe
+            :key="iframeKey"
+            class="preview-frame"
+            :src="preview.url"
+            title="生成应用预览"
+            referrerpolicy="no-referrer"
+          />
+        </div>
+
         <div v-else class="preview-empty">
           <div class="preview-illustration" aria-hidden="true">
             <div class="mini-sidebar"><i /><i /><i /></div>
@@ -81,12 +100,36 @@
             <span class="done">描述想法</span><i />
             <span :class="{ done: planReady }">确认计划</span><i />
             <span :class="{ done: status?.code_ready }">生成应用</span><i />
-            <span>在线预览</span>
+            <span :class="{ done: status?.state === 'completed' }">运行验证</span>
           </div>
-          <p v-if="status?.code_ready" class="preview-note">
-            源码已经生成，可在顶部“编辑器”中查看。通过平台检查并启动隔离运行时后，
-            这里才会展示真实应用。
+          <p v-if="preview?.status === 'starting'" class="preview-note verified">
+            {{ preview.message || '正在启动本地预览（首次可能需要构建前端）…' }}
           </p>
+          <p
+            v-else-if="preview?.status === 'error'"
+            class="preview-note preview-error"
+            role="alert"
+          >
+            {{ preview.message || '预览启动失败' }}
+          </p>
+          <p v-else-if="preview?.status === 'disabled'" class="preview-note">
+            本地预览未启用。可在后端配置 PREVIEW_ENABLED=true。
+          </p>
+          <p v-else-if="status?.state === 'completed'" class="preview-note verified">
+            独立验收已通过。点击下方按钮启动本机预览。
+          </p>
+          <p v-else-if="status?.code_ready" class="preview-note">
+            源码已经生成，可在顶部“编辑器”中查看；正在进行独立验收和隔离运行验证。
+          </p>
+          <button
+            v-if="status?.state === 'completed' && preview?.status !== 'starting'"
+            type="button"
+            class="preview-start"
+            :disabled="previewBusy"
+            @click="ensurePreview(true)"
+          >
+            {{ previewBusy ? '启动中…' : preview?.status === 'error' ? '重试预览' : '启动预览' }}
+          </button>
         </div>
       </div>
     </div>
@@ -111,7 +154,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import * as previewApi from '@/api/modules/preview'
+import type { PreviewStatus } from '@/api/modules/preview'
 import type { RequirementsStatus } from '@/api/modules/requirements'
 import type { RequirementPlanItem } from '../useRequirements'
 import WorkbenchIcon, { type WorkbenchIconName } from './WorkbenchIcon.vue'
@@ -119,6 +164,7 @@ import WorkbenchIcon, { type WorkbenchIconName } from './WorkbenchIcon.vue'
 type PreviewDevice = 'desktop' | 'tablet' | 'mobile'
 
 const props = defineProps<{
+  projectId: number
   status: RequirementsStatus | null
   planGoal: string
   planItems: RequirementPlanItem[]
@@ -131,6 +177,11 @@ const props = defineProps<{
 const emit = defineEmits<{ refresh: []; resolve: [] }>()
 const device = ref<PreviewDevice>('desktop')
 const consoleOpen = ref(false)
+const preview = ref<PreviewStatus | null>(null)
+const previewBusy = ref(false)
+const iframeKey = ref(0)
+let pollTimer: ReturnType<typeof setTimeout> | undefined
+let disposed = false
 const devices: Array<{ id: PreviewDevice; label: string; icon: WorkbenchIconName }> = [
   { id: 'desktop', label: '桌面', icon: 'desktop' },
   { id: 'tablet', label: '平板', icon: 'tablet' },
@@ -159,12 +210,20 @@ const planReady = computed(
   () => props.canApprove || postApproval.value || props.status?.state === 'ready_for_delivery',
 )
 const previewTitle = computed(() => {
+  if (preview.value?.status === 'starting') return '正在启动预览'
+  if (preview.value?.status === 'error') return '预览启动失败'
+  if (props.status?.state === 'completed') return '应用已完成运行验证'
   if (props.status?.code_ready) return '应用代码已生成'
   if (postApproval.value) return '正在构建你的应用'
   if (props.canApprove) return '你的应用，即将从这里开始'
   return '把想法变成看得见的应用'
 })
 const previewDescription = computed(() => {
+  if (preview.value?.status === 'starting')
+    return '正在构建前端产物并启动本机前后端，完成后会直接显示在这里。'
+  if (preview.value?.status === 'error') return '可以重试启动预览；源码仍可在「编辑器」中查看。'
+  if (props.status?.state === 'completed')
+    return '准确代码版本已经通过独立验收。启动本机预览后，可在此直接操作应用。'
   if (props.status?.code_ready) return '工作区已有真实代码，正在等待验证与安全预览运行时。'
   if (props.status?.state === 'engineering_running')
     return '工程任务正在读写工作区，进度会同步到 Console。'
@@ -183,12 +242,105 @@ const consoleRows = computed(() => {
   if (props.status?.error) {
     rows.push({ id: 'current-error', label: '构建错误', detail: props.status.error, ok: false })
   }
+  if (preview.value?.message) {
+    rows.push({
+      id: 'preview-status',
+      label: '预览',
+      detail: preview.value.message,
+      ok: preview.value.status === 'ready',
+    })
+  }
   return rows
 })
 
-function reload() {
-  emit('refresh')
+function clearPoll() {
+  clearTimeout(pollTimer)
+  pollTimer = undefined
 }
+
+function schedulePoll() {
+  clearPoll()
+  if (disposed || preview.value?.status !== 'starting') return
+  pollTimer = setTimeout(() => {
+    void refreshPreview()
+  }, 1500)
+}
+
+async function refreshPreview() {
+  if (disposed || !Number.isFinite(props.projectId)) return
+  try {
+    preview.value = await previewApi.getPreview(props.projectId)
+  } catch (err) {
+    if (!disposed) {
+      preview.value = {
+        status: 'error',
+        url: null,
+        run_id: null,
+        message: err instanceof Error ? err.message : '读取预览状态失败',
+      }
+    }
+    return
+  }
+  if (preview.value.status === 'starting') schedulePoll()
+  else clearPoll()
+}
+
+async function ensurePreview(force = false) {
+  if (disposed || props.status?.state !== 'completed') return
+  if (!force && (preview.value?.status === 'ready' || preview.value?.status === 'starting')) {
+    if (preview.value.status === 'starting') schedulePoll()
+    return
+  }
+  previewBusy.value = true
+  try {
+    preview.value = await previewApi.startPreview(props.projectId)
+    if (preview.value.status === 'starting') schedulePoll()
+    if (preview.value.status === 'ready') iframeKey.value += 1
+  } catch (err) {
+    preview.value = {
+      status: 'error',
+      url: null,
+      run_id: null,
+      message: err instanceof Error ? err.message : '启动预览失败',
+    }
+  } finally {
+    previewBusy.value = false
+  }
+}
+
+function openExternal() {
+  if (!preview.value?.url) return
+  window.open(preview.value.url, '_blank', 'noopener,noreferrer')
+}
+
+async function reload() {
+  emit('refresh')
+  if (props.status?.state === 'completed') {
+    if (preview.value?.status === 'ready') {
+      iframeKey.value += 1
+      await refreshPreview()
+    } else {
+      await ensurePreview(true)
+    }
+  }
+}
+
+watch(
+  () => props.status?.state,
+  (state) => {
+    if (state === 'completed') void ensurePreview(false)
+    else {
+      clearPoll()
+      preview.value = null
+    }
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  disposed = true
+  clearPoll()
+})
 </script>
 
 <style scoped lang="scss">
@@ -255,6 +407,9 @@ function reload() {
   border: 1px solid #e6e6ea;
   border-radius: 999px;
   background: #fafafa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .viewer-stage {
   display: flex;
@@ -275,6 +430,19 @@ function reload() {
   background: #fff;
   box-shadow: 0 12px 32px rgba(31, 35, 48, 0.06);
   transition: width 180ms ease;
+}
+.live-preview {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  background: #fff;
+}
+.preview-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 480px;
+  border: 0;
+  background: #fff;
 }
 .preview-empty,
 .viewer-error {
@@ -300,7 +468,8 @@ function reload() {
   color: #858794;
   line-height: 1.8;
 }
-.viewer-error button {
+.viewer-error button,
+.preview-start {
   margin-top: 18px;
   border: 0;
   border-radius: 8px;
@@ -308,6 +477,10 @@ function reload() {
   color: #fff;
   padding: 9px 15px;
   cursor: pointer;
+}
+.preview-start:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 .error-badge {
   display: grid;
@@ -412,6 +585,12 @@ function reload() {
   margin-top: 16px !important;
   color: #8a6d3b !important;
   font-size: 12px;
+}
+.preview-note.verified {
+  color: #417a50 !important;
+}
+.preview-note.preview-error {
+  color: #b91c1c !important;
 }
 .plan-overview {
   flex: 1;

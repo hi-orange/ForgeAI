@@ -77,7 +77,7 @@ TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="run_check",
-        description="在隔离、离线环境运行数据库、后端、前端或完整检查。",
+        description="在隔离环境运行数据库、后端、前端或完整检查（可按生成清单安装依赖）。",
         parameters={
             "type": "object",
             "properties": {
@@ -122,6 +122,12 @@ class TestEngineerToolState:
     system_design: SystemDesign | None = None
     checks: dict[str, ToolExecutionResult] = field(default_factory=dict)
     defects: dict[str, DefectRecord] = field(default_factory=dict)
+    explore_before_check: int = 0
+
+
+# Allow a few targeted reads after artifacts; then force run_check(all).
+_MAX_EXPLORE_BEFORE_CHECK = 3
+_EXPLORE_TOOLS = frozenset({"list_files", "read_file", "search_code"})
 
 
 def _result_status(result: ToolExecutionResult) -> VerificationStatus:
@@ -193,6 +199,23 @@ def execute_test_engineer_tool(
     state: TestEngineerToolState,
 ) -> tuple[ToolExecutionResult, TestReport | None]:
     try:
+        if call.name in _EXPLORE_TOOLS and "all" not in state.checks:
+            state.explore_before_check += 1
+            if state.explore_before_check > _MAX_EXPLORE_BEFORE_CHECK:
+                return (
+                    ToolExecutionResult(
+                        tool_call_id=call.id,
+                        name=call.name,
+                        ok=False,
+                        error_code="CHECK_FIRST",
+                        summary=(
+                            '提交报告前必须先 run_check(check_id="all")。'
+                            "请立刻运行完整检查，不要继续浏览源码。"
+                        ),
+                        arguments=dict(call.arguments),
+                    ),
+                    None,
+                )
         if call.name == "read_artifact":
             artifact = str(call.arguments.get("artifact") or "")
             if artifact == "app_spec":

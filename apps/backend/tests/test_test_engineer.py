@@ -295,6 +295,35 @@ class TestEngineerTests(unittest.TestCase):
                         workspace_root=Path(directory),
                     )
 
+    def test_explore_before_check_is_capped(self):
+        with TemporaryDirectory(prefix="forgeai-test-engineer-cap-") as directory:
+            root = Path(directory)
+            (root / "frontend").mkdir()
+            (root / "frontend" / "a.vue").write_text("<template></template>\n", encoding="utf-8")
+            state = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=root,
+            )
+            for index in range(3):
+                result, _ = execute_test_engineer_tool(
+                    ToolCall(
+                        id=f"read_{index}",
+                        name="read_file",
+                        arguments={"path": "frontend/a.vue"},
+                    ),
+                    state,
+                )
+                self.assertTrue(result.ok, result.summary)
+            blocked, _ = execute_test_engineer_tool(
+                ToolCall(id="read_blocked", name="read_file", arguments={"path": "frontend/a.vue"}),
+                state,
+            )
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.error_code, "CHECK_FIRST")
+        self.assertIn("run_check", blocked.summary)
+
 
 if __name__ == "__main__":
     unittest.main()

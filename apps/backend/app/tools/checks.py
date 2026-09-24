@@ -1,4 +1,4 @@
-"""Execute fixed engineering checks in disposable, offline Linux containers."""
+"""Execute fixed engineering checks in disposable Linux containers."""
 
 from __future__ import annotations
 
@@ -122,6 +122,9 @@ def source_snapshot(root: Path) -> tuple[bytes, str]:
 
 
 def docker_command(binary: str, image: str, name: str, check_id: str) -> list[str]:
+    # Egress is required when generated package.json / pyproject.toml diverges from
+    # the template baseline so the check controller can install the declared deps.
+    # Source is still stdin-only; no host mounts or Docker socket.
     return [
         binary,
         "run",
@@ -129,18 +132,17 @@ def docker_command(binary: str, image: str, name: str, check_id: str) -> list[st
         "--pull=never",
         "--name",
         name,
-        "--network=none",
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         "--user=65534:65534",
         "--cpus=2",
-        "--memory=768m",
-        "--memory-swap=768m",
-        "--pids-limit=96",
+        "--memory=1536m",
+        "--memory-swap=1536m",
+        "--pids-limit=128",
         "--log-driver=none",
         "--init",
-        "--tmpfs=/tmp:rw,nosuid,nodev,size=384m,mode=1777",
+        "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=768m,mode=1777",
         "-i",
         "--entrypoint=python",
         image,
@@ -231,7 +233,11 @@ def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> Tool
             if result.ok
             else ("CHECK_ENVIRONMENT_UNAVAILABLE" if code in {125, 126, 127} else "CHECK_FAILED")
         )
-        result.summary = f"{check_id} 检查通过" if result.ok else f"{check_id} 检查失败"
+        result.summary = (
+            ("完整检查与隔离运行冒烟通过" if check_id == "all" else f"{check_id} 检查通过")
+            if result.ok
+            else f"{check_id} 检查失败"
+        )
         result.data.update(exit_code=code, output=output)
         result.truncated = truncated
         if source_snapshot(root)[1] != digest:

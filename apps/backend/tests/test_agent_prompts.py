@@ -35,6 +35,8 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("retrieve_code_context", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("RAG 命中不是源码", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("edit_file_by_replace", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("install_project_dependency", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("禁止 apt", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("一次工具调用只修改一个文件", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("只输出目标文件正文", CODE_WRITER_SYSTEM_PROMPT)
         self.assertIn("不输出 TODO", CODE_WRITER_SYSTEM_PROMPT)

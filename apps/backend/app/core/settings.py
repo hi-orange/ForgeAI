@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     llm_provider: str = "deepseek"
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-flash"
 
     tavily_api_key: str | None = None
     tavily_base_url: str = "https://api.tavily.com"
@@ -42,7 +42,16 @@ class Settings(BaseSettings):
 
     # Disposable Linux check containers for generated fullstack-v1 apps.
     engineering_check_image: str = "forgeai-checks:fullstack-v1"
-    engineering_check_timeout_seconds: int = 180
+    engineering_check_timeout_seconds: int = 300
+
+    # Local loopback preview of a completed generated app (not a multi-tenant gateway).
+    preview_enabled: bool = True
+    preview_bind_host: str = "127.0.0.1"
+    preview_port_min: int = 18200
+    preview_port_max: int = 18399
+    preview_idle_timeout_seconds: int = 1800
+    preview_build_timeout_seconds: int = 180
+    preview_ready_timeout_seconds: int = 90
 
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env.development",

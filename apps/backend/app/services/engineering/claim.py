@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.generation.template_registry import DEFAULT_TEMPLATE_VERSION, load_template_metadata
 from app.models.build_run import BuildRun, BuildRunStage
-from app.models.configuration_item import ConfigurationItemType
+from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
 from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
 from app.models.task import Task, TaskRecipient, TaskStatus
@@ -22,6 +22,7 @@ from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
+from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import build_run as build_run_service
 from app.services import plan as plan_service
 from app.services import task as task_service
@@ -29,14 +30,14 @@ from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_engineer
 from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_now
 
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
-INPUT_SNAPSHOT_SCHEMA_VERSION = 2
-SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2})
+INPUT_SNAPSHOT_SCHEMA_VERSION = 3
+SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 TOOL_STRATEGY_VERSION = "planned_files_v1"
 
 DEFAULT_CALL_BUDGET: dict[str, int] = {
     "max_model_turns": 40,
     "max_tool_calls": 120,
-    "max_repair_rounds": 8,
+    "max_repair_rounds": 3,
 }
 
 
@@ -64,6 +65,8 @@ def build_frozen_input_snapshot(
     spec: AppSpec,
     design_item_id: str | None,
     system_design: SystemDesign | None,
+    quality_report_item_id: str | None = None,
+    quality_report: TestReport | None = None,
     template_version: str = DEFAULT_TEMPLATE_VERSION,
     base_revision_id: str | None = None,
     call_budget: dict[str, int] | None = None,
@@ -84,6 +87,10 @@ def build_frozen_input_snapshot(
         "design_item_id": design_item_id,
         "system_design": (
             system_design.model_dump(mode="json") if system_design is not None else None
+        ),
+        "quality_report_item_id": quality_report_item_id,
+        "quality_report": (
+            quality_report.model_dump(mode="json") if quality_report is not None else None
         ),
         "base_revision_id": base_revision_id,
         "template_version": template_version,
@@ -147,7 +154,12 @@ def claim_code_engineer_task(
             raise NotFoundException("构建任务不存在")
         build_run_service.require_active_for_stages(
             run,
-            {BuildRunStage.PM, BuildRunStage.ARCHITECT, BuildRunStage.DEVELOPER},
+            {
+                BuildRunStage.PM,
+                BuildRunStage.ARCHITECT,
+                BuildRunStage.DEVELOPER,
+                BuildRunStage.QA,
+            },
         )
         result = db.execute(
             select(Task, Plan)
@@ -170,8 +182,8 @@ def claim_code_engineer_task(
             raise BusinessException("只能领取工程交付任务")
         if task.expected_output_type != ConfigurationItemType.CODE.value:
             raise BusinessException("工程交付任务的预期成果必须是 code")
-        if len(task.input_configuration_item_ids) != 1:
-            raise ConflictException("工程交付任务没有固定唯一的需求输入")
+        if len(task.input_configuration_item_ids) not in {1, 2}:
+            raise ConflictException("工程交付任务必须包含工程来源及可选的质量报告")
         if task.depends_on_task_ids:
             raise ConflictException("工程交付任务不能带依赖链")
 
@@ -180,6 +192,35 @@ def claim_code_engineer_task(
         approved_item_id = source.app_spec_item.item_id
         design_item_id = source.input_item.item_id if source.system_design is not None else None
         spec = source.app_spec
+        quality_report_item_id: str | None = None
+        quality_report: TestReport | None = None
+        if len(task.input_configuration_item_ids) == 2:
+            quality_report_item_id = task.input_configuration_item_ids[1]
+            report_item = db.scalar(
+                select(ConfigurationItem)
+                .where(
+                    ConfigurationItem.item_id == quality_report_item_id,
+                    ConfigurationItem.project_id == project_id,
+                    ConfigurationItem.producer_run_id == run_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                report_item is None
+                or (report_item.semantic_type, report_item.state) != ("test_report", "usable")
+                or len(report_item.upstream_item_ids) != 1
+            ):
+                raise ConflictException("质量修复任务引用了无效的 test_report")
+            try:
+                quality_report = TestReport.model_validate(report_item.payload)
+            except Exception as exc:
+                raise ConflictException("质量修复任务的 test_report 正文无效") from exc
+            if (
+                quality_report.quality_conclusion == QualityConclusion.PASSED
+                or quality_report.code_item_id != report_item.upstream_item_ids[0]
+            ):
+                raise ConflictException("通过的报告或身份不一致的报告不能触发代码修复")
 
         if task.status == TaskStatus.RUNNING.value and plan.status == PlanStatus.RUNNING.value:
             current = latest_execution(db, task_id, lock=True)
@@ -200,6 +241,8 @@ def claim_code_engineer_task(
                     raise ConflictException("获批需求已被替换，不能沿用旧执行")
                 if snapshot.get("design_item_id") != design_item_id:
                     raise ConflictException("冻结系统设计与任务定义不一致")
+                if snapshot.get("quality_report_item_id") != quality_report_item_id:
+                    raise ConflictException("冻结质量报告与任务定义不一致")
                 db.commit()
                 db.refresh(task)
                 db.refresh(current)
@@ -221,6 +264,8 @@ def claim_code_engineer_task(
                 raise ConflictException("获批需求已被替换，不能沿用旧执行")
             if snapshot.get("design_item_id") != design_item_id:
                 raise ConflictException("冻结系统设计与任务定义不一致")
+            if snapshot.get("quality_report_item_id") != quality_report_item_id:
+                raise ConflictException("冻结质量报告与任务定义不一致")
             if current.status == "running":
                 current.status, current.active_slot, current.finished_at = "superseded", None, now
                 db.flush()
@@ -253,6 +298,7 @@ def claim_code_engineer_task(
                 BuildRunStage.PM,
                 BuildRunStage.ARCHITECT,
                 BuildRunStage.DEVELOPER,
+                BuildRunStage.QA,
             },
         )
         plan_service.stage_running(db, plan)
@@ -270,6 +316,8 @@ def claim_code_engineer_task(
             spec=spec,
             design_item_id=design_item_id,
             system_design=source.system_design,
+            quality_report_item_id=quality_report_item_id,
+            quality_report=quality_report,
             template_version=template_version,
         )
         execution = TaskExecution(

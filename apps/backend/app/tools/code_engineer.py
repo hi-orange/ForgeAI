@@ -10,6 +10,7 @@ from app.core.exceptions import BusinessException, ConflictException
 from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
+from app.tools import project_deps
 
 CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
@@ -120,8 +121,41 @@ CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
         },
     ),
     ToolDefinition(
+        name="install_project_dependency",
+        description=(
+            "在 frontend/ 或 backend/ 内用白名单包管理器增删项目依赖"
+            "（npm/pnpm/uv/pip）。禁止 apt 等系统安装；Runtime 基线由平台提供。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "manager": {
+                    "type": "string",
+                    "enum": ["npm", "pnpm", "uv", "pip"],
+                },
+                "action": {"type": "string", "enum": ["add", "remove"]},
+                "packages": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "minItems": 1,
+                    "maxItems": 8,
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["frontend", "backend"],
+                    "description": "npm/pnpm→frontend；uv/pip→backend",
+                },
+            },
+            "required": ["manager", "action", "packages", "target"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
         name="run_check",
-        description="在离线隔离环境中检查数据库迁移、后端启动和前端构建；完成前使用 all。",
+        description=(
+            "在隔离环境中检查数据库迁移、后端启动和前端构建"
+            "（可按生成清单安装依赖）；完成前使用 all。"
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -224,6 +258,15 @@ def execute_tool_call(
             if record_engineering_memory is None:
                 raise BusinessException("当前阶段不能记录工程记忆")
             return record_engineering_memory(args)
+        if call.name == "install_project_dependency":
+            return project_deps.install_project_dependency(
+                workspace_root,
+                manager=str(args.get("manager") or ""),
+                action=str(args.get("action") or ""),
+                packages=args.get("packages"),
+                target=str(args.get("target") or "frontend"),
+                tool_call_id=call.id,
+            )
         if call.name == "run_check":
             return check_tools.run_check(
                 workspace_root,

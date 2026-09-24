@@ -37,6 +37,12 @@ export type EngineeringActivity = {
   label: string
   detail: string
   ok: boolean
+  phase_id?: string
+  phase_label?: string
+  phase_role?: string
+  attempt?: number
+  work_item_id?: string
+  work_item_title?: string
 }
 
 export type RequirementsStatus = {

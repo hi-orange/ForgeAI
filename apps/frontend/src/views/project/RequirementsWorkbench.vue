@@ -20,17 +20,35 @@
 
     <aside v-show="!chatCollapsed" class="chat-pane" aria-label="项目对话">
       <div ref="thread" class="chat-thread">
-        <article
-          v-for="message in messages"
-          :key="message.id"
-          class="message"
-          :class="message.sender"
-        >
-          <div v-if="message.sender !== 'user'" class="agent-meta">
-            <span class="avatar">F</span> Forge
-          </div>
-          <p>{{ message.content }}</p>
-        </article>
+        <template v-for="message in messages" :key="message.id">
+          <details
+            v-if="showApprovedPlan && message.id === status?.message_id"
+            class="approval-panel approved-plan"
+            open
+          >
+            <summary>
+              <span class="approval-title">批准</span>
+              <span class="approval-meta">
+                <span class="approval-count">{{ approvedPlanItems.length }} 项</span>
+                <span class="approval-chevron" aria-hidden="true" />
+              </span>
+            </summary>
+            <p class="plan-hint">以下是本次已批准并用于构建的需求清单。</p>
+            <p v-if="planGoal" class="plan-goal">{{ planGoal }}</p>
+            <div class="plan-list">
+              <div v-for="item in approvedPlanItems" :key="item.id" class="plan-row approved">
+                <span class="plan-check" aria-hidden="true">✓</span>
+                <span>{{ item.label }}</span>
+              </div>
+            </div>
+          </details>
+          <article class="message" :class="message.sender">
+            <div v-if="message.sender !== 'user'" class="agent-meta">
+              <span class="avatar">F</span> Forge
+            </div>
+            <p>{{ message.content }}</p>
+          </article>
+        </template>
         <article v-if="!awaitingIdeaAfterReply" class="agent-message">
           <div class="agent-meta">
             <span class="avatar">F</span><strong>Forge</strong
@@ -56,10 +74,19 @@
             :running="timelineRunning"
             @open-file="openWorkspaceFile"
           />
+          <section v-if="status?.state === 'completed'" class="delivery-summary">
+            <strong>本次构建已完成并通过独立验证</strong>
+            <p>已按批准的需求交付 {{ approvedPlanItems.length }} 项内容，代码结果已冻结。</p>
+            <ul v-if="approvedPlanItems.length">
+              <li v-for="item in approvedPlanItems" :key="'delivered-' + item.id">
+                {{ item.label }}
+              </li>
+            </ul>
+          </section>
         </article>
 
         <details
-          v-if="canApprove || showApprovedPlan"
+          v-if="canApprove"
           class="approval-panel"
           :open="approvalPanelOpen"
           @toggle="onApprovalToggle"
@@ -67,98 +94,79 @@
           <summary>
             <span class="approval-title">批准</span>
             <span class="approval-meta">
-              <span class="approval-count">{{
-                canApprove ? `${checkedPlanCount} 项已选` : `${approvedPlanItems.length} 项`
-              }}</span>
+              <span class="approval-count">{{ checkedPlanCount }} 项已选</span>
               <span class="approval-chevron" aria-hidden="true" />
             </span>
           </summary>
           <p class="plan-hint">
-            {{
-              canApprove
-                ? '请从以下需求中选择希望优先实现的内容（可多选）。也可以编辑或新增。'
-                : '以下是本次已批准并用于构建的需求清单。'
-            }}
+            请从以下需求中选择希望优先实现的内容（可多选）。也可以编辑或新增。
           </p>
-          <label v-if="canApprove && editing" class="goal-label"
+          <label v-if="editing" class="goal-label"
             >应用目标<textarea v-model="planGoal" rows="2" maxlength="2000" :disabled="busy" />
           </label>
           <p v-else-if="planGoal" class="plan-goal">{{ planGoal }}</p>
           <div class="plan-list">
-            <template v-if="canApprove">
-              <div
-                v-for="item in planItems"
-                :key="item.id"
-                class="plan-row"
-                :class="{ unchecked: !item.checked }"
-              >
-                <input
-                  :id="'plan-check-' + item.id"
-                  v-model="item.checked"
-                  type="checkbox"
-                  :disabled="busy"
-                  :aria-label="'选择：' + item.label"
-                />
-                <textarea
-                  v-if="editing"
-                  v-model="item.label"
-                  rows="2"
-                  maxlength="2000"
-                  :aria-label="'编辑需求：' + item.label"
-                  :disabled="busy"
-                />
-                <label v-else :for="'plan-check-' + item.id">{{ item.label }}</label>
-                <label v-if="needsAcceptance(item)" class="acceptance-label">
-                  怎样算完成
-                  <textarea
-                    v-model="item.acceptance"
-                    rows="2"
-                    maxlength="2000"
-                    :disabled="busy"
-                    :aria-label="'验收条件：' + item.label"
-                    placeholder="写下操作和预期结果，例如：游客打开首页，无需登录即可看到公开列表。"
-                  />
-                </label>
-              </div>
-              <p v-if="!planItems.length" class="plan-hint">添加第一项功能，即可批准计划。</p>
-            </template>
-            <template v-else>
-              <div v-for="item in approvedPlanItems" :key="item.id" class="plan-row approved">
-                <span class="plan-check" aria-hidden="true">✓</span>
-                <span>{{ item.label }}</span>
-              </div>
-            </template>
-          </div>
-          <template v-if="canApprove">
-            <form class="add-requirement" @submit.prevent="addRequirement">
+            <div
+              v-for="item in planItems"
+              :key="item.id"
+              class="plan-row"
+              :class="{ unchecked: !item.checked }"
+            >
               <input
-                v-model="newRequirement"
-                aria-label="新增需求"
-                placeholder="＋ 新增一项需求…"
+                :id="'plan-check-' + item.id"
+                v-model="item.checked"
+                type="checkbox"
+                :disabled="busy"
+                :aria-label="'选择：' + item.label"
+              />
+              <textarea
+                v-if="editing"
+                v-model="item.label"
+                rows="2"
                 maxlength="2000"
+                :aria-label="'编辑需求：' + item.label"
                 :disabled="busy"
               />
-              <button
-                type="submit"
-                :disabled="busy || !newRequirement.trim() || featureCount >= 50"
-              >
-                添加
-              </button>
-            </form>
-            <div class="plan-actions">
-              <button type="button" class="secondary" :disabled="busy" @click="editing = !editing">
-                {{ editing ? '完成编辑' : '编辑计划' }}
-              </button>
-              <button
-                type="button"
-                class="primary"
-                :disabled="busy || !selectedCount || !planGoal.trim()"
-                @click="approve"
-              >
-                {{ busy ? '处理中…' : '批准并构建' }}
-              </button>
+              <label v-else :for="'plan-check-' + item.id">{{ item.label }}</label>
+              <label v-if="needsAcceptance(item)" class="acceptance-label">
+                怎样算完成
+                <textarea
+                  v-model="item.acceptance"
+                  rows="2"
+                  maxlength="2000"
+                  :disabled="busy"
+                  :aria-label="'验收条件：' + item.label"
+                  placeholder="写下操作和预期结果，例如：游客打开首页，无需登录即可看到公开列表。"
+                />
+              </label>
             </div>
-          </template>
+            <p v-if="!planItems.length" class="plan-hint">添加第一项功能，即可批准计划。</p>
+          </div>
+          <form class="add-requirement" @submit.prevent="addRequirement">
+            <input
+              v-model="newRequirement"
+              aria-label="新增需求"
+              placeholder="＋ 新增一项需求…"
+              maxlength="2000"
+              :disabled="busy"
+            />
+            <button type="submit" :disabled="busy || !newRequirement.trim() || featureCount >= 50">
+              添加
+            </button>
+          </form>
+          <div class="plan-actions">
+            <button type="button" class="secondary" :disabled="busy" @click="editing = !editing">
+              {{ editing ? '完成编辑' : '编辑计划' }}
+            </button>
+            <button
+              type="button"
+              class="primary"
+              :disabled="busy || !selectedCount || !planGoal.trim()"
+              @click="approve"
+            >
+              {{ busy ? '处理中…' : '批准并构建' }}
+            </button>
+          </div>
         </details>
         <div
           v-if="status?.state === 'needs_user_input' && !status.app_spec?.features.length"
@@ -241,6 +249,7 @@
       />
       <AppPreviewPane
         v-else-if="workspaceView === 'design'"
+        :project-id="projectId"
         :status="status"
         :plan-goal="planGoal"
         :plan-items="planItems"
@@ -268,7 +277,6 @@ import { isNearThreadBottom, isWriteActivity } from './buildTimeline'
 import AppPreviewPane from './components/AppPreviewPane.vue'
 import BuildTimeline from './components/BuildTimeline.vue'
 import ProjectTopbar, { type TopbarModeTab } from './components/ProjectTopbar.vue'
-import WorkbenchIcon from './components/WorkbenchIcon.vue'
 import WorkspaceEditorPane from './components/WorkspaceEditorPane.vue'
 import { useRequirements } from './useRequirements'
 
@@ -381,7 +389,8 @@ const postApproval = computed(
     status.value?.state === 'quality_pending' ||
     status.value?.state === 'quality_running' ||
     status.value?.state === 'completed' ||
-    status.value?.state === 'quality_failed',
+    status.value?.state === 'quality_failed' ||
+    (status.value?.state === 'retry_available' && Boolean(status.value.code_ready)),
 )
 const timelineRunning = computed(
   () =>
@@ -405,21 +414,47 @@ const understandingFirstTurn = computed(
     (status.value?.state === 'not_started' || !status.value) &&
     messages.value.some((message) => message.sender === 'user'),
 )
+const llmRetryTitle = computed(() => {
+  const message = error.value || ''
+  if (message.includes('余额不足')) return '大模型余额不足'
+  if (message.includes('鉴权失败') || message.includes('API_KEY')) return '大模型鉴权失败'
+  if (message.includes('过于频繁')) return '大模型请求受限'
+  if (message.includes('无法连接') || message.includes('超时')) return '模型连接失败'
+  return '大模型暂时不可用'
+})
 const stateLabel = computed(() => {
   if (understandingFirstTurn.value) return '正在理解…'
   if (busy.value) return '正在处理…'
   if (awaitingIdeaAfterReply.value) return '等待你的描述'
-  if (canRetryStart.value) return '模型连接失败'
+  if (canRetryStart.value) return llmRetryTitle.value
   return status.value ? labels[status.value.state] : '正在加载项目…'
 })
 const agentText = computed(() => {
   if (awaitingIdeaAfterReply.value) return ''
   if (understandingFirstTurn.value) return '我在理解你刚才说的话。'
-  if (canRetryStart.value) return '构建还没有开始。恢复网络后，可从原需求继续，不会重复创建任务。'
+  if (canRetryStart.value) {
+    const message = error.value || ''
+    if (message.includes('余额不足')) {
+      return '构建还没有开始。充值后可从原需求继续，不会重复创建任务。'
+    }
+    if (message.includes('鉴权失败') || message.includes('API_KEY')) {
+      return '构建还没有开始。检查密钥配置后可从原需求继续，不会重复创建任务。'
+    }
+    if (message.includes('无法连接') || message.includes('超时')) {
+      return '构建还没有开始。恢复网络后可从原需求继续，不会重复创建任务。'
+    }
+    return '构建还没有开始。恢复后可从原需求继续，不会重复创建任务。'
+  }
   if (canApprove.value) return '我整理了一份初步计划。选择你想要的功能，随时补充自己的想法。'
   if (postApproval.value) {
     if (status.value?.state === 'completed') {
       return '代码已经通过独立验收，当前版本可以使用。'
+    }
+    if (status.value?.state === 'retry_available' && status.value.code_ready) {
+      return (
+        status.value.error ||
+        '业务代码已写入，但独立验收还没有完成。可继续处理，不会丢掉已生成的代码。'
+      )
     }
     if (status.value?.state === 'quality_failed') {
       return status.value.error || '独立验收发现问题，当前版本未标记为可用。'
@@ -446,11 +481,7 @@ const agentText = computed(() => {
         ? '计划已批准。自动分派下一步没有完成，可以继续处理。'
         : '计划已批准，正在启动后续构建。'
     }
-    if (
-      status.value?.state === 'design_pending' ||
-      status.value?.state === 'engineering_pending' ||
-      status.value?.state === 'quality_pending'
-    ) {
+    if (status.value?.state === 'design_pending' || status.value?.state === 'engineering_pending') {
       return '计划已批准，正在开始构建应用。'
     }
     return '计划已批准，正在开始构建应用。'
@@ -723,6 +754,31 @@ summary:focus-visible {
   margin: 0 0 12px 39px;
   line-height: 1.9;
   color: #787b8b;
+}
+.delivery-summary {
+  margin: 14px 0 0 39px;
+  padding: 16px 18px;
+  border: 1px solid #dfe4f4;
+  border-radius: 14px;
+  background: #f8f9fd;
+  color: #52566c;
+  line-height: 1.7;
+  strong {
+    color: #2f3550;
+    font-size: 14px;
+  }
+  p {
+    margin: 6px 0 0;
+    font-size: 13px;
+  }
+  ul {
+    margin: 10px 0 0;
+    padding-left: 18px;
+    font-size: 13px;
+  }
+  li + li {
+    margin-top: 4px;
+  }
 }
 .approval-panel {
   margin: 14px 0;
