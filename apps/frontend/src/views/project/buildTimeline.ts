@@ -1,16 +1,39 @@
 import type { EngineeringActivity } from '@/api/modules/requirements'
 
 const labels: Record<string, string> = {
+  read_artifact: '读取已批准需求',
+  editor_read: '读取必要文件',
+  editor_write: '整理系统设计',
+  terminal_list: '查看项目结构',
+  terminal_run: '检查工程环境',
+  write_system_design: '提交系统设计',
   list_files: '查看目录',
   read_file: '读取文件',
   search_code: '搜索代码',
-  apply_patch: '写入文件',
+  retrieve_code_context: '检索代码上下文',
+  write_new_code: '生成文件',
+  write_file: '写入文件',
+  generate_file: '生成文件',
+  edit_file_by_replace: '修改文件',
+  apply_patch: '写入文件', // 仅用于读取旧 checkpoint。
+  record_engineering_memory: '记录工程约束',
   run_check: '运行检查',
   complete_work_item: '完成当前功能',
   report_blocked: '构建暂停',
   model: '暂时无法继续',
   error: '操作失败',
+  plan_files: '规划文件',
+  plan_ready: '文件计划就绪',
+  check_result: '检查结果',
+  check_environment: '检查环境',
 }
+
+const writeActivities = new Set([
+  'write_new_code',
+  'write_file',
+  'edit_file_by_replace',
+  'apply_patch',
+])
 
 /** Optional presentation fields beyond the API `EngineeringActivity` contract. */
 export type TimelineInput = EngineeringActivity & {
@@ -45,10 +68,16 @@ export function timelineSteps(events: TimelineInput[]): TimelineStep[] {
       label: labels[step.name] || step.label,
       path:
         step.path ||
-        (step.ok && ['read_file', 'apply_patch'].includes(step.name) ? step.detail || null : null),
+        (step.ok && (step.name === 'read_file' || writeActivities.has(step.name))
+          ? step.detail || null
+          : null),
       work_item_title: step.work_item_title || '',
       work_item_id: step.work_item_id || '',
     }))
+}
+
+export function isWriteActivity(name: string) {
+  return writeActivities.has(name)
 }
 
 export type BuildGroup = {

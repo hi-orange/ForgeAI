@@ -31,7 +31,7 @@ function write() {
  source.writtenPath = 'frontend/src/Jobs.vue'
  contents[source.writtenPath] = '<script setup>\\nimport { ref } from "vue"\\nconst jobs = ref([])\\n// 第 ' + source.generation + ' 次真实文件响应\\n</script>\\n<template><main><h1>职位列表</h1></main></template>'
  if (source.generation === 1) activities.push({id:'s2',name:'summary',detail:'接口结构已确认，现在编写职位列表页面。',ok:true,work_item_id:'jobs'})
- activities.push({id:'w'+source.generation,name:'apply_patch',detail:source.writtenPath,ok:true,work_item_id:'jobs'})
+ activities.push({id:'w'+source.generation,name:'write_new_code',detail:source.writtenPath,ok:true,work_item_id:'jobs'})
 }
 createApp({setup:() => () => h('main', {style:'height:100vh;display:grid;grid-template-rows:48px 1fr;grid-template-columns:360px 1fr;background:#f6f6f6;color:#343943;font:13px system-ui'}, [
  h('header',{style:'grid-column:1/-1;display:flex;align-items:center;gap:20px;padding:0 20px'},[h('strong','构建交互验证'), h('button',{onClick:write},'模拟下一次写入')]),

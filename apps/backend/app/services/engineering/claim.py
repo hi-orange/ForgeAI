@@ -31,7 +31,7 @@ from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_n
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
 INPUT_SNAPSHOT_SCHEMA_VERSION = 2
 SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2})
-TOOL_STRATEGY_VERSION = "engineering_tools_v3"
+TOOL_STRATEGY_VERSION = "planned_files_v1"
 
 DEFAULT_CALL_BUDGET: dict[str, int] = {
     "max_model_turns": 40,

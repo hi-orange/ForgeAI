@@ -22,15 +22,90 @@ MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 32 * 1024
 
 
+def check_environment(*, tool_call_id: str = "check_environment") -> ToolExecutionResult:
+    """Verify the isolated check runtime before spending model calls."""
+
+    result = ToolExecutionResult(
+        tool_call_id=tool_call_id,
+        name="check_environment",
+        ok=False,
+        summary="",
+    )
+    binary = shutil.which("docker")
+    if binary is None:
+        return result.model_copy(
+            update={
+                "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
+                "summary": "隔离检查环境未就绪：未找到 Docker，请安装并启动 Docker。",
+            }
+        )
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        daemon = subprocess.run(
+            [binary, "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=flags,
+            check=False,
+        )
+        if daemon.returncode != 0:
+            detail = (daemon.stderr or daemon.stdout).strip()
+            return result.model_copy(
+                update={
+                    "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
+                    "summary": (
+                        "隔离检查环境未就绪：Docker daemon 不可用，请启动 Docker 后继续。"
+                        + (f" {detail[:240]}" if detail else "")
+                    ),
+                }
+            )
+        image = subprocess.run(
+            [binary, "image", "inspect", settings.engineering_check_image],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=flags,
+            check=False,
+        )
+        if image.returncode != 0:
+            return result.model_copy(
+                update={
+                    "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
+                    "summary": (
+                        "隔离检查镜像不存在：请先构建 sandbox/Dockerfile，镜像名为 "
+                        f"{settings.engineering_check_image}。"
+                    ),
+                }
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return result.model_copy(
+            update={
+                "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
+                "summary": f"隔离检查环境探测失败：{str(exc)[:240]}",
+            }
+        )
+    return result.model_copy(
+        update={
+            "ok": True,
+            "summary": "隔离检查环境已就绪",
+            "data": {
+                "image": settings.engineering_check_image,
+                "server_version": daemon.stdout.strip(),
+            },
+        }
+    )
+
+
 def source_snapshot(root: Path) -> tuple[bytes, str]:
     """Export only app sources, never platform markers, secrets, data or symlinks."""
     files: dict[str, str] = {}
     size = 0
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
-        if relative.parts[0] not in {"frontend", "backend"}:
-            continue
         if any(part in SKIP_DIRS for part in relative.parts) or not path.is_file():
+            continue
+        if relative.parts[0] == "forgeai":
             continue
         if not is_text_file(path) or path.name.startswith(".env"):
             continue

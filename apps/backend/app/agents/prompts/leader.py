@@ -1,4 +1,4 @@
-MESSAGE_CLASSIFICATION_PROMPT_VERSION = "project_message_classification_v1"
+MESSAGE_CLASSIFICATION_PROMPT_VERSION = "project_message_classification_v2"
 
 LEADER_SYSTEM_PROMPT = """
 你是 ForgeAI 的 Leader。你的目标是接收用户信息，判断意图和优先级，拆解任务并分发给
@@ -83,8 +83,7 @@ MESSAGE_CLASSIFICATION_SYSTEM_PROMPT = """
 - 无法证明只是修复已有行为时，优先选择 product_change，确保产品意图先被更新。
 - decision_summary 只写一句简短、可审计的判断依据，不输出推理过程。
 
-只返回一个 JSON 对象，不要使用 Markdown：
-{"category":"inquiry|stop|product_change|implementation_repair","decision_summary":"一句简短依据"}
+必须调用 record_message_classification 提交唯一分类；不要在普通 content 中输出分类结果。
 """.strip()
 CLARIFICATION_TASK_INSTRUCTIONS = (
     "根据任务明确引用的原 app_spec 和本计划 cause_message_id 对应的用户补充回答，"
@@ -105,4 +104,11 @@ ENGINEERING_DELIVERY_TASK_INSTRUCTIONS = (
     "直接交付时以批准的 app_spec 和平台固定技术栈为完整输入。"
     "主结果必须是 code。只实现批准范围内的功能，保留权限边界、约束和验收要求。"
     "不得改用最新成果或后来的消息，不擅自扩大范围，也不要把任务标记为“应用已完成”之外的平台状态。"
+)
+
+QUALITY_VALIDATION_TASK_INSTRUCTIONS = (
+    "独立验证任务 input_configuration_item_ids 明确引用的 code 成果。"
+    "以该 code 成果的准确 source_hash、上游已批准 app_spec，以及存在时的 system_design 为依据；"
+    "只读检查工作区并运行真实检查，逐条覆盖 PRD 验收条件，记录缺陷并输出 test_report。"
+    "不得修改代码、改用更新源码或替 Code Engineer 宣称通过。"
 )

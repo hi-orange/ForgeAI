@@ -19,7 +19,7 @@ from app.agents.prompts.product_manager import (
 
 class AgentPromptContractTests(unittest.TestCase):
     def test_product_manager_research_is_optional_and_approval_safe(self):
-        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v2"))
+        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v3"))
         self.assertIn("普通、明确的应用需求不强制联网", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("需由用户勾选、编辑和批准", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("source_ids", APP_SPEC_SYSTEM_PROMPT)

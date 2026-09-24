@@ -17,6 +17,7 @@ APPROVAL_VERSION = "requirements_approval_v1"
 
 ENGINEERING_TASK_KEY = "engineering_delivery"
 ARCHITECTURE_TASK_KEY = "system_design"
+QUALITY_TASK_KEY = "quality_validation"
 
 
 @dataclass(frozen=True, slots=True)

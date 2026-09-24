@@ -11,10 +11,12 @@ from app.services.engineering.claim import (
     read_frozen_input_snapshot,
     template_digest,
 )
+from app.services.engineering.completion import complete_code_engineer_task
 from app.services.engineering.handoff import (
     APPROVAL_VERSION,
     ARCHITECTURE_TASK_KEY,
     ENGINEERING_TASK_KEY,
+    QUALITY_TASK_KEY,
     find_architecture_task,
     find_claimed_engineering_task,
     find_pending_engineering_task,
@@ -33,12 +35,14 @@ __all__ = [
     "ARCHITECTURE_TASK_KEY",
     "DEFAULT_CALL_BUDGET",
     "ENGINEERING_TASK_KEY",
+    "QUALITY_TASK_KEY",
     "INPUT_SNAPSHOT_KIND",
     "INPUT_SNAPSHOT_SCHEMA_VERSION",
     "TOOL_STRATEGY_VERSION",
     "approved_spec_digest",
     "build_frozen_input_snapshot",
     "claim_code_engineer_task",
+    "complete_code_engineer_task",
     "find_architecture_task",
     "find_claimed_engineering_task",
     "find_pending_engineering_task",

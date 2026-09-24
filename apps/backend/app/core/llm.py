@@ -51,7 +51,7 @@ def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
         raise BusinessException("大模型调用失败，请稍后重试") from exc
     except httpx.HTTPError as exc:
         logger.exception("LLM network error")
-        raise BusinessException("无法连接大模型服务") from exc
+        raise BusinessException("无法连接大模型服务，请检查网络或代理设置后重试") from exc
     if not isinstance(data, dict):
         raise BusinessException("大模型返回格式异常")
     return data
@@ -65,19 +65,19 @@ def chat_completion(
     timeout: float = 120.0,
     json_output: bool = False,
 ) -> str:
-    """普通对话补全；json_output 时强制 JSON 并关闭 thinking，返回最终文本。"""
+    """普通对话补全；json_output 时强制 JSON。始终关闭 thinking，避免推理占满输出预算。"""
     body: dict[str, object] = {
         "model": settings.deepseek_model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        # DeepSeek V4 enables thinking by default. File/code generations otherwise
+        # spend the entire max_tokens budget on reasoning and return empty content
+        # with finish_reason="length".
+        "thinking": {"type": "disabled"},
     }
     if json_output:
         body["response_format"] = {"type": "json_object"}
-        # DeepSeek V4 enables thinking by default. Large structured generations can
-        # otherwise spend the entire max_tokens budget on reasoning and return an
-        # empty final content with finish_reason="length".
-        body["thinking"] = {"type": "disabled"}
 
     data = _post_chat(body, timeout=timeout)
 

@@ -10,6 +10,7 @@ from app.tools.files import (
     edit_file_by_replace,
     list_files,
     read_file,
+    read_workspace_source,
     search_code,
 )
 from app.tools.paths import sha256_bytes
@@ -59,6 +60,37 @@ class WorkspaceFileToolTests(unittest.TestCase):
             (self.root / "backend" / "app" / "main.py").read_text(encoding="utf-8"),
             "print('new')\n",
         )
+
+    def test_empty_file_read_succeeds(self):
+        target = self.root / "backend" / "app" / "empty.py"
+        target.write_text("", encoding="utf-8")
+        result = read_file(self.root, path="backend/app/empty.py")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["content"], "")
+        self.assertEqual(result.data["line_count"], 0)
+
+    def test_platform_read_allows_files_beyond_agent_full_read_limit(self):
+        target = self.root / "backend" / "app" / "large_view.py"
+        # Agent full-read fails above 1000 lines / 50KB; platform assembly may still rewrite.
+        payload = "".join(f"line_{index} = {index}\n" for index in range(1200))
+        target.write_text(payload, encoding="utf-8")
+        blocked = read_file(self.root, path="backend/app/large_view.py")
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.error_code, "FILE_TOO_LARGE")
+        full = read_workspace_source(self.root, path="backend/app/large_view.py")
+        self.assertTrue(full.ok)
+        self.assertEqual(full.data["line_count"], 1200)
+        self.assertIn("line_1199", full.data["content"])
+
+    def test_start_beyond_eof_returns_range_invalid(self):
+        result = read_file(
+            self.root,
+            path="backend/app/main.py",
+            start_line=20,
+            end_line=30,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "RANGE_INVALID")
 
     def test_large_file_requires_bounded_range(self):
         target = self.root / "backend" / "app" / "large.py"

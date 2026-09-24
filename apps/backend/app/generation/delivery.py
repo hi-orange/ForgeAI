@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,6 +20,37 @@ class WorkItem(BaseModel):
     deliverables: list[str] = Field(default_factory=list)
     status: str = "pending"
     summary: str | None = None
+
+
+class FileTask(BaseModel):
+    """One ordered source-file change in a platform-driven implementation plan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    path: str = Field(min_length=1, max_length=500)
+    description: str = Field(min_length=1, max_length=2000)
+    context_paths: list[str] = Field(default_factory=list, max_length=12)
+    status: Literal["pending", "completed"] = "pending"
+    content_hash: str | None = None
+
+
+class ImplementationPlan(BaseModel):
+    """Executable file graph for one work item, not a semantic product artifact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_item_id: str
+    summary: str = Field(min_length=1, max_length=2000)
+    files: list[FileTask] = Field(min_length=1, max_length=30)
+
+    def validate_unique_paths(self) -> None:
+        ids = [item.id for item in self.files]
+        if len(ids) != len(set(ids)):
+            raise ConflictException("文件级实施计划包含重复任务 id")
+        paths = [item.path.replace("\\", "/") for item in self.files]
+        if len(paths) != len(set(paths)):
+            raise ConflictException("文件级实施计划包含重复目标路径")
 
 
 def plan_delivery(spec: AppSpec) -> list[WorkItem]:

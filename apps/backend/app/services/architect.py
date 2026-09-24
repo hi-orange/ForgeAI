@@ -19,6 +19,7 @@ from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
+from app.schemas.agent_action import ToolExecutionResult
 from app.schemas.configuration_item import ConfigurationItemRegistration
 from app.schemas.system_design import SystemDesign
 from app.services import build_run as build_run_service
@@ -26,6 +27,16 @@ from app.services import configuration_manager, task_execution
 from app.services import plan as plan_service
 from app.services import task as task_service
 from app.services.engineering.handoff import ARCHITECTURE_TASK_KEY, load_approved_app_spec
+
+_ACTIVITY_LABELS = {
+    "read_artifact": "读取已批准需求",
+    "editor_read": "读取必要文件",
+    "editor_write": "整理系统设计",
+    "terminal_list": "查看项目结构",
+    "terminal_run": "检查工程环境",
+    "write_system_design": "提交系统设计",
+}
+MAX_ARCHITECT_ACTIVITIES = 30
 
 
 def _load_task(
@@ -117,6 +128,36 @@ def claim_architect_task(
     return task, execution
 
 
+def record_architect_activity(
+    db: Session,
+    task_id: str,
+    execution_id: str,
+    observation: ToolExecutionResult,
+) -> None:
+    """Persist compact user-visible progress while preserving the execution fence."""
+
+    execution = task_execution.require_execution(db, task_id, execution_id, lock=True)
+    assert execution is not None
+    draft = dict(execution.draft or {})
+    checkpoint = draft.get("checkpoint")
+    if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "architect_checkpoint":
+        checkpoint = {"kind": "architect_checkpoint", "activity": []}
+    activity = list(checkpoint.get("activity") or [])
+    activity.append(
+        {
+            "id": observation.tool_call_id,
+            "name": observation.name,
+            "label": _ACTIVITY_LABELS.get(observation.name, observation.name),
+            "detail": observation.summary,
+            "ok": observation.ok,
+        }
+    )
+    checkpoint["activity"] = activity[-MAX_ARCHITECT_ACTIVITIES:]
+    draft["checkpoint"] = checkpoint
+    execution.draft = json.loads(json.dumps(draft, ensure_ascii=False))
+    task_execution.renew_execution_lease(db, task_id, execution_id)
+
+
 def complete_architect_task(
     db: Session,
     user: User,
@@ -142,7 +183,11 @@ def complete_architect_task(
         if saved is not None:
             if saved.result_hash != result_hash:
                 raise ConflictException("Architect 任务已登记不同结果，不能覆盖")
-            item = db.get(ConfigurationItem, saved.configuration_item_id)
+            item = db.scalar(
+                select(ConfigurationItem).where(
+                    ConfigurationItem.item_id == saved.configuration_item_id
+                )
+            )
             if item is None:
                 raise ConflictException("Architect 任务产出关联异常")
             db.commit()

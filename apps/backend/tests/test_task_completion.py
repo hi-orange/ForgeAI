@@ -1,5 +1,4 @@
 import importlib.util
-import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,6 +25,7 @@ from app.models.project_message_classification import ProjectMessageClassificati
 from app.models.task import Task
 from app.models.task_result import TaskResult
 from app.models.user import User
+from app.schemas.agent_action import ChatWithToolsResult, ToolCall
 from app.schemas.configuration_item import ConfigurationItemRegistration
 from app.schemas.plan import PlanCreate
 from app.schemas.product_manager import ProductManagerResult
@@ -68,7 +68,19 @@ class TaskCompletionTests(unittest.TestCase):
             "open_questions": [],
         }
         self.chat = self.enterContext(
-            patch.object(product_manager_agent, "chat_completion", return_value=json.dumps(spec))
+            patch.object(
+                product_manager_agent,
+                "chat_with_tools",
+                return_value=ChatWithToolsResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="write-prd",
+                            name="write_prd",
+                            arguments={"prd": spec},
+                        )
+                    ]
+                ),
+            )
         )
         with self.session_factory() as db:
             self.owner = User(username="owner", email="owner@test.com", hashed_password="unused")

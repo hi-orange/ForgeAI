@@ -36,4 +36,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    _set_comment("用户消息的 Manager 分类结果")
+    _set_comment("用户消息的旧版分类结果")

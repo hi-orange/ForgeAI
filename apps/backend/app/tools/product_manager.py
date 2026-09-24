@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -191,7 +190,3 @@ def execute_product_manager_tool(
             ),
             None,
         )
-
-
-def tool_result_message(result: ToolExecutionResult) -> str:
-    return json.dumps(result.model_dump(mode="json"), ensure_ascii=False)[:20_000]

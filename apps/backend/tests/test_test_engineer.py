@@ -12,8 +12,11 @@ from app.core.exceptions import BusinessException
 from app.models.task import TaskRecipient
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
 from app.schemas.system_design import SystemDesign
-from app.schemas.test_report import TestReport
-from app.tools.test_engineer import TestEngineerToolState, execute_test_engineer_tool
+from app.schemas.test_report import TestReport as QualityReport
+from app.tools.test_engineer import (
+    TestEngineerToolState as EngineerToolState,
+)
+from app.tools.test_engineer import execute_test_engineer_tool
 
 SOURCE_HASH = "a" * 64
 
@@ -87,15 +90,15 @@ class TestEngineerTests(unittest.TestCase):
         self.assertNotIn("apply_patch", profile.allowed_tools)
 
     def test_report_cannot_claim_pass_with_defects_or_failed_evidence(self):
-        self.assertEqual(TestReport.model_validate(passed_report()).quality_conclusion, "passed")
+        self.assertEqual(QualityReport.model_validate(passed_report()).quality_conclusion, "passed")
         invalid = passed_report()
         invalid["defects"] = failed_report()["defects"]
         with self.assertRaises(ValidationError):
-            TestReport.model_validate(invalid)
+            QualityReport.model_validate(invalid)
 
     def test_tools_run_real_check_and_submit_exact_code_report(self):
         with TemporaryDirectory(prefix="forgeai-test-engineer-") as directory:
-            state = TestEngineerToolState(
+            state = EngineerToolState(
                 app_spec=valid_spec(),
                 system_design=SystemDesign.model_validate(valid_design()),
                 code_item_id="ci_code",
@@ -137,7 +140,7 @@ class TestEngineerTests(unittest.TestCase):
 
     def test_failed_acceptance_requires_recorded_defect(self):
         with TemporaryDirectory(prefix="forgeai-test-engineer-") as directory:
-            state = TestEngineerToolState(
+            state = EngineerToolState(
                 app_spec=valid_spec(),
                 code_item_id="ci_code",
                 code_source_hash=SOURCE_HASH,
@@ -197,7 +200,7 @@ class TestEngineerTests(unittest.TestCase):
 
     def test_source_mismatch_blocks_check_evidence(self):
         with TemporaryDirectory(prefix="forgeai-test-engineer-") as directory:
-            state = TestEngineerToolState(
+            state = EngineerToolState(
                 app_spec=valid_spec(),
                 code_item_id="ci_code",
                 code_source_hash=SOURCE_HASH,

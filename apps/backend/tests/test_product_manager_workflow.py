@@ -21,7 +21,11 @@ from app.models.task import Task
 from app.models.task_result import TaskResult
 from app.models.user import User
 from app.orchestration import product_manager as product_manager_workflow
+from app.schemas.agent_action import ChatWithToolsResult, ToolCall
+from app.schemas.leader import LeaderIntentDecision, LeaderOutcome
+from app.schemas.plan import PlanCreate
 from app.schemas.product_manager_workflow import ProductManagerWorkflowOutcome
+from app.schemas.task import TaskCreate
 from app.services import leader as leader_service
 from app.services import task as task_service
 from app.services import task_execution
@@ -59,6 +63,18 @@ def valid_spec(*, open_questions: list[str] | None = None) -> dict[str, object]:
         ],
         "open_questions": open_questions or [],
     }
+
+
+def prd_turn(spec: dict[str, object] | None = None) -> ChatWithToolsResult:
+    return ChatWithToolsResult(
+        tool_calls=[
+            ToolCall(
+                id="write-prd",
+                name="write_prd",
+                arguments={"prd": spec or valid_spec()},
+            )
+        ]
+    )
 
 
 def approval_payload(spec: dict[str, object] | None = None, **overrides) -> dict[str, object]:
@@ -110,8 +126,54 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
         self.chat = self.enterContext(
             patch.object(
                 product_manager_agent,
-                "chat_completion",
-                return_value=json.dumps(valid_spec(), ensure_ascii=False),
+                "chat_with_tools",
+                return_value=prd_turn(),
+            )
+        )
+
+        def route_approved(context, *, instruction):
+            del instruction
+            approved_payload = next(
+                task.result["payload"]
+                for plan in reversed(context.plans)
+                for task in plan.tasks
+                if task.result and task.result.get("semantic_type") == "app_spec"
+            )
+            approved_id = next(
+                task.result["configuration_item_id"]
+                for plan in reversed(context.plans)
+                for task in plan.tasks
+                if task.result and task.result.get("payload") == approved_payload
+            )
+            task = TaskCreate(
+                task_key="engineering_delivery",
+                recipient="Code Engineer",
+                title="实现应用",
+                instructions="根据准确的已批准需求完成本轮任务。",
+                expected_output_type="code",
+                input_configuration_item_ids=[approved_id],
+            )
+            return LeaderOutcome(
+                intent=LeaderIntentDecision(
+                    category="product_change",
+                    priority="normal",
+                    summary="已根据批准范围选择下一角色。",
+                ),
+                action="dispatch",
+                summary="已分派下一角色。",
+                plan=PlanCreate(
+                    version=max(plan.version for plan in context.plans) + 1,
+                    cause_message_id=context.target_message.id,
+                    tasks=[task],
+                ),
+                dispatched_task_keys=[task.task_key],
+            )
+
+        self.leader = self.enterContext(
+            patch.object(
+                leader_service.leader_agent,
+                "lead_project_turn",
+                side_effect=route_approved,
             )
         )
         self.engineer = self.enterContext(
@@ -235,9 +297,7 @@ class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
 
     def test_open_questions_still_wait_for_checklist_approval(self):
         questions = ["导出文件需要 CSV 还是 JSON？"]
-        self.chat.return_value = json.dumps(
-            valid_spec(open_questions=questions), ensure_ascii=False
-        )
+        self.chat.return_value = prd_turn(valid_spec(open_questions=questions))
 
         result = self._run()
 

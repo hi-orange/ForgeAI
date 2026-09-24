@@ -1,14 +1,13 @@
-import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from unittest.mock import patch
 
-from pydantic import ValidationError
 from sqlalchemy import event, func, select, update
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
     approval_payload,
+    prd_turn,
     valid_spec,
 )
 
@@ -21,7 +20,6 @@ from app.models.task import Task, TaskRecipient
 from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.schemas.plan import PlanCreate
-from app.schemas.product_manager_workflow import ProductManagerWorkflowResult
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.task import TaskCreate
 from app.services import leader, product_manager
@@ -34,25 +32,6 @@ from app.services.task_execution import utc_now
 
 
 class DesignHandoffTests(ProductManagerWorkflowFixture):
-    def test_response_requires_paired_design_identifiers_and_resolved_questions(self):
-        result = self._run().model_dump()
-        result.update(
-            {
-                "outcome": "ready_for_design",
-                "design_plan_id": "plan-design",
-                "design_task_id": "task-design",
-                "open_questions": [],
-            }
-        )
-        for overrides in (
-            {"design_task_id": None},
-            {"design_plan_id": None},
-            {"open_questions": ["还没回答"]},
-            {"outcome": "needs_user_input"},
-        ):
-            with self.subTest(overrides=overrides), self.assertRaises(ValidationError):
-                ProductManagerWorkflowResult.model_validate({**result, **overrides})
-
     def test_unfinished_source_task_is_not_accepted_even_if_a_result_exists(self):
         item = self._publish_only()
         with self.session_factory() as db:
@@ -65,7 +44,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
 
     def _publish_only(self, questions=None):
         _, task = self._create_plan()
-        self.chat.return_value = json.dumps(valid_spec(open_questions=questions))
+        self.chat.return_value = prd_turn(valid_spec(open_questions=questions))
         with self.session_factory() as db:
             task_service.claim_product_manager_task(
                 db,
@@ -105,7 +84,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
             # Manual handoff tests now pass through the same approval boundary as
             # the HTTP endpoint. Question-bearing specs remain unapproved so the
             # rejection tests continue to exercise that guard.
-            item = db.get(ConfigurationItem, item_id)
+            item = db.scalar(select(ConfigurationItem).where(ConfigurationItem.item_id == item_id))
             if item is not None:
                 spec = item.payload
                 result = db.scalar(
@@ -123,7 +102,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
                         RequirementsApproval.model_validate(
                             approval_payload(
                                 spec,
-                                client_message_id=f"test-approval-{item_id}",
+                                client_message_id=f"test-approval-{item.id}",
                             )
                         ),
                     )
@@ -188,10 +167,8 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
         self.assertEqual(progress.app_spec.model_dump(), valid_spec())
 
     def test_questions_never_create_a_design_plan(self):
-        self.chat.return_value = json.dumps(valid_spec(open_questions=["导出格式？"]))
+        self.chat.return_value = prd_turn(valid_spec(open_questions=["导出格式？"]))
         result = self._run()
-        self.assertIsNone(result.design_task_id)
-        self.assertIsNone(result.design_plan_id)
         with self.assertRaisesRegex(ConflictException, "待确认问题"):
             self._assign(result.configuration_item_id)
         self.assertEqual(self._count(Plan), 1)
@@ -213,7 +190,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
         self.assertEqual(self._assign(item.item_id).task_id, ids[0])
         result = self._run()
         # Product Manager only reports its result; Leader owns downstream dispatch.
-        self.assertIsNone(result.design_task_id)
+        self.assertEqual(result.outcome, "ready_for_delivery")
         self.assertEqual(self._count(Plan), 2)
         self.assertEqual(self._count(Task), 2)
         self.chat.assert_called_once()
@@ -364,7 +341,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
         self.assertEqual(self._count(Plan), 1)
         self.assertEqual(self._count(Task), 1)
         self.assertEqual(self._count(ConfigurationItem), 1)
-        self.assertEqual(self._status().state, "ready_for_design")
+        self.assertEqual(self._status().state, "ready_for_delivery")
         self._assign(item.item_id)
 
     def test_handoff_failure_retries_only_dispatch_not_product_manager(self):
@@ -377,7 +354,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
             with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
                 self._assign(item.item_id)
         progress = self._status()
-        self.assertEqual(progress.state, "ready_for_design")
+        self.assertEqual(progress.state, "ready_for_delivery")
         self.assertEqual(self._count(TaskResult), 1)
         result = self._assign(item.item_id)
         self.assertEqual(result.input_configuration_item_ids, [item.item_id])
@@ -387,7 +364,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
     def test_reading_legacy_ready_requirements_does_not_dispatch(self):
         self._publish_only()
         for _ in range(2):
-            self.assertEqual(self._status().state, "ready_for_design")
+            self.assertEqual(self._status().state, "ready_for_delivery")
         self.assertEqual(self._count(Plan), 1)
         self.chat.assert_called_once()
 
@@ -411,7 +388,7 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
 
     def test_approval_keeps_selected_ids_and_drops_deselected_features(self):
         _, task = self._create_plan()
-        self.chat.return_value = json.dumps(valid_spec())
+        self.chat.return_value = prd_turn(valid_spec())
         with self.session_factory() as db:
             task_service.claim_product_manager_task(
                 db, self.owner, self.project.id, self.run.run_id, task.task_id

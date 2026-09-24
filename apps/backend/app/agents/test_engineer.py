@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from app.agents.prompts.test_engineer import TEST_ENGINEER_SYSTEM_PROMPT
 from app.agents.roles import get_role_profile
-from app.agents.tool_protocol import append_tool_exchange, require_single_tool_call
+from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_with_tools
 from app.models.task import TaskRecipient
@@ -36,13 +36,14 @@ def verify_code(
     code_item_id: str,
     code_source_hash: str,
     workspace_root: Path,
-    system_design: SystemDesign,
+    system_design: SystemDesign | None,
 ) -> TestReport:
     """Verify one frozen code identity; persistence remains the caller's responsibility."""
 
     try:
         spec = AppSpec.model_validate(spec.model_dump())
-        system_design = SystemDesign.model_validate(system_design.model_dump())
+        if system_design is not None:
+            system_design = SystemDesign.model_validate(system_design.model_dump())
     except ValidationError as exc:
         raise BusinessException("Test Engineer 的 PRD 或系统设计输入不符合要求") from exc
     root = workspace_root.resolve()
@@ -71,32 +72,22 @@ def verify_code(
                     "code_item_id": code_item_id,
                     "source_hash": code_source_hash,
                     "acceptance_ids": [item.id for item in spec.acceptance_criteria],
-                    "has_system_design": True,
+                    "has_system_design": system_design is not None,
                 },
                 ensure_ascii=False,
             ),
         },
     ]
-    for _turn in range(MAX_TEST_ENGINEER_TOOL_TURNS):
-        result = chat_with_tools(
-            messages=list(messages),
-            tools=ALLOWED_TEST_ENGINEER_TOOLS,
-            temperature=0.0,
-            max_tokens=8192,
-        )
-        call = require_single_tool_call(
-            result,
-            role_name="Test Engineer",
-            allowed_tools=TEST_ENGINEER_PROFILE.allowed_tools,
-            missing_message="Test Engineer 未调用工具验证或提交报告",
-        )
-        observation, report = execute_test_engineer_tool(call, state)
-        if report is not None:
-            return report
-        append_tool_exchange(
-            messages,
-            result=result,
-            call=call,
-            observation=observation,
-        )
-    raise BusinessException("Test Engineer 工具调用预算已用尽，尚未提交测试报告")
+    return run_bounded_tool_loop(
+        messages=messages,
+        tools=ALLOWED_TEST_ENGINEER_TOOLS,
+        allowed_tools=TEST_ENGINEER_PROFILE.allowed_tools,
+        role_name="Test Engineer",
+        max_turns=MAX_TEST_ENGINEER_TOOL_TURNS,
+        temperature=0.0,
+        max_tokens=8192,
+        missing_message="Test Engineer 未调用工具验证或提交报告",
+        exhausted_message="Test Engineer 工具调用预算已用尽，尚未提交测试报告",
+        execute_tool=lambda call: execute_test_engineer_tool(call, state),
+        model_call=chat_with_tools,
+    )

@@ -1,4 +1,4 @@
-APP_SPEC_PROMPT_VERSION = "product_manager_prd_tools_v2"
+APP_SPEC_PROMPT_VERSION = "product_manager_prd_tools_v3"
 
 APP_SPEC_SYSTEM_PROMPT = """
 你是 ForgeAI 的 Product Manager。你的目标是产出可审批 PRD；当用户明确要求，或产品判断确实

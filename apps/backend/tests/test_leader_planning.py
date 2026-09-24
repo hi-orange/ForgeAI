@@ -51,7 +51,7 @@ class LeaderPlanningTests(unittest.TestCase):
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.llm = self.enterContext(
             patch(
-                "app.agents.leader.chat_completion",
+                "app.agents.leader.chat_with_tools",
                 side_effect=AssertionError("创建初始计划不应调用模型"),
             )
         )

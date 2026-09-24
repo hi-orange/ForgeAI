@@ -76,7 +76,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useWorkspaceSource } from '../useWorkspaceSource'
 import WorkbenchIcon from './WorkbenchIcon.vue'
 
@@ -98,6 +98,17 @@ defineEmits<{ download: [] }>()
 
 const query = ref('')
 const expanded = ref(new Set<string>(['frontend', 'backend', 'frontend/src', 'backend/app']))
+
+function expandAncestors(path: string) {
+  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
+  const next = new Set(expanded.value)
+  let prefix = ''
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    prefix = prefix ? `${prefix}/${parts[index]}` : parts[index]!
+    next.add(prefix)
+  }
+  expanded.value = next
+}
 const {
   files,
   selectedPath,
@@ -110,6 +121,14 @@ const {
   selectFile,
   followWrites,
 } = useWorkspaceSource(props)
+
+watch(
+  () => props.writtenPath,
+  (path) => {
+    if (path) expandAncestors(path)
+  },
+  { immediate: true },
+)
 
 const selectedName = computed(() => selectedPath.value?.split('/').at(-1) ?? '')
 const lineCount = computed(() => Math.max(1, (fileContent.value ?? '').split('\n').length))

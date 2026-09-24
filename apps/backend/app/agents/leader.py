@@ -10,15 +10,17 @@ from app.agents.prompts.leader import (
     MESSAGE_CLASSIFICATION_SYSTEM_PROMPT,
 )
 from app.agents.roles import LEADER_PROFILE
-from app.agents.tool_protocol import append_tool_exchange, require_single_tool_call
+from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
-from app.core.llm import chat_completion, chat_with_tools
+from app.core.llm import chat_with_tools
 from app.schemas.leader import LeaderContext, LeaderOutcome
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
 from app.tools.leader import (
     LEADER_TOOLS,
+    MESSAGE_CLASSIFICATION_TOOL,
     LeaderToolState,
     execute_leader_tool,
+    execute_message_classification_tool,
 )
 
 MAX_LEADER_TOOL_TURNS = 12
@@ -31,31 +33,6 @@ class ProjectMessageContext(TypedDict):
     sequence: int
     sender: str
     content: str
-
-
-def _remove_json_fence(value: str) -> str:
-    """去掉模型偶发包上的 ```json ... ``` 围栏，便于解析。"""
-
-    stripped = value.strip()
-    if not stripped.startswith("```"):
-        return stripped
-
-    lines = stripped.splitlines()
-    if lines:
-        lines = lines[1:]
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
-
-
-def _parse_decision(raw: str) -> ProjectMessageClassificationDecision:
-    """把模型原文校验成固定决策结构；格式不对则视为业务失败。"""
-
-    try:
-        payload = json.loads(_remove_json_fence(raw))
-        return ProjectMessageClassificationDecision.model_validate(payload)
-    except (json.JSONDecodeError, TypeError, ValidationError) as exc:
-        raise BusinessException("Leader 消息分类返回格式异常") from exc
 
 
 def classify_message(
@@ -78,8 +55,7 @@ def classify_message(
             "content": message_content,
         },
     }
-    # temperature=0 降低分类抖动；json_output 要求模型只回 JSON。
-    raw = chat_completion(
+    return run_bounded_tool_loop(
         messages=[
             {"role": "system", "content": MESSAGE_CLASSIFICATION_SYSTEM_PROMPT},
             {
@@ -87,14 +63,20 @@ def classify_message(
                 "content": json.dumps(classification_input, ensure_ascii=False),
             },
         ],
+        tools=[MESSAGE_CLASSIFICATION_TOOL],
+        allowed_tools={MESSAGE_CLASSIFICATION_TOOL.name},
+        role_name="Leader",
+        max_turns=1,
         temperature=0.0,
         max_tokens=256,
-        json_output=True,
+        missing_message="Leader 未调用工具提交消息分类",
+        exhausted_message="Leader 未能提交消息分类",
+        execute_tool=execute_message_classification_tool,
+        model_call=chat_with_tools,
     )
-    return _parse_decision(raw)
 
 
-def _leadership_messages(context: LeaderContext) -> list[dict[str, Any]]:
+def _leadership_messages(context: LeaderContext, instruction: str) -> list[dict[str, Any]]:
     return [
         {
             "role": "system",
@@ -107,7 +89,7 @@ def _leadership_messages(context: LeaderContext) -> list[dict[str, Any]]:
                     "project_id": context.project_id,
                     "run_id": context.run_id,
                     "target_message_id": context.target_message.id,
-                    "instruction": "先读取冻结上下文，再管理本轮计划和分派。",
+                    "instruction": instruction,
                 },
                 ensure_ascii=False,
             ),
@@ -115,7 +97,11 @@ def _leadership_messages(context: LeaderContext) -> list[dict[str, Any]]:
     ]
 
 
-def lead_project_turn(context: LeaderContext) -> LeaderOutcome:
+def lead_project_turn(
+    context: LeaderContext,
+    *,
+    instruction: str = "先读取冻结上下文，再管理本轮计划和分派。",
+) -> LeaderOutcome:
     """Run one bounded management turn; callers persist validated plan/outcome separately."""
 
     try:
@@ -123,27 +109,16 @@ def lead_project_turn(context: LeaderContext) -> LeaderOutcome:
     except ValidationError as exc:
         raise BusinessException("Leader 项目上下文不符合要求") from exc
     state = LeaderToolState(context=context)
-    messages = _leadership_messages(context)
-    for _turn in range(MAX_LEADER_TOOL_TURNS):
-        result = chat_with_tools(
-            messages=list(messages),
-            tools=ALLOWED_LEADER_TOOLS,
-            temperature=0.0,
-            max_tokens=8192,
-        )
-        call = require_single_tool_call(
-            result,
-            role_name="Leader",
-            allowed_tools=LEADER_PROFILE.allowed_tools,
-            missing_message="Leader 未调用工具更新计划或结束本轮",
-        )
-        observation, outcome = execute_leader_tool(call, state)
-        if outcome is not None:
-            return outcome
-        append_tool_exchange(
-            messages,
-            result=result,
-            call=call,
-            observation=observation,
-        )
-    raise BusinessException("Leader 工具调用预算已用尽，尚未结束本轮管理")
+    return run_bounded_tool_loop(
+        messages=_leadership_messages(context, instruction),
+        tools=ALLOWED_LEADER_TOOLS,
+        allowed_tools=LEADER_PROFILE.allowed_tools,
+        role_name="Leader",
+        max_turns=MAX_LEADER_TOOL_TURNS,
+        temperature=0.0,
+        max_tokens=8192,
+        missing_message="Leader 未调用工具更新计划或结束本轮",
+        exhausted_message="Leader 工具调用预算已用尽，尚未结束本轮管理",
+        execute_tool=lambda call: execute_leader_tool(call, state),
+        model_call=chat_with_tools,
+    )

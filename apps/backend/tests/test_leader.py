@@ -323,19 +323,49 @@ class LeaderTests(unittest.TestCase):
             with self.assertRaisesRegex(BusinessException, "无权使用工具"):
                 leader_agent.lead_project_turn(leader_context())
 
-    def test_agent_rejects_parallel_tool_calls(self):
-        with patch.object(
-            leader_agent,
-            "chat_with_tools",
-            return_value=ChatWithToolsResult(
+    def test_agent_defers_extra_parallel_tool_calls(self):
+        turns = [
+            ChatWithToolsResult(
                 tool_calls=[
                     ToolCall(id="context", name="read_project_context", arguments={}),
                     ToolCall(id="plan", name="read_plan", arguments={}),
                 ]
             ),
-        ):
-            with self.assertRaisesRegex(BusinessException, "每轮只能调用一个工具"):
-                leader_agent.lead_project_turn(leader_context())
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(id="intent", name="classify_intent", arguments={"intent": intent()})
+                ]
+            ),
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(id="create", name="create_plan", arguments={"plan": product_plan()})
+                ]
+            ),
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(
+                        id="dispatch", name="dispatch_task", arguments={"task_key": "requirements"}
+                    )
+                ]
+            ),
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish_turn",
+                        arguments={"action": "dispatch", "summary": "开始需求整理。"},
+                    )
+                ]
+            ),
+        ]
+        with patch.object(leader_agent, "chat_with_tools", side_effect=turns) as chat:
+            outcome = leader_agent.lead_project_turn(leader_context())
+        self.assertEqual(outcome.action, "dispatch")
+        second_turn_history = chat.call_args_list[1].kwargs["messages"]
+        self.assertEqual(
+            [message["role"] for message in second_turn_history],
+            ["system", "user", "assistant", "tool", "tool"],
+        )
 
 
 if __name__ == "__main__":

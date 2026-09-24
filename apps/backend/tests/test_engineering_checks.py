@@ -12,7 +12,13 @@ from unittest.mock import patch
 from app.core.exceptions import ConflictException
 from app.generation.lock import workspace_lock
 from app.generation.workspace import create_workspace
-from app.tools.checks import _execute, docker_command, run_check, source_snapshot
+from app.tools.checks import (
+    _execute,
+    check_environment,
+    docker_command,
+    run_check,
+    source_snapshot,
+)
 
 
 class EngineeringCheckTests(unittest.TestCase):
@@ -29,6 +35,9 @@ class EngineeringCheckTests(unittest.TestCase):
         self.assertNotIn("backend/.env", files)
         self.assertNotIn("backend/data/private.json", files)
         self.assertIn("backend/alembic/env.py", files)
+        self.assertIn("template.json", files)
+        (self.root / "build.config.json").write_text('{"target":"app"}', encoding="utf-8")
+        self.assertIn("build.config.json", json.loads(source_snapshot(self.root)[0]))
         (self.root / "frontend/src/App.vue").write_text("changed", encoding="utf-8")
         self.assertNotEqual(source_snapshot(self.root)[1], before)
 
@@ -53,6 +62,37 @@ class EngineeringCheckTests(unittest.TestCase):
             result = run_check(self.root, check_id="all")
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "CHECK_ENVIRONMENT_UNAVAILABLE")
+
+    def test_environment_preflight_requires_daemon_and_pinned_image(self):
+        daemon = subprocess.CompletedProcess(
+            args=["docker", "info"], returncode=0, stdout="27.5.1\n", stderr=""
+        )
+        image = subprocess.CompletedProcess(
+            args=["docker", "image", "inspect"], returncode=0, stdout="[]", stderr=""
+        )
+        with (
+            patch("app.tools.checks.shutil.which", return_value="docker"),
+            patch("app.tools.checks.subprocess.run", side_effect=[daemon, image]) as run,
+        ):
+            result = check_environment()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["server_version"], "27.5.1")
+        self.assertEqual(run.call_args_list[0].args[0][0:2], ["docker", "info"])
+        self.assertEqual(run.call_args_list[1].args[0][0:3], ["docker", "image", "inspect"])
+
+    def test_environment_preflight_stops_when_daemon_is_unavailable(self):
+        daemon = subprocess.CompletedProcess(
+            args=["docker", "info"], returncode=1, stdout="", stderr="daemon unavailable"
+        )
+        with (
+            patch("app.tools.checks.shutil.which", return_value="docker"),
+            patch("app.tools.checks.subprocess.run", return_value=daemon) as run,
+        ):
+            result = check_environment()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "CHECK_ENVIRONMENT_UNAVAILABLE")
+        self.assertIn("Docker daemon", result.summary)
+        run.assert_called_once()
 
     def test_unknown_check_never_launches_process(self):
         with patch("app.tools.checks._execute") as execute:

@@ -1,7 +1,7 @@
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 WorkflowId = Annotated[
     str,
@@ -14,7 +14,7 @@ class ProductManagerWorkflowOutcome(StrEnum):
 
     NEEDS_USER_INPUT = "needs_user_input"
     AWAITING_APPROVAL = "awaiting_approval"
-    READY_FOR_DESIGN = "ready_for_design"
+    READY_FOR_DELIVERY = "ready_for_delivery"
 
 
 class ProductManagerWorkflowInput(BaseModel):
@@ -42,15 +42,3 @@ class ProductManagerWorkflowResult(BaseModel):
     configuration_item_id: WorkflowId
     outcome: ProductManagerWorkflowOutcome = Field(strict=False)
     open_questions: list[str] = Field(max_length=50)
-    design_plan_id: WorkflowId | None = None
-    design_task_id: WorkflowId | None = None
-
-    @model_validator(mode="after")
-    def validate_design_assignment(self) -> Self:
-        if (self.design_plan_id is None) != (self.design_task_id is None):
-            raise ValueError("设计计划和任务编号必须同时提供")
-        if self.design_task_id is not None and (
-            self.outcome != ProductManagerWorkflowOutcome.READY_FOR_DESIGN or self.open_questions
-        ):
-            raise ValueError("有待确认问题的需求不能携带设计派工结果")
-        return self
