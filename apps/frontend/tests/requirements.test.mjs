@@ -27,7 +27,7 @@ test('presentation groups repeated model calls into one tool card and keeps stag
     detail: '接口已确认，现在编写列表页面',
     ok: true,
   })
-  activities.push({ id: 'write', name: 'apply_patch', detail: 'frontend/src/App.vue', ok: true })
+  activities.push({ id: 'write', name: 'write_new_code', detail: 'frontend/src/App.vue', ok: true })
   groups = buildGroups(activities)
   assert.equal(groups.length, 2)
   assert.equal(groups[1].title, '接口已确认，现在编写列表页面')
@@ -291,11 +291,11 @@ async function fixture(state = progress()) {
         content,
         client_message_id: `key-${sequence}`,
       })
-      state = progress('ready_for_design', { message_id: sequence })
+      state = progress('ready_for_delivery', { message_id: sequence })
       return structuredClone(state)
     }),
     startRequirements: mock.fn(async () => {
-      state = progress('ready_for_design', { message_id: messages[0]?.id ?? 1 })
+      state = progress('ready_for_delivery', { message_id: messages[0]?.id ?? 1 })
       return structuredClone(state)
     }),
     continueRequirements: mock.fn(async () => {
@@ -304,13 +304,11 @@ async function fixture(state = progress()) {
           activities: [{ id: 'start', name: 'start' }],
           result: state.result,
         })
-      } else if (state.state === 'ready_for_design') {
+      } else if (state.state === 'ready_for_delivery') {
         state = progress('design_pending', {
           message_id: state.message_id,
           result: {
             configuration_item_id: 'ci-1',
-            design_plan_id: 'plan-design',
-            design_task_id: 'task-design',
             open_questions: [],
           },
         })
@@ -397,6 +395,29 @@ test('mount starts from the stored home message without posting a duplicate', as
   f.unmount()
 })
 
+test('failed initial model connection can retry the stored message without posting a duplicate', async () => {
+  const f = await fixture(progress('not_started', { run_id: null }))
+  f.messages.push({
+    id: 1,
+    sequence: 1,
+    sender: 'user',
+    content: '做一个读书记录应用',
+    client_message_id: 'project:7:initial',
+  })
+  f.api.startRequirements.mock.mockImplementationOnce(async () => {
+    throw new Error('无法连接大模型服务，请检查网络或代理设置后重试')
+  })
+  await f.mount()
+  assert.equal(f.view.canRetryStart.value, true)
+  assert.equal(f.view.error.value, '无法连接大模型服务，请检查网络或代理设置后重试')
+  await f.view.retryStart()
+  assert.equal(f.api.startRequirements.mock.callCount(), 2)
+  assert.equal(f.api.submitRequirements.mock.callCount(), 0)
+  assert.equal(f.view.error.value, '')
+  assert.equal(f.view.canRetryStart.value, false)
+  f.unmount()
+})
+
 test('messages paginate and a refreshed waiting round binds the exact item', async () => {
   const f = await fixture(progress('needs_user_input'))
   for (let index = 0; index < 200; index++) {
@@ -411,7 +432,7 @@ test('messages paginate and a refreshed waiting round binds the exact item', asy
     7,
     'CSV',
   ])
-  assert.equal(f.view.status.value.state, 'ready_for_design')
+  assert.equal(f.view.status.value.state, 'ready_for_delivery')
   f.unmount()
 })
 
@@ -420,8 +441,8 @@ test('double submit calls the submit endpoint only once', async () => {
   const gate = deferred()
   f.api.submitRequirements.mock.mockImplementation(async () => {
     await gate.promise
-    f.setState(progress('ready_for_design'))
-    return progress('ready_for_design')
+    f.setState(progress('ready_for_delivery'))
+    return progress('ready_for_delivery')
   })
   await f.mount()
   f.view.text.value = 'CSV'
@@ -518,8 +539,8 @@ test('an older polling response cannot overwrite the final result', async () => 
     reading = deferred()
   f.api.submitRequirements.mock.mockImplementation(async () => {
     await work.promise
-    f.setState(progress('ready_for_design'))
-    return progress('ready_for_design')
+    f.setState(progress('ready_for_delivery'))
+    return progress('ready_for_delivery')
   })
   f.view.text.value = 'CSV'
   const submission = f.view.submit()
@@ -528,7 +549,7 @@ test('an older polling response cannot overwrite the final result', async () => 
   work.resolve()
   reading.resolve(progress('running'))
   await Promise.all([submission, poll])
-  assert.equal(f.view.status.value.state, 'ready_for_design')
+  assert.equal(f.view.status.value.state, 'ready_for_delivery')
   assert.equal(f.timers.size, 0)
   f.unmount()
 })
@@ -541,47 +562,37 @@ test('unmount cancels polling and ignores late read results', async () => {
   f.api.getRequirements.mock.mockImplementationOnce(() => reading.promise)
   const poll = f.view.refresh()
   f.unmount()
-  reading.resolve(progress('ready_for_design'))
+  reading.resolve(progress('ready_for_delivery'))
   await poll
   assert.equal(f.view.status.value.state, 'running')
   assert.equal(f.timers.size, 0)
 })
 
-test('ready requirements resume through continue without posting a new message', async () => {
-  const f = await fixture(progress('ready_for_design', { message_id: 45 }))
+test('ready requirements automatically dispatch and start without posting a new message', async () => {
+  const f = await fixture(progress('ready_for_delivery', { message_id: 45 }))
   await f.mount()
-  assert.equal(f.view.canResume.value, true)
-  assert.equal(f.api.continueRequirements.mock.callCount(), 0)
-  await f.view.resume()
-  assert.equal(f.api.continueRequirements.mock.callCount(), 1)
+  assert.equal(f.view.canResume.value, false)
+  assert.equal(f.api.continueRequirements.mock.callCount(), 2)
   assert.equal(f.api.submitRequirements.mock.callCount(), 0)
-  assert.equal(f.view.status.value.state, 'design_pending')
-  assert.equal(f.view.canResume.value, true)
+  assert.equal(f.view.status.value.state, 'engineering_running')
   f.unmount()
 })
 
-test('refreshing a design assignment is read-only and explicit continuation starts engineering', async () => {
+test('mounting a pending design assignment automatically starts engineering', async () => {
   const f = await fixture(
     progress('design_pending', {
+      task_id: 'task-design',
       result: {
         configuration_item_id: 'ci-pinned',
-        design_plan_id: 'plan-design',
-        design_task_id: 'task-design',
         open_questions: [],
       },
     }),
   )
   await f.mount()
-  await f.view.refresh()
-  assert.equal(f.view.status.value.result.configuration_item_id, 'ci-pinned')
-  assert.equal(f.view.status.value.result.design_task_id, 'task-design')
   assert.equal(f.view.canWrite.value, false)
-  assert.equal(f.view.canResume.value, true)
-  assert.equal(f.api.continueRequirements.mock.callCount(), 0)
-  assert.equal(f.timers.size, 0)
-  await f.view.resume()
   assert.equal(f.api.continueRequirements.mock.callCount(), 1)
   assert.equal(f.view.status.value.state, 'engineering_running')
+  assert.equal(f.view.canResume.value, false)
   assert.equal(f.timers.size, 1)
   f.unmount()
 })
@@ -654,7 +665,7 @@ test('timeline merges starts and results in operation order without losing failu
     {
       id: '6',
       operation_id: 'write',
-      name: 'apply_patch',
+      name: 'edit_file_by_replace',
       status: 'running',
       ok: true,
       path: 'models.py',
@@ -670,14 +681,13 @@ test('timeline merges starts and results in operation order without losing failu
 })
 
 test('a failed dispatch retry keeps the continuation button available', async () => {
-  const f = await fixture(progress('ready_for_design'))
-  await f.mount()
+  const f = await fixture(progress('ready_for_delivery'))
   f.api.continueRequirements.mock.mockImplementation(async () => {
     throw new Error('派工失败')
   })
-  await f.view.resume()
+  await f.mount()
   assert.equal(f.view.canResume.value, true)
-  assert.equal(f.view.status.value.state, 'ready_for_design')
+  assert.equal(f.view.status.value.state, 'ready_for_delivery')
   assert.equal(f.view.error.value, '派工失败')
   assert.equal(f.api.submitRequirements.mock.callCount(), 0)
   f.unmount()

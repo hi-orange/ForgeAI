@@ -22,7 +22,7 @@
             :class="{ failed: !step.ok }"
           >
             <span class="tool-icon" aria-hidden="true">{{
-              step.ok ? (step.name === 'apply_patch' ? '✎' : '▤') : '!'
+              step.ok ? (isWriteActivity(step.name) ? '✎' : '▤') : '!'
             }}</span>
             <span>{{ step.label }}</span>
             <button
@@ -64,7 +64,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { EngineeringActivity } from '@/api/modules/requirements'
-import { buildGroups, timelineSteps, type BuildGroup } from '../buildTimeline'
+import { buildGroups, isWriteActivity, timelineSteps, type BuildGroup } from '../buildTimeline'
 
 const props = defineProps<{ activities: EngineeringActivity[]; running: boolean }>()
 defineEmits<{ 'open-file': [path: string] }>()

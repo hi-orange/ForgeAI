@@ -42,7 +42,16 @@ def run_architecture_task(
         _, _, _, spec = load_approved_app_spec(reader, project_id, run_id, app_spec_item_id)
     workspace_root = default_workspace_path(settings.runtime_data_root, project_id, run_id)
     try:
-        design = generate_system_design(spec=spec, workspace_root=workspace_root)
+        design = generate_system_design(
+            spec=spec,
+            workspace_root=workspace_root,
+            on_activity=lambda observation: architect_service.record_architect_activity(
+                db,
+                task_id,
+                execution.execution_id,
+                observation,
+            ),
+        )
         design_item = architect_service.complete_architect_task(
             db,
             user,
@@ -52,12 +61,12 @@ def run_architecture_task(
             execution.execution_id,
             design,
         )
-    except Exception:
+    except Exception as exc:
         fail_execution(
             db,
             task_id,
             execution.execution_id,
-            error="Architect 执行失败，可重试恢复。",
+            error=f"Architect 暂停：{str(exc)[:450]}",
         )
         raise
 

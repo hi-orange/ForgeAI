@@ -12,6 +12,7 @@ from sqlalchemy import func, null, select, update
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
     approval_payload,
+    prd_turn,
     valid_spec,
 )
 
@@ -24,6 +25,7 @@ from app.models.project_message import ProjectMessage
 from app.models.task_artifact import TaskArtifact
 from app.models.task_execution import TaskExecution
 from app.schemas.app_spec import AppSpec
+from app.schemas.leader import LeaderIntentDecision, LeaderOutcome
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import RequirementsApproval
@@ -157,6 +159,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
                 approved_id,
             )
             self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
+            self.leader.assert_called_once()
 
     def test_migration_repairs_plan_when_all_tasks_already_succeeded(self):
         result = self._run()
@@ -205,7 +208,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             ],
             "open_questions": [],
         }
-        self.chat.return_value = json.dumps(simple)
+        self.chat.return_value = prd_turn(simple)
         proposal = self._run()
         approved_id = self._approve(proposal, approval_payload(simple))
         with self.session_factory() as db:
@@ -226,6 +229,48 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             self.assertEqual(snapshot["delivery_path"], "direct")
             self.assertIsNone(snapshot["design_item_id"])
             self.assertIsNone(snapshot["system_design"])
+
+    def test_leader_model_can_route_approved_app_to_architect(self):
+        proposal = self._run()
+        approved_id = self._approve(proposal, approval_payload())
+
+        def architect_route(context, *, instruction):
+            self.assertIn(approved_id, instruction)
+            task = TaskCreate(
+                task_key="system_design",
+                recipient="Architect",
+                title="设计系统",
+                instructions="根据准确的批准需求产出系统设计。",
+                expected_output_type="system_design",
+                input_configuration_item_ids=[approved_id],
+            )
+            return LeaderOutcome(
+                intent=LeaderIntentDecision(
+                    category="product_change",
+                    priority="normal",
+                    summary="该需求需要先明确跨模块契约。",
+                ),
+                action="dispatch",
+                summary="先交给 Architect。",
+                plan=PlanCreate(
+                    version=max(plan.version for plan in context.plans) + 1,
+                    cause_message_id=context.target_message.id,
+                    tasks=[task],
+                ),
+                dispatched_task_keys=[task.task_key],
+            )
+
+        self.leader.side_effect = architect_route
+        with self.session_factory() as db:
+            delivery = leader.dispatch_approved_requirements(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                approved_id,
+            )
+        self.assertEqual(delivery.recipient, "Architect")
+        self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
 
     def test_cleanup_migration_deletes_legacy_run_but_keeps_project_messages(self):
         result = self._run()
@@ -374,7 +419,7 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
                 "source_ids": ["feat_records", "feat_export"],
             }
         ]
-        self.chat.return_value = json.dumps(spec)
+        self.chat.return_value = prd_turn(spec)
         result = self._run()
         payload = approval_payload(spec)
         payload["selected"] = [s for s in payload["selected"] if s["id"] != "feat_export"]

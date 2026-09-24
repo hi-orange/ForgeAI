@@ -27,10 +27,8 @@ export type RequirementsResult = {
   plan_id: string
   task_id: string
   configuration_item_id: string
-  outcome: 'needs_user_input' | 'awaiting_approval' | 'ready_for_design'
+  outcome: 'needs_user_input' | 'awaiting_approval' | 'ready_for_delivery'
   open_questions: string[]
-  design_plan_id: string | null
-  design_task_id: string | null
 }
 
 export type EngineeringActivity = {
@@ -55,11 +53,16 @@ export type RequirementsStatus = {
     | 'stopped'
     | 'needs_user_input'
     | 'awaiting_approval'
-    | 'ready_for_design'
+    | 'ready_for_delivery'
     | 'design_pending'
     | 'design_running'
+    | 'engineering_pending'
     | 'engineering_running'
     | 'engineering_generated'
+    | 'quality_pending'
+    | 'quality_running'
+    | 'completed'
+    | 'quality_failed'
   execution_id: string | null
   execution_expires_at: string | null
   error: string | null
@@ -67,6 +70,8 @@ export type RequirementsStatus = {
   app_spec: AppSpec | null
   workspace_ready?: boolean
   code_ready?: boolean
+  code_item_id?: string | null
+  test_report_item_id?: string | null
   workspace_path?: string | null
   activities?: EngineeringActivity[]
 }

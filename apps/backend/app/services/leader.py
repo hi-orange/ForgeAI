@@ -4,14 +4,17 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.agents import leader as leader_agent
 from app.agents.prompts.leader import (
     ARCHITECTURE_TASK_INSTRUCTIONS,
     CLARIFICATION_TASK_INSTRUCTIONS,
     ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
     INITIAL_REQUIREMENTS_TASK_INSTRUCTIONS,
+    QUALITY_VALIDATION_TASK_INSTRUCTIONS,
 )
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.generation.workspace import prepare_engineering_workspace
+from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
 from app.models.plan import Plan
 from app.models.project import Project, ProjectStatus
@@ -21,7 +24,13 @@ from app.models.requirement_clarification import RequirementClarification
 from app.models.task import Task, TaskRecipient
 from app.models.task_result import TaskResult
 from app.models.user import User
-from app.schemas.app_spec import AppSpec
+from app.schemas.leader import (
+    LeaderContext,
+    LeaderMessageSnapshot,
+    LeaderOutcome,
+    LeaderPlanSnapshot,
+    LeaderTaskSnapshot,
+)
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.task import TaskCreate
@@ -32,6 +41,7 @@ from app.services.engineering import (
     APPROVAL_VERSION,
     ARCHITECTURE_TASK_KEY,
     ENGINEERING_TASK_KEY,
+    QUALITY_TASK_KEY,
     find_architecture_task,
     find_claimed_engineering_task,
     find_pending_engineering_task,
@@ -45,6 +55,7 @@ from app.services.project_message_classification import (
     require_project_message,
 )
 from app.services.task_execution import lock_run
+from app.services.test_engineer import load_test_inputs
 
 
 class DeliveryPath(StrEnum):
@@ -52,56 +63,152 @@ class DeliveryPath(StrEnum):
     DESIGNED = "designed"
 
 
-_ARCHITECTURE_SENSITIVE_TERMS = frozenset(
-    {
-        "权限",
-        "角色",
-        "登录",
-        "认证",
-        "支付",
-        "外部",
-        "第三方",
-        "实时",
-        "并发",
-        "审批",
-        "多租户",
-        "安全",
-        "隐私",
-        "permission",
-        "role",
-        "login",
-        "auth",
-        "payment",
-        "external",
-        "third-party",
-        "realtime",
-        "concurrency",
-        "multi-tenant",
-        "security",
-        "privacy",
-    }
-)
+def _build_leader_context(
+    db: Session,
+    *,
+    project_id: int,
+    run_id: str,
+    target_message_id: int,
+) -> LeaderContext:
+    project = db.get(Project, project_id)
+    run = db.scalar(
+        select(BuildRun).where(BuildRun.project_id == project_id, BuildRun.run_id == run_id)
+    )
+    target = db.get(ProjectMessage, target_message_id)
+    if project is None or run is None or target is None:
+        raise NotFoundException("Leader 缺少项目、构建或目标消息上下文")
+    recent_rows = list(
+        db.scalars(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.sequence < target.sequence,
+            )
+            .order_by(ProjectMessage.sequence.desc())
+            .limit(20)
+        ).all()
+    )
+    recent_rows.reverse()
+    plan_rows = list(
+        db.scalars(
+            select(Plan)
+            .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
+            .order_by(Plan.version.desc())
+            .limit(20)
+        ).all()
+    )
+    plan_rows.reverse()
+    plan_snapshots: list[LeaderPlanSnapshot] = []
+    for plan in plan_rows:
+        task_rows = list(
+            db.scalars(
+                select(Task).where(Task.plan_id == plan.plan_id).order_by(Task.position)
+            ).all()
+        )
+        task_snapshots: list[LeaderTaskSnapshot] = []
+        for task in task_rows:
+            saved = db.get(TaskResult, task.task_id)
+            item = (
+                db.scalar(
+                    select(ConfigurationItem).where(
+                        ConfigurationItem.item_id == saved.configuration_item_id
+                    )
+                )
+                if saved
+                else None
+            )
+            task_snapshots.append(
+                LeaderTaskSnapshot.model_validate(
+                    {
+                        "task_id": task.task_id,
+                        "task_key": task.task_key,
+                        "recipient": task.recipient,
+                        "title": task.title,
+                        "status": task.status,
+                        "depends_on_task_ids": list(task.depends_on_task_ids),
+                        "result": (
+                            {
+                                "configuration_item_id": item.item_id,
+                                "semantic_type": item.semantic_type,
+                                "state": item.state,
+                                "payload": item.payload,
+                            }
+                            if item is not None
+                            else None
+                        ),
+                    }
+                )
+            )
+        plan_snapshots.append(
+            LeaderPlanSnapshot.model_validate(
+                {
+                    "plan_id": plan.plan_id,
+                    "version": plan.version,
+                    "status": plan.status,
+                    "tasks": task_snapshots,
+                }
+            )
+        )
+    return LeaderContext(
+        project_id=project.id,
+        project_name=project.name,
+        project_status=project.status,
+        run_id=run.run_id,
+        run_status=run.status,
+        target_message=LeaderMessageSnapshot.model_validate(
+            {
+                "id": target.id,
+                "sequence": target.sequence,
+                "sender": target.sender,
+                "content": target.content,
+            }
+        ),
+        recent_messages=[
+            LeaderMessageSnapshot.model_validate(
+                {
+                    "id": message.id,
+                    "sequence": message.sequence,
+                    "sender": message.sender,
+                    "content": message.content,
+                }
+            )
+            for message in recent_rows
+        ],
+        plans=plan_snapshots,
+    )
 
 
-def choose_delivery_path(spec: AppSpec) -> DeliveryPath:
-    """Choose a stable route from one exact approved product-intent version."""
-
-    searchable = " ".join(
-        [spec.goal]
-        + [item.text for item in spec.features]
-        + [item.text for item in spec.constraints]
-    ).lower()
-    architecture_sensitive = any(term in searchable for term in _ARCHITECTURE_SENSITIVE_TERMS)
+def _delivery_path_from_outcome(
+    outcome: LeaderOutcome,
+    *,
+    approved_item_id: str,
+    cause_message_id: int,
+) -> DeliveryPath:
+    if outcome.action != "dispatch" or outcome.plan is None:
+        raise BusinessException("Leader 必须为已批准需求选择下一个交付角色")
+    if outcome.intent.category != ProjectMessageCategory.PRODUCT_CHANGE:
+        raise BusinessException("Leader 对已批准需求的意图判断不一致")
+    if len(outcome.plan.tasks) != 1 or len(outcome.dispatched_task_keys) != 1:
+        raise BusinessException("Leader 本轮只能分派一个明确的下游角色")
+    task = outcome.plan.tasks[0]
     if (
-        len(spec.features) > 3
-        or len(spec.data_requirements) > 6
-        or len(spec.interface_requirements) > 4
-        or len(spec.target_users) > 2
-        or len(spec.constraints) > 1
-        or architecture_sensitive
+        outcome.plan.cause_message_id != cause_message_id
+        or outcome.dispatched_task_keys != [task.task_key]
+        or task.input_configuration_item_ids != [approved_item_id]
+        or task.depends_on_task_keys
+    ):
+        raise BusinessException("Leader 分派没有引用本轮准确的已批准需求")
+    if (
+        task.recipient == TaskRecipient.ARCHITECT
+        and task.expected_output_type == ConfigurationItemType.SYSTEM_DESIGN
     ):
         return DeliveryPath.DESIGNED
-    return DeliveryPath.DIRECT
+    if (
+        task.recipient == TaskRecipient.CODE_ENGINEER
+        and task.expected_output_type == ConfigurationItemType.CODE
+    ):
+        return DeliveryPath.DIRECT
+    raise BusinessException("Leader 只能把已批准需求交给 Architect 或 Code Engineer")
 
 
 def create_architecture_task(
@@ -535,10 +642,31 @@ def dispatch_approved_requirements(
     run_id: str,
     approved_item_id: str,
 ) -> Task:
-    """Choose and persist the next assignment for one approved specification."""
+    """Let Leader choose, then persist one validated next-role assignment."""
 
-    _, _, _, spec = load_approved_app_spec(db, project_id, run_id, approved_item_id)
-    if choose_delivery_path(spec) == DeliveryPath.DIRECT:
+    project_service.get_user_project(db, user, project_id)
+    _, _, source_plan, _ = load_approved_app_spec(db, project_id, run_id, approved_item_id)
+    context = _build_leader_context(
+        db,
+        project_id=project_id,
+        run_id=run_id,
+        target_message_id=source_plan.cause_message_id,
+    )
+    outcome = leader_agent.lead_project_turn(
+        context,
+        instruction=(
+            "本轮只决定已批准 app_spec 的下一个角色。创建且分派一个任务："
+            "简单、固定栈且无关键架构决策时交给 Code Engineer；涉及权限安全、外部系统、"
+            "复杂数据关系、并发或跨模块契约时交给 Architect。任务必须只引用准确成果 "
+            f"{approved_item_id}，不得安排 Product Manager、Test Engineer 或未来任务。"
+        ),
+    )
+    path = _delivery_path_from_outcome(
+        outcome,
+        approved_item_id=approved_item_id,
+        cause_message_id=source_plan.cause_message_id,
+    )
+    if path == DeliveryPath.DIRECT:
         return create_engineering_delivery_task(
             db,
             user,
@@ -560,3 +688,83 @@ def dispatch_completed_design(
     """Assign Code Engineer after Architect reports a completed design."""
 
     return create_engineering_delivery_task(db, user, project_id, run_id, design_item_id)
+
+
+def dispatch_completed_code(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    code_item_id: str,
+) -> Task:
+    """Assign independent quality validation for one exact completed code result."""
+
+    try:
+        run = lock_run(db, user, project_id, run_id)
+        if run.status != "running" or run.stage != "developer" or run.active_slot != 1:
+            raise ConflictException("当前构建不能进行代码到质量验证的交接")
+        inputs = load_test_inputs(db, project_id, run_id, code_item_id, lock=True)
+        latest = db.scalar(
+            select(Plan)
+            .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
+            .order_by(Plan.version.desc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if latest is None:
+            raise ConflictException("当前构建没有可继续的计划")
+        if latest.version > inputs.code_plan.version:
+            tasks = list(db.scalars(select(Task).where(Task.plan_id == latest.plan_id)).all())
+            if len(tasks) == 1:
+                replay = tasks[0]
+                if (
+                    replay.task_key == QUALITY_TASK_KEY
+                    and replay.recipient == TaskRecipient.TEST_ENGINEER.value
+                    and replay.expected_output_type == ConfigurationItemType.TEST_REPORT.value
+                    and replay.input_configuration_item_ids == [code_item_id]
+                    and not replay.depends_on_task_ids
+                    and replay.status
+                    in {
+                        "pending",
+                        "running",
+                        "succeeded",
+                    }
+                ):
+                    db.commit()
+                    db.refresh(replay)
+                    return replay
+            raise ConflictException("代码成果已进入其他后续计划，请刷新进度")
+        if latest.plan_id != inputs.code_plan.plan_id:
+            raise ConflictException("代码成果不是当前最新计划的结果")
+        plan = plan_service.stage_plan(
+            db,
+            user,
+            project_id,
+            run_id,
+            PlanCreate(
+                version=latest.version + 1,
+                cause_message_id=latest.cause_message_id,
+                tasks=[
+                    TaskCreate(
+                        task_key=QUALITY_TASK_KEY,
+                        recipient=TaskRecipient.TEST_ENGINEER,
+                        title="独立验证应用代码",
+                        instructions=QUALITY_VALIDATION_TASK_INSTRUCTIONS,
+                        expected_output_type=ConfigurationItemType.TEST_REPORT,
+                        input_configuration_item_ids=[code_item_id],
+                    )
+                ],
+            ),
+        )
+        task = db.scalar(select(Task).where(Task.plan_id == plan.plan_id))
+        assert task is not None
+        db.commit()
+        db.refresh(task)
+        return task
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictException("质量验证派工保存冲突，请重试") from exc
+    except Exception:
+        db.rollback()
+        raise

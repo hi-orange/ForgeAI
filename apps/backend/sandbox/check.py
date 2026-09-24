@@ -36,7 +36,11 @@ def database():
     expected = tomllib.loads(Path("/opt/backend/pyproject.toml").read_text())
     actual = tomllib.loads((backend / "pyproject.toml").read_text())
     if actual["project"]["dependencies"] != expected["project"]["dependencies"]:
-        raise ValueError("当前检查镜像仅支持模板中的后端依赖，请恢复依赖清单")
+        raise ValueError(
+            "后端依赖与检查镜像不一致。"
+            "当前检查容器离线且只预装模板依赖；请恢复 backend/pyproject.toml，"
+            "或先更新模板并重建 forgeai-checks 镜像后再增加依赖。"
+        )
     command(["alembic", "upgrade", "head"], backend)
     command(["alembic", "check"], backend)
     if not DATABASE.is_file():
@@ -86,7 +90,11 @@ def frontend():
     actual = json.loads((frontend_root / "package.json").read_text())
     for key in ("dependencies", "devDependencies"):
         if actual.get(key) != expected.get(key):
-            raise ValueError("当前检查镜像仅支持模板中的前端依赖，请恢复依赖清单")
+            raise ValueError(
+                "前端依赖与检查镜像不一致。"
+                "当前检查容器离线且只预装模板依赖；请恢复 frontend/package.json，"
+                "或先更新模板并重建 forgeai-checks 镜像后再增加依赖。"
+            )
     # Vite writes node_modules/.vite-temp while loading its config. Keep packages read-only,
     # but give this check a private writable node_modules directory for those cache entries.
     modules = frontend_root / "node_modules"

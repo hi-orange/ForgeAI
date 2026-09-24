@@ -143,12 +143,20 @@ const frameStyle = computed(() => ({
 const selectedItems = computed(() => props.planItems.filter((item) => item.checked))
 const showPlanOverview = computed(() => Boolean(props.status?.app_spec) && props.canApprove)
 const postApproval = computed(() =>
-  ['design_pending', 'design_running', 'engineering_running', 'engineering_generated'].includes(
-    props.status?.state ?? '',
-  ),
+  [
+    'design_pending',
+    'design_running',
+    'engineering_pending',
+    'engineering_running',
+    'engineering_generated',
+    'quality_pending',
+    'quality_running',
+    'completed',
+    'quality_failed',
+  ].includes(props.status?.state ?? ''),
 )
 const planReady = computed(
-  () => props.canApprove || postApproval.value || props.status?.state === 'ready_for_design',
+  () => props.canApprove || postApproval.value || props.status?.state === 'ready_for_delivery',
 )
 const previewTitle = computed(() => {
   if (props.status?.code_ready) return '应用代码已生成'

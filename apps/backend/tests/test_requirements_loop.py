@@ -17,6 +17,7 @@ from test_architect import valid_design
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
     approval_payload,
+    prd_turn,
     valid_spec,
 )
 
@@ -56,8 +57,8 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             if not entered.is_set():
                 entered.set()
                 self.assertTrue(release.wait(timeout=20))
-                return json.dumps(valid_spec(open_questions=["旧执行的问题"]))
-            return json.dumps(valid_spec())
+                return prd_turn(valid_spec(open_questions=["旧执行的问题"]))
+            return prd_turn(valid_spec())
 
         self.chat.side_effect = generate
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -89,7 +90,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         self.assertEqual(progress.message_id, followup.cause_message_id)
         self.assertEqual(progress.state, "retry_available")
         self.chat.side_effect = None
-        self.chat.return_value = json.dumps(valid_spec())
+        self.chat.return_value = prd_turn(valid_spec())
         with self.session_factory() as db:
             result = run_product_manager_workflow(
                 db,
@@ -119,7 +120,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
                 original.unusable_reason = "test invalidation during model call"
                 original.unusable_at = task_execution.utc_now()
                 db.commit()
-            return json.dumps(valid_spec())
+            return prd_turn(valid_spec())
 
         self.chat.side_effect = generate
         with self.assertRaises(ConflictException):
@@ -167,7 +168,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         self.assertEqual(self._counts()[3:5], (1, 1))
 
     def _questions(self, questions=None):
-        self.chat.return_value = json.dumps(valid_spec(open_questions=questions or ["导出格式？"]))
+        self.chat.return_value = prd_turn(valid_spec(open_questions=questions or ["导出格式？"]))
         return self._run()
 
     def _answer(self, item_id, content="CSV", key="answer-1", user=None):
@@ -214,7 +215,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         self.assertEqual(self._status().state, "awaiting_approval")
         second_plan = self._answer(first.configuration_item_id)
         self.assertEqual(self._status().state, "pending")
-        self.chat.return_value = json.dumps(valid_spec(open_questions=["是否需要提醒？"]))
+        self.chat.return_value = prd_turn(valid_spec(open_questions=["是否需要提醒？"]))
         second = self._execute_plan(second_plan)
         sent = json.loads(self.chat.call_args.kwargs["messages"][1]["content"])
         self.assertEqual(sent["previous_item_id"], first.configuration_item_id)
@@ -224,7 +225,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         self.assertEqual(sent["source_message"]["content"], "CSV")
         self.assertEqual(sent["recent_messages"], [])
         third_plan = self._answer(second.configuration_item_id, "不需要提醒", "answer-2")
-        self.chat.return_value = json.dumps(valid_spec())
+        self.chat.return_value = prd_turn(valid_spec())
         third = self._execute_plan(third_plan)
         self.assertEqual(self._status().state, "awaiting_approval")
         self.assertEqual(self._status().result, third)
@@ -348,7 +349,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         def generate(**_):
             entered.set()
             self.assertTrue(release.wait(timeout=20))
-            return json.dumps(valid_spec())
+            return prd_turn(valid_spec())
 
         self.chat.side_effect = generate
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -525,7 +526,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         self.assertEqual(paused.state, "retry_available")
         self.assertEqual(paused.execution_id, execution.execution_id)
         self.assertIn("暂停", paused.error or "")
-        self.chat.return_value = json.dumps(valid_spec())
+        self.chat.return_value = prd_turn(valid_spec())
         result = self._run(recovery_execution_id=execution.execution_id)
         self.assertEqual(result.outcome, "awaiting_approval")
         self.assertEqual(self._status().state, "awaiting_approval")
@@ -553,13 +554,13 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         before = self.client.get(f"{self.base}/requirements")
         self.assertEqual(before.json()["data"]["state"], "not_started")
         self.chat.assert_not_called()
-        self.chat.return_value = json.dumps(valid_spec(open_questions=["导出格式？"]))
+        self.chat.return_value = prd_turn(valid_spec(open_questions=["导出格式？"]))
         first = self.client.post(self.execute, json={"message_id": self.message.id})
         self.assertEqual(first.status_code, 200, first.text)
         item_id = first.json()["data"]["configuration_item_id"]
         waiting = self.client.get(f"{self.base}/requirements")
         self.assertEqual(waiting.json()["data"]["result"]["open_questions"], ["导出格式？"])
-        self.chat.return_value = json.dumps(valid_spec())
+        self.chat.return_value = prd_turn(valid_spec())
         answer = {"content": "CSV", "client_message_id": "api-answer"}
         response = self.client.post(f"{self.execute}/{item_id}/answers", json=answer)
         self.assertEqual(response.status_code, 200, response.text)
@@ -577,7 +578,7 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
             json=approval_payload(client_message_id="api-approval"),
         )
         self.assertEqual(approval.status_code, 200, approval.text)
-        self.assertEqual(approval.json()["data"]["state"], "design_pending")
+        self.assertEqual(approval.json()["data"]["state"], "engineering_pending")
         self.assertIsNone(approval.json()["data"]["execution_id"])
         replay_approval = self.client.post(
             f"{self.execute}/{current['result']['configuration_item_id']}/approval",
@@ -613,22 +614,24 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
                 side_effect=RuntimeError("dispatch failed"),
             ),
         ):
-            with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
-                self.client.post(
-                    f"{self.execute}/{item_id}/approval",
-                    json=approval_payload(client_message_id="dispatch-approval"),
-                )
+            approval = self.client.post(
+                f"{self.execute}/{item_id}/approval",
+                json=approval_payload(client_message_id="dispatch-approval"),
+            )
+        self.assertEqual(approval.status_code, 200, approval.text)
+        saved = approval.json()["data"]
+        self.assertEqual(saved["state"], "ready_for_delivery")
+        self.assertIn("自动分派下一步失败", saved["error"] or "")
         waiting = self.client.get(f"{self.base}/requirements")
         self.assertEqual(waiting.status_code, 200)
-        saved = waiting.json()["data"]
-        self.assertEqual(saved["state"], "ready_for_design")
+        self.assertEqual(waiting.json()["data"]["state"], "ready_for_delivery")
         retry = self.client.post(f"{self.base}/requirements/continue")
         self.assertEqual(retry.status_code, 200, retry.text)
         self.assertEqual(
             retry.json()["data"]["result"]["configuration_item_id"],
             saved["result"]["configuration_item_id"],
         )
-        self.assertIsNotNone(retry.json()["data"]["result"]["design_task_id"])
+        self.assertIsNotNone(retry.json()["data"]["task_id"])
         self.chat.assert_called_once()
 
     def test_http_rejects_cross_owner_and_malformed_input(self):
@@ -661,7 +664,7 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
             json=approval_payload(client_message_id="pause-approval"),
         )
         self.assertEqual(approval.status_code, 200, approval.text)
-        self.assertEqual(approval.json()["data"]["state"], "design_pending")
+        self.assertEqual(approval.json()["data"]["state"], "engineering_pending")
         run_id = approval.json()["data"]["run_id"]
         with (
             patch(

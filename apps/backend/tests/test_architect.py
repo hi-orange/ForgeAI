@@ -221,6 +221,49 @@ class ArchitectTests(unittest.TestCase):
             ["system", "user", "assistant", "tool"],
         )
 
+    def test_agent_defers_extra_parallel_calls_without_failing_the_execution(self):
+        turns = [
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(id="artifact", name="read_artifact", arguments={}),
+                    ToolCall(
+                        id="extra-read",
+                        name="editor_read",
+                        arguments={"target": "README.md"},
+                    ),
+                ]
+            ),
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(
+                        id="submit",
+                        name="write_system_design",
+                        arguments={"system_design": valid_design()},
+                    )
+                ]
+            ),
+        ]
+        observations = []
+        with TemporaryDirectory(prefix="forgeai-architect-agent-") as directory:
+            with patch.object(architect_agent, "chat_with_tools", side_effect=turns) as chat:
+                result = architect_agent.generate_system_design(
+                    spec=valid_spec(),
+                    workspace_root=Path(directory),
+                    on_activity=observations.append,
+                )
+
+        self.assertEqual(result.model_dump(), valid_design())
+        self.assertEqual(
+            [item.error_code for item in observations],
+            [None, None],
+        )
+        history = chat.call_args_list[1].kwargs["messages"]
+        self.assertEqual(
+            [message["role"] for message in history],
+            ["system", "user", "assistant", "tool", "tool"],
+        )
+        self.assertEqual(history[-1]["tool_call_id"], "extra-read")
+
     def test_agent_rejects_unapproved_tools_and_missing_workspace(self):
         with self.assertRaisesRegex(BusinessException, "工作区不存在"):
             architect_agent.generate_system_design(

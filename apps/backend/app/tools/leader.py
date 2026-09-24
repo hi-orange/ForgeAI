@@ -18,9 +18,22 @@ from app.schemas.leader import (
     LeaderOutcome,
 )
 from app.schemas.plan import PlanCreate
+from app.schemas.project_message_classification import ProjectMessageClassificationDecision
 
 _PLAN_SCHEMA = PlanCreate.model_json_schema()
 _INTENT_SCHEMA = LeaderIntentDecision.model_json_schema()
+_MESSAGE_CLASSIFICATION_SCHEMA = ProjectMessageClassificationDecision.model_json_schema()
+
+MESSAGE_CLASSIFICATION_TOOL = ToolDefinition(
+    name="record_message_classification",
+    description="提交本次目标用户消息的唯一业务分类和一句可审计摘要。",
+    parameters={
+        "type": "object",
+        "properties": {"decision": _MESSAGE_CLASSIFICATION_SCHEMA},
+        "required": ["decision"],
+        "additionalProperties": False,
+    },
+)
 
 LEADER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
@@ -148,6 +161,25 @@ def _tool_result(
         summary=summary,
         data=data or {},
         arguments=dict(call.arguments),
+    )
+
+
+def execute_message_classification_tool(
+    call: ToolCall,
+) -> tuple[ToolExecutionResult, ProjectMessageClassificationDecision]:
+    try:
+        decision = ProjectMessageClassificationDecision.model_validate(
+            call.arguments.get("decision")
+        )
+    except ValidationError as exc:
+        raise BusinessException("Leader 消息分类返回格式异常") from exc
+    return (
+        _tool_result(
+            call,
+            summary="已记录用户消息分类",
+            data={"decision": decision.model_dump(mode="json")},
+        ),
+        decision,
     )
 
 

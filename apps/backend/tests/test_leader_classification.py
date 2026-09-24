@@ -40,6 +40,7 @@ from app.models.project_message_classification import (
     ProjectMessageClassification,
 )
 from app.models.user import User
+from app.schemas.agent_action import ChatWithToolsResult, ToolCall
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
 from app.services import project_message_classification as project_message_classification_service
 
@@ -424,14 +425,22 @@ class LeaderClassificationTests(unittest.TestCase):
         self.assertIs(result, winning)
         db.rollback.assert_called_once_with()
 
-    def test_agent_parses_strict_json_and_uses_structured_input(self) -> None:
-        raw = (
-            "```json\n"
-            '{"category":"implementation_repair",'
-            '"decision_summary":"现有登录行为没有正常工作。"}\n'
-            "```"
+    def test_agent_uses_classification_tool_and_structured_input(self) -> None:
+        result = ChatWithToolsResult(
+            tool_calls=[
+                ToolCall(
+                    id="classify",
+                    name="record_message_classification",
+                    arguments={
+                        "decision": {
+                            "category": "implementation_repair",
+                            "decision_summary": "现有登录行为没有正常工作。",
+                        }
+                    },
+                )
+            ]
         )
-        with patch.object(leader_agent, "chat_completion", return_value=raw) as chat:
+        with patch.object(leader_agent, "chat_with_tools", return_value=result) as chat:
             decision = leader_agent.classify_message(
                 project_name="Demo",
                 project_status=ProjectStatus.AVAILABLE.value,
@@ -445,23 +454,38 @@ class LeaderClassificationTests(unittest.TestCase):
         request = chat.call_args.kwargs
         self.assertEqual(request["temperature"], 0.0)
         self.assertEqual(request["max_tokens"], 256)
-        self.assertTrue(request["json_output"])
+        self.assertEqual(
+            [tool.name for tool in request["tools"]],
+            ["record_message_classification"],
+        )
         payload = json.loads(request["messages"][1]["content"])
         self.assertEqual(payload["message_to_classify"]["sequence"], 2)
         self.assertEqual(payload["recent_messages_before_target"][0]["sequence"], 1)
 
     def test_agent_rejects_malformed_or_unknown_decisions(self) -> None:
         invalid_responses = (
-            "not json",
-            '{"category":"unknown","decision_summary":"invalid"}',
-            '{"category":"stop","decision_summary":"ok","extra":true}',
-            '{"category":"stop","decision_summary":"   "}',
+            ChatWithToolsResult(content="not a tool call"),
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(
+                        id="classify",
+                        name="record_message_classification",
+                        arguments={
+                            "decision": {
+                                "category": "unknown",
+                                "decision_summary": "invalid",
+                            }
+                        },
+                    )
+                ]
+            ),
+            ChatWithToolsResult(tool_calls=[ToolCall(id="other", name="read_plan", arguments={})]),
         )
-        for raw in invalid_responses:
+        for response in invalid_responses:
             with (
-                self.subTest(raw=raw),
-                patch.object(leader_agent, "chat_completion", return_value=raw),
-                self.assertRaisesRegex(BusinessException, "Leader 消息分类返回格式异常"),
+                self.subTest(response=response),
+                patch.object(leader_agent, "chat_with_tools", return_value=response),
+                self.assertRaises(BusinessException),
             ):
                 leader_agent.classify_message(
                     project_name="Demo",

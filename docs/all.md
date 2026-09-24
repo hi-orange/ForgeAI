@@ -35,17 +35,25 @@
 - `needs_user_input`：无法理解目标，需要用户补充。
 - `design_pending`：Architect 任务已创建，等待处理。
 - `design_running`：Architect 正在生成系统设计。
+- `engineering_pending`：Code Engineer 任务已创建，等待处理。
 - `engineering_running`：Code Engineer 正在实现代码。
-- `ready_for_design`：已批准但派工未成功，可重试。
+- `engineering_generated`：源码已通过工程检查并冻结为正式 `code` 成果，等待质量派工。
+- `quality_pending`：Test Engineer 任务已创建，等待独立验证。
+- `quality_running`：Test Engineer 正在只读验证准确的代码成果。
+- `completed`：独立验证通过，BuildRun 成功且项目版本可用。
+- `quality_failed`：独立验证失败或受阻，BuildRun 已失败，项目版本未标记为可用。
+- `ready_for_delivery`：已批准但 Leader 派工未成功，可重试。
 
 边界：
 
 - 批准步骤只保存 Leader 选定的下一任务，不调用设计或编码模型，不代表应用完成。
 - Code Engineer 的输入固定为准确的批准 `app_spec`，复杂路径还必须固定引用对应的 `system_design`。
+- Code Engineer 完成后登记带源码哈希和清单的 `code` 成果；Test Engineer 只读验证该准确成果，
+  并登记 `test_report` 后才能结束 BuildRun。
 - 未批准即创建的 Architect 运行由迁移删除，不在运行时兼容。
 - Architect 计划和任务保持 `pending` 时，BuildRun 仍为 `running / pm`。
 - 重复批准或派工只返回原结果。
-- 若批准已保存但派工失败，页面显示 `ready_for_design`，可重试派工，不会重新调用需求模型。
+- 若批准已保存但 Leader 派工失败，页面显示 `ready_for_delivery`，可重试派工，不会重新调用需求模型。
 - 历史 v1 字符串列表通过共享读取函数转换成带稳定 ID 的结构，不覆盖原产物、内容哈希和来源。
 - 新批准与澄清结果写入 v2 并引用旧产物；未发布的 v1 执行草稿可恢复为 v2。未知版本继续拒绝。
 - 附属产物必须属于任务所在的项目和生产运行；其他任务的主产物也不能被登记成附属产物。

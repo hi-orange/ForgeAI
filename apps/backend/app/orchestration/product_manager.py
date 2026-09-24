@@ -292,7 +292,7 @@ class _ProductManagerWorkflow:
         app_spec = _validated_app_spec(state.get("app_spec"))
 
         if state.get("approved"):
-            state["outcome"] = ProductManagerWorkflowOutcome.READY_FOR_DESIGN
+            state["outcome"] = ProductManagerWorkflowOutcome.READY_FOR_DELIVERY
             state["open_questions"] = []
         elif app_spec.features:
             state["outcome"] = ProductManagerWorkflowOutcome.AWAITING_APPROVAL
@@ -311,8 +311,6 @@ class _ProductManagerWorkflow:
                 configuration_item_id=state["configuration_item_id"],
                 outcome=state["outcome"],
                 open_questions=state["open_questions"],
-                design_plan_id=state.get("design_plan_id"),
-                design_task_id=state.get("design_task_id"),
             )
         except ValidationError as exc:
             raise BusinessException("Product Manager 工作流没有产生完整结果") from exc

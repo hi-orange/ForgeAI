@@ -22,6 +22,7 @@ from app.models.project_message import ProjectMessage
 from app.models.project_message_classification import ProjectMessageClassification
 from app.models.task import Task, TaskRecipient
 from app.models.user import User
+from app.schemas.agent_action import ChatWithToolsResult, ToolCall
 from app.schemas.app_spec import APP_SPEC_SCHEMA_VERSION, AppSpec
 from app.schemas.product_manager import (
     MAX_HISTORY_CHARS,
@@ -77,11 +78,19 @@ def model_input(**overrides) -> ProductManagerInput:
     )
 
 
+def tool_turn(name: str, arguments: dict, *, call_id: str = "pm-call") -> ChatWithToolsResult:
+    return ChatWithToolsResult(tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)])
+
+
+def prd_turn(spec: dict | None = None) -> ChatWithToolsResult:
+    return tool_turn("write_prd", {"prd": spec or valid_spec()})
+
+
 class ProductManagerAgentTests(unittest.TestCase):
     def test_calls_existing_llm_with_separated_structured_input_and_schema(self):
         payload = model_input()
         with patch.object(
-            product_manager_agent, "chat_completion", return_value=json.dumps(valid_spec())
+            product_manager_agent, "chat_with_tools", return_value=prd_turn()
         ) as chat:
             result = product_manager_agent.generate_app_spec(payload)
         self.assertIsInstance(result, AppSpec)
@@ -91,28 +100,29 @@ class ProductManagerAgentTests(unittest.TestCase):
         request = chat.call_args.kwargs
         self.assertEqual(request["temperature"], 0.0)
         self.assertEqual(request["max_tokens"], 8192)
-        self.assertTrue(request["json_output"])
         self.assertEqual([message["role"] for message in request["messages"]], ["system", "user"])
         self.assertEqual(json.loads(request["messages"][1]["content"]), payload.model_dump())
-        self.assertIn(
-            json.dumps(AppSpec.model_json_schema(), ensure_ascii=False),
-            request["messages"][0]["content"],
+        self.assertEqual(
+            {tool.name for tool in request["tools"]},
+            product_manager_agent.PRODUCT_MANAGER_PROFILE.allowed_tools,
         )
+        write_prd = next(tool for tool in request["tools"] if tool.name == "write_prd")
+        self.assertEqual(write_prd.parameters["properties"]["prd"], AppSpec.model_json_schema())
         self.assertIn("不自动等于用户确认", request["messages"][0]["content"])
 
     def test_research_editor_and_write_prd_use_bounded_role_tools(self):
         spec = valid_spec()
         actions = [
-            {"tool": "enhanced_search", "arguments": {"query": "阅读记录应用 竞品"}},
-            {"tool": "browser_open", "arguments": {"url": "https://example.com/research"}},
-            {"tool": "edit_prd", "arguments": {"prd": spec}},
-            {"tool": "write_prd", "arguments": {"prd": spec}},
+            tool_turn("enhanced_search", {"query": "阅读记录应用 竞品"}, call_id="search"),
+            tool_turn("browser_open", {"url": "https://example.com/research"}, call_id="open"),
+            tool_turn("edit_prd", {"prd": spec}, call_id="edit"),
+            tool_turn("write_prd", {"prd": spec}, call_id="write"),
         ]
         with (
             patch.object(
                 product_manager_agent,
-                "chat_completion",
-                side_effect=[json.dumps(action, ensure_ascii=False) for action in actions],
+                "chat_with_tools",
+                side_effect=actions,
             ) as chat,
             patch(
                 "app.tools.product_manager.web_research.enhanced_search",
@@ -145,17 +155,17 @@ class ProductManagerAgentTests(unittest.TestCase):
             [len(call.kwargs["messages"]) for call in chat.call_args_list],
             [2, 4, 6, 8],
         )
-        final_tool_result = json.loads(
-            chat.call_args_list[-1].kwargs["messages"][-1]["content"].split("：", 1)[1]
-        )
+        final_tool_result = json.loads(chat.call_args_list[-1].kwargs["messages"][-1]["content"])
         self.assertEqual(final_tool_result["name"], "edit_prd")
         self.assertTrue(final_tool_result["ok"])
+        self.assertEqual(
+            [message["role"] for message in chat.call_args_list[-1].kwargs["messages"]],
+            ["system", "user", "assistant", "tool", "assistant", "tool", "assistant", "tool"],
+        )
 
     def test_rejects_tools_outside_product_manager_role(self):
-        action = {"tool": "apply_patch", "arguments": {"path": "README.md"}}
-        with patch.object(
-            product_manager_agent, "chat_completion", return_value=json.dumps(action)
-        ) as chat:
+        action = tool_turn("apply_patch", {"path": "README.md"})
+        with patch.object(product_manager_agent, "chat_with_tools", return_value=action) as chat:
             with self.assertRaisesRegex(BusinessException, "无权使用工具"):
                 product_manager_agent.generate_app_spec(model_input())
         chat.assert_called_once()
@@ -190,7 +200,7 @@ class ProductManagerAgentTests(unittest.TestCase):
         payload = model_input(task_instructions=injection)
         payload.source_message.content = injection
         with patch.object(
-            product_manager_agent, "chat_completion", return_value=json.dumps(valid_spec())
+            product_manager_agent, "chat_with_tools", return_value=prd_turn()
         ) as chat:
             product_manager_agent.generate_app_spec(payload)
         messages = chat.call_args.kwargs["messages"]
@@ -200,20 +210,17 @@ class ProductManagerAgentTests(unittest.TestCase):
         self.assertEqual(supplied["task_instructions"], injection)
         self.assertEqual(len(messages), 2)
 
-    def test_accepts_plain_json_and_complete_fences_without_changing_language(self):
+    def test_requires_write_prd_instead_of_accepting_plain_json_content(self):
         spec = valid_spec(
             goal="Track reading — 読書記録",
             constraints=[{"id": "con_en", "text": "No public sharing"}],
         )
-        raw = json.dumps(spec, ensure_ascii=False)
-        for wrapped in (raw, f"```json\n{raw}\n```", f"```\n{raw}\n```", f" \n{raw}\n "):
-            with (
-                self.subTest(raw=wrapped[:20]),
-                patch.object(product_manager_agent, "chat_completion", return_value=wrapped),
-            ):
-                self.assertEqual(
-                    product_manager_agent.generate_app_spec(model_input()).model_dump(), spec
-                )
+        result = ChatWithToolsResult(content=json.dumps(spec, ensure_ascii=False))
+        with (
+            patch.object(product_manager_agent, "chat_with_tools", return_value=result),
+            self.assertRaisesRegex(BusinessException, "未调用工具提交 PRD"),
+        ):
+            product_manager_agent.generate_app_spec(model_input())
 
     def test_schema_allows_unclear_requests_only_with_explicit_questions(self):
         spec = {key: [] for key in valid_spec() if key != "goal"}
@@ -287,34 +294,17 @@ class ProductManagerAgentTests(unittest.TestCase):
                     {key: value for key, value in valid_spec().items() if key != field}
                 )
 
-    def test_malformed_model_outputs_are_business_errors_without_echoing_raw_text(self):
-        valid = json.dumps(valid_spec())
-        for raw in (
-            "private requirement: not JSON",
-            "",
-            "[]",
-            "null",
-            "{}",
-            valid + valid,
-            "here is the result: " + valid,
-            "```json\n" + valid,
-            valid[:-1],
-            '{"goal":"first","goal":"second"}',
-            valid.replace('"goal":', '"goal": NaN, "extra":'),
-            valid.replace('"goal":', '"goal": Infinity, "extra":'),
-            json.dumps(valid_spec(features=[1])),
-            "x" * (product_manager_agent.MAX_APP_SPEC_RESPONSE_CHARS + 1),
-            "[" * 2000 + "]" * 2000,
-            None,
-        ):
-            with (
-                self.subTest(raw=str(raw)[:40]),
-                patch.object(product_manager_agent, "chat_completion", return_value=raw) as chat,
-            ):
-                with self.assertRaisesRegex(BusinessException, "PRD 格式异常") as caught:
-                    product_manager_agent.generate_app_spec(model_input())
-                self.assertNotIn("private requirement", caught.exception.msg)
-                chat.assert_called_once()
+    def test_invalid_prd_calls_are_bounded_and_do_not_echo_private_input(self):
+        invalid = tool_turn("write_prd", {"prd": {"goal": "private requirement"}})
+        with patch.object(
+            product_manager_agent,
+            "chat_with_tools",
+            side_effect=[invalid] * product_manager_agent.MAX_PRODUCT_MANAGER_TOOL_TURNS,
+        ) as chat:
+            with self.assertRaisesRegex(BusinessException, "预算已用尽") as caught:
+                product_manager_agent.generate_app_spec(model_input())
+        self.assertNotIn("private requirement", caught.exception.msg)
+        self.assertEqual(chat.call_count, product_manager_agent.MAX_PRODUCT_MANAGER_TOOL_TURNS)
 
     def test_input_rejects_future_duplicate_out_of_order_and_assistant_sources(self):
         base = model_input().model_dump()
@@ -338,14 +328,14 @@ class ProductManagerAgentTests(unittest.TestCase):
     def test_mutated_input_is_revalidated_before_model_call(self):
         payload = model_input()
         payload.recent_messages.append(payload.source_message)
-        with patch.object(product_manager_agent, "chat_completion") as chat:
+        with patch.object(product_manager_agent, "chat_with_tools") as chat:
             with self.assertRaisesRegex(BusinessException, "需求输入"):
                 product_manager_agent.generate_app_spec(payload)
         chat.assert_not_called()
 
     def test_llm_failure_propagates_without_automatic_retry(self):
         failure = BusinessException("大模型请求超时，请稍后重试")
-        with patch.object(product_manager_agent, "chat_completion", side_effect=failure) as chat:
+        with patch.object(product_manager_agent, "chat_with_tools", side_effect=failure) as chat:
             with self.assertRaises(BusinessException) as caught:
                 product_manager_agent.generate_app_spec(model_input())
         self.assertIs(caught.exception, failure)
@@ -370,9 +360,7 @@ class ProductManagerServiceTests(unittest.TestCase):
         Base.metadata.create_all(self.engine)
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.chat = self.enterContext(
-            patch.object(
-                product_manager_agent, "chat_completion", return_value=json.dumps(valid_spec())
-            )
+            patch.object(product_manager_agent, "chat_with_tools", return_value=prd_turn())
         )
         with self.session_factory() as db:
             self.owner = User(username="owner", email="owner@test.com", hashed_password="unused")
@@ -663,7 +651,7 @@ class ProductManagerServiceTests(unittest.TestCase):
             with self.session_factory() as writer:
                 writer.get(Task, self.task.id).status = "cancelled"
                 writer.commit()
-            return json.dumps(valid_spec())
+            return prd_turn()
 
         self.chat.side_effect = cancel_during_model
         with self.session_factory() as db:
@@ -679,7 +667,7 @@ class ProductManagerServiceTests(unittest.TestCase):
             with self.session_factory() as writer:
                 writer.add(self._message(self.project.id, 5, "调用模型期间又有了新需求"))
                 writer.commit()
-            return json.dumps(valid_spec())
+            return prd_turn()
 
         self.chat.side_effect = add_message
         with self.session_factory() as db:
@@ -704,7 +692,10 @@ class ProductManagerServiceTests(unittest.TestCase):
         self._assert_not_published()
 
     def test_invalid_output_and_llm_failures_leave_task_unfinished_and_create_no_artifact(self):
-        for failure in ("not JSON", BusinessException("大模型调用失败")):
+        for failure in (
+            ChatWithToolsResult(content="not a tool call"),
+            BusinessException("大模型调用失败"),
+        ):
             with self.subTest(failure=str(failure)), self.session_factory() as db:
                 self.chat.reset_mock()
                 self.chat.side_effect = failure if isinstance(failure, Exception) else None

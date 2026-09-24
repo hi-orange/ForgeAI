@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from unittest.mock import patch
 
 from sqlalchemy import select, update
@@ -10,6 +9,7 @@ from test_architect import valid_design
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
     approval_payload,
+    prd_turn,
     valid_spec,
 )
 
@@ -40,7 +40,7 @@ from app.services.requirements import get_requirements_status, pause_active_exec
 class EngineeringClaimTests(ProductManagerWorkflowFixture):
     def _publish_only(self):
         _, task = self._create_plan()
-        self.chat.return_value = json.dumps(valid_spec())
+        self.chat.return_value = prd_turn(valid_spec())
         with self.session_factory() as db:
             task_service.claim_product_manager_task(
                 db,

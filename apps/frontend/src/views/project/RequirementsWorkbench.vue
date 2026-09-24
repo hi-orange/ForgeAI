@@ -44,6 +44,7 @@
                   busy ||
                   status?.state === 'running' ||
                   status?.state === 'design_running' ||
+                  status?.state === 'quality_running' ||
                   (status?.state === 'engineering_running' && !status.error),
               }"
             />{{ stateLabel }}
@@ -52,88 +53,113 @@
           <BuildTimeline
             v-if="status?.activities?.length"
             :activities="status.activities"
-            :running="engineeringRunning"
+            :running="timelineRunning"
             @open-file="openWorkspaceFile"
           />
         </article>
 
-        <section v-if="canApprove" class="approval-card" aria-labelledby="plan-heading">
-          <div class="plan-heading">
-            <h2 id="plan-heading">确认构建计划</h2>
-            <span>{{ selectedCount }} 项已选</span>
-          </div>
-          <p class="plan-hint">勾选本次要实现的内容，也可以编辑或新增。</p>
-          <label v-if="editing" class="goal-label"
+        <details
+          v-if="canApprove || showApprovedPlan"
+          class="approval-panel"
+          :open="approvalPanelOpen"
+          @toggle="onApprovalToggle"
+        >
+          <summary>
+            <span class="approval-title">批准</span>
+            <span class="approval-meta">
+              <span class="approval-count">{{
+                canApprove ? `${checkedPlanCount} 项已选` : `${approvedPlanItems.length} 项`
+              }}</span>
+              <span class="approval-chevron" aria-hidden="true" />
+            </span>
+          </summary>
+          <p class="plan-hint">
+            {{
+              canApprove
+                ? '请从以下需求中选择希望优先实现的内容（可多选）。也可以编辑或新增。'
+                : '以下是本次已批准并用于构建的需求清单。'
+            }}
+          </p>
+          <label v-if="canApprove && editing" class="goal-label"
             >应用目标<textarea v-model="planGoal" rows="2" maxlength="2000" :disabled="busy" />
           </label>
-          <p v-else class="plan-goal">{{ planGoal }}</p>
+          <p v-else-if="planGoal" class="plan-goal">{{ planGoal }}</p>
           <div class="plan-list">
-            <div
-              v-for="(item, index) in planItems"
-              :key="item.id"
-              class="plan-row"
-              :class="{ unchecked: !item.checked }"
-            >
-              <span class="item-number">{{ index + 1 }}.</span>
-              <textarea
-                v-if="editing"
-                v-model="item.label"
-                rows="2"
-                maxlength="2000"
-                :aria-label="'编辑第 ' + (index + 1) + ' 项需求'"
-                :disabled="busy"
-              />
-              <label v-else :for="'plan-check-' + item.id"
-                ><small v-if="item.kind !== 'feature'">{{ kindLabel(item.kind) }} · </small
-                >{{ item.label }}</label
+            <template v-if="canApprove">
+              <div
+                v-for="item in planItems"
+                :key="item.id"
+                class="plan-row"
+                :class="{ unchecked: !item.checked }"
               >
-              <input
-                :id="'plan-check-' + item.id"
-                v-model="item.checked"
-                type="checkbox"
-                :disabled="busy"
-                :aria-label="'选择第 ' + (index + 1) + ' 项：' + item.label"
-              />
-              <label v-if="needsAcceptance(item)" class="acceptance-label">
-                怎样算完成
+                <input
+                  :id="'plan-check-' + item.id"
+                  v-model="item.checked"
+                  type="checkbox"
+                  :disabled="busy"
+                  :aria-label="'选择：' + item.label"
+                />
                 <textarea
-                  v-model="item.acceptance"
+                  v-if="editing"
+                  v-model="item.label"
                   rows="2"
                   maxlength="2000"
+                  :aria-label="'编辑需求：' + item.label"
                   :disabled="busy"
-                  :aria-label="'第 ' + (index + 1) + ' 项功能的验收条件'"
-                  placeholder="写下操作和预期结果，例如：游客打开首页，无需登录即可看到公开列表。"
                 />
-              </label>
+                <label v-else :for="'plan-check-' + item.id">{{ item.label }}</label>
+                <label v-if="needsAcceptance(item)" class="acceptance-label">
+                  怎样算完成
+                  <textarea
+                    v-model="item.acceptance"
+                    rows="2"
+                    maxlength="2000"
+                    :disabled="busy"
+                    :aria-label="'验收条件：' + item.label"
+                    placeholder="写下操作和预期结果，例如：游客打开首页，无需登录即可看到公开列表。"
+                  />
+                </label>
+              </div>
+              <p v-if="!planItems.length" class="plan-hint">添加第一项功能，即可批准计划。</p>
+            </template>
+            <template v-else>
+              <div v-for="item in approvedPlanItems" :key="item.id" class="plan-row approved">
+                <span class="plan-check" aria-hidden="true">✓</span>
+                <span>{{ item.label }}</span>
+              </div>
+            </template>
+          </div>
+          <template v-if="canApprove">
+            <form class="add-requirement" @submit.prevent="addRequirement">
+              <input
+                v-model="newRequirement"
+                aria-label="新增需求"
+                placeholder="＋ 新增一项需求…"
+                maxlength="2000"
+                :disabled="busy"
+              />
+              <button
+                type="submit"
+                :disabled="busy || !newRequirement.trim() || featureCount >= 50"
+              >
+                添加
+              </button>
+            </form>
+            <div class="plan-actions">
+              <button type="button" class="secondary" :disabled="busy" @click="editing = !editing">
+                {{ editing ? '完成编辑' : '编辑计划' }}
+              </button>
+              <button
+                type="button"
+                class="primary"
+                :disabled="busy || !selectedCount || !planGoal.trim()"
+                @click="approve"
+              >
+                {{ busy ? '处理中…' : '批准并构建' }}
+              </button>
             </div>
-            <p v-if="!planItems.length" class="plan-hint">添加第一项功能，即可批准计划。</p>
-          </div>
-          <form class="add-requirement" @submit.prevent="addRequirement">
-            <input
-              v-model="newRequirement"
-              aria-label="新增需求"
-              placeholder="＋ 新增一项需求…"
-              maxlength="2000"
-              :disabled="busy"
-            />
-            <button type="submit" :disabled="busy || !newRequirement.trim() || featureCount >= 50">
-              添加
-            </button>
-          </form>
-          <div class="plan-actions">
-            <button type="button" class="secondary" :disabled="busy" @click="editing = !editing">
-              {{ editing ? '完成编辑' : '编辑计划' }}
-            </button>
-            <button
-              type="button"
-              class="primary"
-              :disabled="busy || !selectedCount || !planGoal.trim()"
-              @click="approve"
-            >
-              {{ busy ? '处理中…' : '批准并构建' }}
-            </button>
-          </div>
-        </section>
+          </template>
+        </details>
         <div
           v-if="status?.state === 'needs_user_input' && !status.app_spec?.features.length"
           class="clarification"
@@ -148,33 +174,20 @@
               status?.error ||
               (status?.state === 'engineering_running'
                 ? '构建似乎还没有开始写入文件，可以继续。'
-                : status?.state === 'ready_for_design'
-                  ? '计划已批准，点击继续处理。'
+                : status?.state === 'ready_for_delivery'
+                  ? '计划已批准，正在自动启动后续构建；若一直停在这里可以手动继续。'
                   : '上次处理尚未完成，可以继续。')
             }}
           </p>
           <button class="secondary" type="button" :disabled="busy" @click="resume">继续处理</button>
         </div>
-        <details
-          v-if="
-            status?.state === 'design_pending' ||
-            status?.state === 'design_running' ||
-            status?.state === 'engineering_running' ||
-            status?.state === 'engineering_generated'
-          "
-          class="approved-card"
-        >
-          <summary>
-            <WorkbenchIcon name="check" /> 计划已批准 ·
-            {{ status.app_spec?.features.length }} 项功能
-          </summary>
-          <ul>
-            <li v-for="feature in status.app_spec?.features" :key="feature.id">
-              {{ feature.text }}
-            </li>
-          </ul>
-        </details>
-        <p v-if="error" class="error" role="alert">{{ error }}</p>
+        <div v-if="canRetryStart" class="resume-card">
+          <p>{{ error }}</p>
+          <button class="secondary" type="button" :disabled="busy" @click="retryStart">
+            重新连接并继续
+          </button>
+        </div>
+        <p v-if="error && !canRetryStart" class="error" role="alert">{{ error }}</p>
       </div>
       <form class="composer" @submit.prevent="submit">
         <textarea
@@ -251,7 +264,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import ForgeLogo from '@/components/ForgeLogo.vue'
 import type { WorkspaceView } from './projectView'
-import { isNearThreadBottom } from './buildTimeline'
+import { isNearThreadBottom, isWriteActivity } from './buildTimeline'
 import AppPreviewPane from './components/AppPreviewPane.vue'
 import BuildTimeline from './components/BuildTimeline.vue'
 import ProjectTopbar, { type TopbarModeTab } from './components/ProjectTopbar.vue'
@@ -272,16 +285,19 @@ const {
   refreshing,
   canWrite,
   canResume,
+  canRetryStart,
   canPause,
   canApprove,
   planGoal,
   planItems,
   selectedCount,
+  checkedPlanCount,
   addPlanItem,
   needsAcceptance,
   refresh,
   submit,
   resume,
+  retryStart,
   pause,
   approve,
 } = useRequirements(projectId)
@@ -289,6 +305,7 @@ const chatCollapsed = ref(false)
 const editing = ref(false)
 const newRequirement = ref('')
 const historyOpen = ref(false)
+const approvalPanelOpen = ref(true)
 const workspaceView = ref<WorkspaceView>('design')
 const requestedWorkspacePath = ref<string | null>(null)
 const workspaceRequestSequence = ref(0)
@@ -297,6 +314,36 @@ let autoOpenedWorkspace = false
 const featureCount = computed(
   () => planItems.value.filter((item) => item.kind === 'feature').length,
 )
+const showApprovedPlan = computed(
+  () =>
+    status.value?.state === 'ready_for_delivery' ||
+    status.value?.state === 'design_pending' ||
+    status.value?.state === 'design_running' ||
+    status.value?.state === 'engineering_pending' ||
+    status.value?.state === 'engineering_running' ||
+    status.value?.state === 'engineering_generated' ||
+    status.value?.state === 'quality_pending' ||
+    status.value?.state === 'quality_running' ||
+    status.value?.state === 'completed' ||
+    status.value?.state === 'quality_failed',
+)
+const approvedPlanItems = computed(() => {
+  const spec = status.value?.app_spec
+  if (!spec) return []
+  return [
+    ...spec.features.map((item) => ({ id: item.id, label: item.text })),
+    ...spec.data_requirements.map((item) => ({ id: item.id, label: item.text })),
+    ...spec.interface_requirements.map((item) => ({ id: item.id, label: item.text })),
+    ...spec.constraints.map((item) => ({ id: item.id, label: item.text })),
+  ]
+})
+function onApprovalToggle(event: Event) {
+  const target = event.target
+  if (target instanceof HTMLDetailsElement) approvalPanelOpen.value = target.open
+}
+watch(canApprove, (value) => {
+  if (value) approvalPanelOpen.value = true
+})
 const modeTabs: TopbarModeTab[] = [
   { id: 'design', icon: 'desktop', label: '预览' },
   { id: 'editor', icon: 'editor-code', label: '编辑器' },
@@ -312,30 +359,38 @@ const labels = {
   stopped: '当前流程已停止',
   needs_user_input: '补充一个想法',
   awaiting_approval: '构建计划已准备好',
-  ready_for_design: '计划已批准',
+  ready_for_delivery: '计划已批准',
   design_pending: '计划已批准，正在开始构建',
   design_running: 'Architect 正在设计系统',
+  engineering_pending: '等待 Code Engineer 开始实现',
   engineering_running: '正在根据获批需求编写代码',
   engineering_generated: '业务代码已写入工作区',
-}
-function kindLabel(kind: string) {
-  return (
-    ({ data: '数据', interface: '界面', constraint: '约束' } as Record<string, string>)[kind] ??
-    kind
-  )
+  quality_pending: '代码已生成，等待独立验证',
+  quality_running: 'Test Engineer 正在独立验证',
+  completed: '构建和质量验证已完成',
+  quality_failed: '质量验证未通过',
 }
 const postApproval = computed(
   () =>
+    status.value?.state === 'ready_for_delivery' ||
     status.value?.state === 'design_pending' ||
     status.value?.state === 'design_running' ||
+    status.value?.state === 'engineering_pending' ||
     status.value?.state === 'engineering_running' ||
-    status.value?.state === 'engineering_generated',
+    status.value?.state === 'engineering_generated' ||
+    status.value?.state === 'quality_pending' ||
+    status.value?.state === 'quality_running' ||
+    status.value?.state === 'completed' ||
+    status.value?.state === 'quality_failed',
 )
-const engineeringRunning = computed(
-  () => status.value?.state === 'engineering_running' && !status.value.error,
+const timelineRunning = computed(
+  () =>
+    ['design_running', 'engineering_running', 'quality_running'].includes(
+      status.value?.state ?? '',
+    ) && !status.value?.error,
 )
 const successfulWrites = computed(
-  () => status.value?.activities?.filter((step) => step.name === 'apply_patch' && step.ok) ?? [],
+  () => status.value?.activities?.filter((step) => isWriteActivity(step.name) && step.ok) ?? [],
 )
 const workspaceGeneration = computed(() => successfulWrites.value.length)
 const latestWrittenPath = computed(() => successfulWrites.value.at(-1)?.detail || null)
@@ -354,13 +409,27 @@ const stateLabel = computed(() => {
   if (understandingFirstTurn.value) return '正在理解…'
   if (busy.value) return '正在处理…'
   if (awaitingIdeaAfterReply.value) return '等待你的描述'
+  if (canRetryStart.value) return '模型连接失败'
   return status.value ? labels[status.value.state] : '正在加载项目…'
 })
 const agentText = computed(() => {
   if (awaitingIdeaAfterReply.value) return ''
   if (understandingFirstTurn.value) return '我在理解你刚才说的话。'
+  if (canRetryStart.value) return '构建还没有开始。恢复网络后，可从原需求继续，不会重复创建任务。'
   if (canApprove.value) return '我整理了一份初步计划。选择你想要的功能，随时补充自己的想法。'
   if (postApproval.value) {
+    if (status.value?.state === 'completed') {
+      return '代码已经通过独立验收，当前版本可以使用。'
+    }
+    if (status.value?.state === 'quality_failed') {
+      return status.value.error || '独立验收发现问题，当前版本未标记为可用。'
+    }
+    if (status.value?.state === 'quality_running') {
+      return 'Test Engineer 正在只读检查准确代码结果、运行检查并逐条验证验收条件。'
+    }
+    if (status.value?.state === 'quality_pending') {
+      return '代码成果已冻结，等待 Test Engineer 独立验收。'
+    }
     if (status.value?.state === 'engineering_generated') {
       return '已按获批需求改写工作区源码。可在「编辑器」查看；正式验收与预览仍未标记为完成。'
     }
@@ -371,6 +440,18 @@ const agentText = computed(() => {
     }
     if (status.value?.state === 'design_running') {
       return 'Architect 正在把获批 PRD 转化为模块、接口和数据结构设计。'
+    }
+    if (status.value?.state === 'ready_for_delivery') {
+      return status.value.error
+        ? '计划已批准。自动分派下一步没有完成，可以继续处理。'
+        : '计划已批准，正在启动后续构建。'
+    }
+    if (
+      status.value?.state === 'design_pending' ||
+      status.value?.state === 'engineering_pending' ||
+      status.value?.state === 'quality_pending'
+    ) {
+      return '计划已批准，正在开始构建应用。'
     }
     return '计划已批准，正在开始构建应用。'
   }
@@ -433,8 +514,13 @@ watch(
       workspaceReady &&
       (state === 'design_pending' ||
         state === 'design_running' ||
+        state === 'engineering_pending' ||
         state === 'engineering_running' ||
-        state === 'engineering_generated')
+        state === 'engineering_generated' ||
+        state === 'quality_pending' ||
+        state === 'quality_running' ||
+        state === 'completed' ||
+        state === 'quality_failed')
     ) {
       autoOpenedWorkspace = true
       workspaceView.value = 'editor'
@@ -638,31 +724,56 @@ summary:focus-visible {
   line-height: 1.9;
   color: #787b8b;
 }
-.approval-card {
-  padding: 16px 8px 8px;
-  border-radius: 22px;
-  background: #e2e5f8;
+.approval-panel {
+  margin: 14px 0;
+  padding: 4px 8px 10px;
+  border-radius: 18px;
+  background: #eceef5;
+  border: 1px solid #e0e3ee;
 }
-.plan-heading {
+.approval-panel > summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 8px;
-  h2 {
-    margin: 0;
-    font-size: 14px;
-    font-weight: 600;
-  }
-  span {
-    font-size: 11px;
-    color: #626b93;
-  }
+  gap: 12px;
+  list-style: none;
+  cursor: pointer;
+  padding: 12px 8px 8px;
+}
+.approval-panel > summary::-webkit-details-marker {
+  display: none;
+}
+.approval-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: #2f3550;
+}
+.approval-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.approval-count {
+  font-size: 12px;
+  color: #6b7390;
+}
+.approval-chevron {
+  width: 8px;
+  height: 8px;
+  border-right: 1.5px solid #6b7390;
+  border-bottom: 1.5px solid #6b7390;
+  transform: rotate(45deg);
+  transition: transform 0.15s ease;
+}
+.approval-panel[open] > summary .approval-chevron {
+  transform: rotate(-135deg);
+  margin-top: 4px;
 }
 .plan-hint,
 .plan-goal {
-  margin: 8px;
+  margin: 0 8px 10px;
   color: #59617e;
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
@@ -670,31 +781,33 @@ summary:focus-visible {
   color: #323b5f;
 }
 .plan-list {
-  border-radius: 17px;
-  padding: 5px 12px;
+  border-radius: 14px;
+  padding: 4px 14px;
   background: #fff;
-  margin-top: 12px;
+  margin: 0 4px;
 }
 .plan-row {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  padding: 13px 0;
-  line-height: 1.75;
+  gap: 12px;
+  padding: 14px 0;
+  line-height: 1.65;
+  color: #2f3550;
+  border-bottom: 1px solid #eef0f6;
+  &:last-child {
+    border-bottom: 0;
+  }
   label {
     flex: 1;
     cursor: pointer;
     overflow-wrap: anywhere;
   }
-  small {
-    color: #737e9c;
-  }
-  input {
-    margin-top: 5px;
+  input[type='checkbox'] {
+    margin-top: 3px;
     accent-color: var(--accent);
     flex: 0 0 auto;
-    width: 15px;
-    height: 15px;
+    width: 16px;
+    height: 16px;
   }
   textarea {
     flex: 1;
@@ -707,13 +820,25 @@ summary:focus-visible {
   &.unchecked label {
     color: #a0a3af;
   }
+  &.approved {
+    align-items: flex-start;
+  }
 }
-.item-number {
-  color: #768097;
+.plan-check {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
 }
 .goal-label {
   display: block;
-  padding: 8px;
+  padding: 0 8px 8px;
   color: #626b93;
   textarea {
     display: block;
@@ -729,7 +854,7 @@ summary:focus-visible {
 .add-requirement {
   display: flex;
   gap: 6px;
-  padding: 8px 4px;
+  padding: 8px 8px 0;
   input {
     min-width: 0;
     flex: 1;
@@ -748,6 +873,7 @@ summary:focus-visible {
 .plan-actions {
   display: flex;
   gap: 8px;
+  padding: 10px 4px 0;
   button {
     flex: 1;
   }
@@ -765,20 +891,12 @@ summary:focus-visible {
   color: var(--accent);
 }
 .resume-card,
-.clarification,
-.approved-card {
+.clarification {
   padding: 14px;
   border: 1px solid #e0e3ee;
   border-radius: 14px;
   margin: 14px 0;
   line-height: 1.8;
-}
-.approved-card summary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  color: #4c6285;
 }
 .error {
   padding: 12px;

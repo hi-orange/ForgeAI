@@ -68,6 +68,7 @@ def read_file(
     end_line: int | None = None,
     tool_call_id: str = "call_read",
 ) -> ToolExecutionResult:
+    """Bounded read for agent tools. Prefer ranges for large files."""
     target = safe_path_under_root(root, path)
     if not is_text_file(target):
         raise ConflictException("该文件不是可编辑的文本文件")
@@ -98,10 +99,51 @@ def read_file(
                 "max_range_lines": MAX_READ_RANGE_LINES,
             },
         )
+    if not lines:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=True,
+            summary=f"读取 {path}（空文件）",
+            data={
+                "path": path.replace("\\", "/"),
+                "start_line": 1,
+                "end_line": 0,
+                "line_count": 0,
+                "content": "",
+                "content_hash": sha256_bytes(raw),
+            },
+        )
     start = max(1, start_line)
+    if start > len(lines):
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=False,
+            error_code="RANGE_INVALID",
+            summary=f"{path} 起始行超出文件（共 {len(lines)} 行）",
+            data={
+                "path": path.replace("\\", "/"),
+                "line_count": len(lines),
+                "content_hash": sha256_bytes(raw),
+                "max_range_lines": MAX_READ_RANGE_LINES,
+            },
+        )
     end = min(len(lines), end_line) if end_line is not None else len(lines)
     if end < start:
-        raise ConflictException("行范围无效")
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=False,
+            error_code="RANGE_INVALID",
+            summary="行范围无效：结束行必须不小于起始行",
+            data={
+                "path": path.replace("\\", "/"),
+                "line_count": len(lines),
+                "content_hash": sha256_bytes(raw),
+                "max_range_lines": MAX_READ_RANGE_LINES,
+            },
+        )
     if end_line is not None and end - start + 1 > MAX_READ_RANGE_LINES:
         return ToolExecutionResult(
             tool_call_id=tool_call_id,
@@ -142,6 +184,59 @@ def read_file(
             "end_line": end,
             "line_count": len(lines),
             "content": excerpt,
+            "content_hash": sha256_bytes(raw),
+        },
+    )
+
+
+def read_workspace_source(
+    root: Path,
+    *,
+    path: str,
+    tool_call_id: str = "call_read_full",
+) -> ToolExecutionResult:
+    """Full-file read for platform context assembly, capped at the write size limit."""
+
+    target = safe_path_under_root(root, path)
+    if not is_text_file(target):
+        raise ConflictException("该文件不是可编辑的文本文件")
+    raw = target.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=False,
+            error_code="NOT_TEXT",
+            summary=f"{path} 不是 UTF-8 文本",
+        )
+    if len(raw) > MAX_WRITE_BYTES:
+        return ToolExecutionResult(
+            tool_call_id=tool_call_id,
+            name="read_file",
+            ok=False,
+            error_code="FILE_TOO_LARGE",
+            summary=f"{path} 超过可写入上限（{MAX_WRITE_BYTES} 字节），无法装配完整上下文",
+            data={
+                "path": path.replace("\\", "/"),
+                "size_bytes": len(raw),
+                "line_count": len(text.splitlines()),
+                "content_hash": sha256_bytes(raw),
+            },
+        )
+    lines = text.splitlines()
+    return ToolExecutionResult(
+        tool_call_id=tool_call_id,
+        name="read_file",
+        ok=True,
+        summary=(f"读取 {path}（完整 {len(lines)} 行）" if lines else f"读取 {path}（空文件）"),
+        data={
+            "path": path.replace("\\", "/"),
+            "start_line": 1,
+            "end_line": len(lines),
+            "line_count": len(lines),
+            "content": text,
             "content_hash": sha256_bytes(raw),
         },
     )

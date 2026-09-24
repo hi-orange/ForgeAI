@@ -75,11 +75,16 @@ class RequirementsStatus(BaseModel):
         "stopped",
         "needs_user_input",
         "awaiting_approval",
-        "ready_for_design",
+        "ready_for_delivery",
         "design_pending",
         "design_running",
+        "engineering_pending",
         "engineering_running",
         "engineering_generated",
+        "quality_pending",
+        "quality_running",
+        "completed",
+        "quality_failed",
     ] = "not_started"
     execution_id: str | None = None
     execution_expires_at: datetime | None = None
@@ -90,5 +95,7 @@ class RequirementsStatus(BaseModel):
     # successful business-code write has happened in this run.
     workspace_ready: bool = False
     code_ready: bool = False
+    code_item_id: str | None = None
+    test_report_item_id: str | None = None
     workspace_path: str | None = None
     activities: list[EngineeringActivity] = Field(default_factory=list)

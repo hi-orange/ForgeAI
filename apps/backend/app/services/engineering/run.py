@@ -14,6 +14,7 @@ from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.orchestration.code_engineer import run_engineering_workflow
 from app.services.engineering.claim import read_frozen_input_snapshot
+from app.services.engineering.completion import complete_code_engineer_task
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
 
 logger = logging.getLogger("forgeai")
@@ -85,6 +86,51 @@ def _record_loop_failure(
         logger.exception("failed to persist engineering loop error execution_id=%s", execution_id)
 
 
+def _run_and_publish(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    task_id: str,
+    execution_id: str,
+    *,
+    session_factory: Any | None = None,
+) -> dict:
+    result = dict(
+        run_engineering_workflow(
+            db,
+            user,
+            project_id,
+            run_id,
+            task_id,
+            execution_id,
+            session_factory=session_factory,
+        )
+    )
+    if result.get("outcome") != "generated":
+        return result
+    code_item = complete_code_engineer_task(
+        db,
+        user,
+        project_id,
+        run_id,
+        task_id,
+        execution_id,
+    )
+    # Import locally: Leader depends on the engineering service facade.
+    from app.services import leader as leader_service
+
+    quality_task = leader_service.dispatch_completed_code(
+        db,
+        user,
+        project_id,
+        run_id,
+        code_item.item_id,
+    )
+    result.update(code_item_id=code_item.item_id, quality_task_id=quality_task.task_id)
+    return result
+
+
 def start_claimed_engineering(
     db: Session,
     user: User,
@@ -97,15 +143,13 @@ def start_claimed_engineering(
 ) -> dict:
     """Run the coding loop. Default is a background thread so the chat can poll tool steps."""
     if wait:
-        return dict(
-            run_engineering_workflow(
-                db,
-                user,
-                project_id,
-                run_id,
-                task.task_id,
-                execution.execution_id,
-            )
+        return _run_and_publish(
+            db,
+            user,
+            project_id,
+            run_id,
+            task.task_id,
+            execution.execution_id,
         )
     if db.new or db.dirty or db.deleted:
         db.commit()
@@ -132,7 +176,7 @@ def start_claimed_engineering(
                 if owner is None:
                     _record_loop_failure(factory, task_id, execution_id, "工程执行用户不存在")
                     return
-                run_engineering_workflow(
+                _run_and_publish(
                     session,
                     owner,
                     project_id,
