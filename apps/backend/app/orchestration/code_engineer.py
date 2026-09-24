@@ -13,27 +13,30 @@ from app.agents.code_engineer import generate_file_content, plan_work_item_files
 from app.core.exceptions import BusinessException, ConflictException
 from app.core.settings import settings
 from app.generation.delivery import (
+    MAX_FILES_PER_WORK_ITEM,
     FileTask,
     ImplementationPlan,
     WorkItem,
     plan_delivery,
+    plan_quality_repair,
     work_items_to_json,
 )
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
+from app.schemas.test_report import TestReport
 from app.services.engineering.claim import DEFAULT_CALL_BUDGET, read_frozen_input_snapshot
 from app.services.engineering.handoff import load_approved_app_spec
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
+from app.tools import project_deps as project_deps_tools
 from app.tools.paths import is_text_file, safe_path_under_root
 
 CHECKPOINT_KIND = "engineering_checkpoint"
 CHECKPOINT_SCHEMA_VERSION = 4
 EXECUTION_MODE = "planned_files_v1"
-MAX_ACTIVITY = 80
 MAX_CONTEXT_FILES = 160
 MAX_PLAN_HISTORY = 24
 
@@ -116,6 +119,7 @@ def _new_checkpoint() -> dict[str, Any]:
         "current_work_item_id": None,
         "active_file_plan": None,
         "active_plan_kind": None,
+        "deferred_file_plan": [],
         "plan_history": [],
         "repair_rounds": {},
         "repair_context": None,
@@ -143,6 +147,7 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
         ("current_work_item_id", None),
         ("active_file_plan", None),
         ("active_plan_kind", None),
+        ("deferred_file_plan", []),
         ("plan_history", []),
         ("repair_rounds", {}),
         ("repair_context", None),
@@ -176,6 +181,38 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
             checkpoint.pop("blocked_reason_code", None)
             checkpoint.pop("last_error", None)
     return checkpoint
+
+
+def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
+    """Make an explicit recovery attempt runnable from its last real evidence."""
+
+    if checkpoint.get("outcome") != "blocked":
+        return False
+    reason = str(checkpoint.get("blocked_reason") or "")
+    checkpoint["outcome"] = "running"
+    checkpoint["blocked_reason"] = None
+    checkpoint.pop("blocked_reason_code", None)
+    checkpoint.pop("last_error", None)
+
+    if "自动修复轮次已用尽" in reason:
+        current = _current_item(checkpoint.get("work_items") or [])
+        history = checkpoint.get("plan_history")
+        latest = history[-1] if isinstance(history, list) and history else None
+        failed_check = latest.get("check") if isinstance(latest, dict) else None
+        if current is not None and isinstance(failed_check, dict):
+            rounds = checkpoint.get("repair_rounds")
+            rounds = rounds if isinstance(rounds, dict) else {}
+            rounds[str(current.get("id") or "")] = 1
+            checkpoint["repair_rounds"] = rounds
+            checkpoint["repair_context"] = {
+                "round": 1,
+                "failed_check": failed_check,
+                "previous_plan": latest.get("plan"),
+                "modified_files": list(checkpoint.get("modified_files") or []),
+            }
+            checkpoint["active_file_plan"] = None
+            checkpoint["active_plan_kind"] = None
+    return True
 
 
 def _save_snapshot(db: Session, execution_id: str, snapshot: dict[str, Any]) -> None:
@@ -224,6 +261,7 @@ def _append_activity(
     ok: bool,
 ) -> None:
     activity = list(checkpoint.get("activity") or [])
+    current = _current_item(checkpoint.get("work_items") or [])
     activity.append(
         {
             "id": f"{name}_{len(activity) + 1}",
@@ -231,9 +269,13 @@ def _append_activity(
             "label": label,
             "detail": detail[:200],
             "ok": ok,
+            "work_item_id": str(current.get("id") or "") if current else "",
+            "work_item_title": str(current.get("title") or "") if current else "",
         }
     )
-    checkpoint["activity"] = activity[-MAX_ACTIVITY:]
+    # Activity is the durable, refresh-safe run history. Trimming the head made the
+    # user-visible step counter move backwards during long builds.
+    checkpoint["activity"] = activity
 
 
 def _block_checkpoint(
@@ -291,6 +333,39 @@ def _next_file(plan: dict[str, Any]) -> dict[str, Any] | None:
         (item for item in files if isinstance(item, dict) and item.get("status") == "pending"),
         None,
     )
+
+
+def _promote_deferred_batch(
+    *,
+    work_item: WorkItem,
+    deferred: list[dict[str, Any]],
+) -> tuple[ImplementationPlan, list[dict[str, Any]]]:
+    """Take the next up-to-MAX slice from deferred overflow and leave the rest queued."""
+
+    batch_raw = deferred[:MAX_FILES_PER_WORK_ITEM]
+    remaining = deferred[MAX_FILES_PER_WORK_ITEM:]
+    files: list[FileTask] = []
+    for index, item in enumerate(batch_raw, start=1):
+        files.append(
+            FileTask.model_validate(
+                {
+                    **item,
+                    "id": f"file_{index:02d}",
+                    "status": "pending",
+                    "content_hash": None,
+                }
+            )
+        )
+    plan = ImplementationPlan(
+        work_item_id=work_item.id,
+        summary=(
+            f"续写：{work_item.title}（本批 {len(files)} 个文件"
+            + (f"，仍有 {len(remaining)} 个待续写" if remaining else "")
+            + "）"
+        ),
+        files=files,
+    )
+    return plan, remaining
 
 
 def _platform_file_context(root: Path, task: FileTask) -> tuple[dict[str, Any], str | None, int]:
@@ -399,6 +474,15 @@ class _EngineeringNodes:
                 checkpoint["blocked_reason"] = None
                 checkpoint["model_turns"] = 0
                 checkpoint["tool_calls"] = 0
+            resumed = execution.attempt > 1 and _resume_blocked_checkpoint(checkpoint)
+            if resumed:
+                _append_activity(
+                    checkpoint,
+                    name="resume",
+                    label="Resume build",
+                    detail="保留已完成文件，从上次真实检查结果继续修复",
+                    ok=True,
+                )
 
             root = _workspace_root(state["project_id"], state["build_run_id"])
             if not isinstance(checkpoint.get("workspace_file_index"), dict):
@@ -424,8 +508,31 @@ class _EngineeringNodes:
                     return self._result(checkpoint)
                 checkpoint["check_environment_execution_id"] = execution.execution_id
 
+            report_payload = snapshot.get("quality_report")
+            quality_report = (
+                TestReport.model_validate(report_payload)
+                if isinstance(report_payload, dict)
+                else None
+            )
+            current_plan = work_items_to_json(
+                plan_quality_repair(spec, quality_report)
+                if quality_report is not None
+                else plan_delivery(spec)
+            )
             if not checkpoint.get("work_items"):
-                checkpoint["work_items"] = work_items_to_json(plan_delivery(spec))
+                checkpoint["work_items"] = current_plan
+            else:
+                # Delivery descriptions are deterministic derivatives of the frozen AppSpec.
+                # Refresh pending items after platform upgrades while preserving completed work.
+                planned_by_id = {str(item["id"]): item for item in current_plan}
+                refreshed: list[dict[str, Any]] = []
+                for saved in checkpoint["work_items"]:
+                    if not isinstance(saved, dict) or saved.get("status") != "pending":
+                        refreshed.append(saved)
+                        continue
+                    planned = planned_by_id.get(str(saved.get("id") or ""))
+                    refreshed.append(dict(planned) if planned is not None else saved)
+                checkpoint["work_items"] = refreshed
             current = _current_item(checkpoint["work_items"])
             checkpoint["current_work_item_id"] = current["id"] if current else None
             if current is None:
@@ -572,14 +679,15 @@ class _EngineeringNodes:
             detail=(f"根据检查错误规划第 {repair_round} 轮修复" if is_repair else work_item.title),
         )
         try:
-            plan = plan_work_item_files(
+            batch = plan_work_item_files(
                 spec=spec,
                 work_item=work_item,
                 workspace_file_index=checkpoint["workspace_file_index"],
                 system_design=system_design,
                 repair_context=repair_context if is_repair else None,
             )
-            plan = _normalize_plan(root, plan)
+            plan = _normalize_plan(root, batch.plan)
+            deferred = [item.model_dump(mode="json") for item in batch.deferred_files]
         except (BusinessException, ConflictException) as exc:
             return self._persist_failure(state, str(exc), model_kind="planner")
 
@@ -589,11 +697,27 @@ class _EngineeringNodes:
             current["planner_model_calls"] = int(current.get("planner_model_calls") or 0) + 1
             current["active_file_plan"] = plan.model_dump(mode="json")
             current["active_plan_kind"] = "repair" if is_repair else "implementation"
+            if is_repair:
+                existing = current.get("deferred_file_plan")
+                existing_rows = existing if isinstance(existing, list) else []
+                active_paths = {item.path for item in plan.files} | {
+                    str(item.get("path") or "") for item in deferred if isinstance(item, dict)
+                }
+                kept = [
+                    item
+                    for item in existing_rows
+                    if isinstance(item, dict) and str(item.get("path") or "") not in active_paths
+                ]
+                deferred = [*deferred, *kept]
+            current["deferred_file_plan"] = deferred
+            detail = f"{plan.summary}（{len(plan.files)} 个文件）"
+            if deferred:
+                detail = f"{detail}；另有 {len(deferred)} 个文件排队续写"
             _append_activity(
                 current,
                 name="plan_ready",
                 label="File plan ready",
-                detail=f"{plan.summary}（{len(plan.files)} 个文件）",
+                detail=detail,
                 ok=True,
             )
             current_snapshot["checkpoint"] = current
@@ -639,6 +763,7 @@ class _EngineeringNodes:
             "implementation_plan": plan.model_dump(mode="json"),
             "platform_file_context": platform_context,
             "repair_context": checkpoint.get("repair_context"),
+            "quality_report": snapshot.get("quality_report"),
         }
         try:
             content = generate_file_content(
@@ -693,6 +818,24 @@ class _EngineeringNodes:
                     detail=current_task.path,
                     ok=True,
                 )
+                sync = project_deps_tools.sync_manifest_dependencies(
+                    root,
+                    current_task.path,
+                    tool_call_id=f"sync_deps_{work_item.id}_{current_task.id}",
+                )
+                if sync is not None:
+                    current["tool_calls"] = int(current.get("tool_calls") or 0) + 1
+                    _append_activity(
+                        current,
+                        name="install_project_dependency",
+                        label="Install project deps",
+                        detail=sync.summary,
+                        ok=sync.ok,
+                    )
+                    # Host package manager missing is non-fatal; isolation checks still
+                    # install from the generated manifest. Real install failures block.
+                    if not sync.ok and sync.error_code == "DEPENDENCY_INSTALL_FAILED":
+                        _block_checkpoint(current, sync.summary, reason_code=sync.error_code)
             current_snapshot["checkpoint"] = current
             _save_snapshot(db, execution.execution_id, current_snapshot)
             renew_execution_lease(db, state["task_id"], execution.execution_id)
@@ -739,26 +882,46 @@ class _EngineeringNodes:
                 current_raw = _current_item(current["work_items"])
                 if current_raw is None or current_raw.get("id") != work_item.id:
                     raise ConflictException("当前工作单元已变化")
-                current_raw["status"] = "completed"
-                current_raw["summary"] = plan.summary[:500]
-                current["active_file_plan"] = None
-                current["active_plan_kind"] = None
-                current["repair_context"] = None
-                next_item = _current_item(current["work_items"])
-                current["current_work_item_id"] = next_item["id"] if next_item else None
-                _append_activity(
-                    current,
-                    name="work_item_complete",
-                    label="Work item complete",
-                    detail=work_item.title,
-                    ok=True,
-                )
-                if next_item is None:
-                    source_hash = result.data.get("source_hash")
-                    if not isinstance(source_hash, str):
-                        raise ConflictException("完整检查没有返回源码 hash")
-                    current["outcome"] = "generated"
-                    current["completed_source_hash"] = source_hash
+                deferred_raw = current.get("deferred_file_plan")
+                deferred = deferred_raw if isinstance(deferred_raw, list) else []
+                pending_deferred = [item for item in deferred if isinstance(item, dict)]
+                if pending_deferred:
+                    next_plan, remaining = _promote_deferred_batch(
+                        work_item=work_item, deferred=pending_deferred
+                    )
+                    current["active_file_plan"] = next_plan.model_dump(mode="json")
+                    current["active_plan_kind"] = "implementation"
+                    current["deferred_file_plan"] = remaining
+                    current["repair_context"] = None
+                    _append_activity(
+                        current,
+                        name="plan_ready",
+                        label="Continue file batch",
+                        detail=next_plan.summary,
+                        ok=True,
+                    )
+                else:
+                    current_raw["status"] = "completed"
+                    current_raw["summary"] = plan.summary[:500]
+                    current["active_file_plan"] = None
+                    current["active_plan_kind"] = None
+                    current["deferred_file_plan"] = []
+                    current["repair_context"] = None
+                    next_item = _current_item(current["work_items"])
+                    current["current_work_item_id"] = next_item["id"] if next_item else None
+                    _append_activity(
+                        current,
+                        name="work_item_complete",
+                        label="Work item complete",
+                        detail=work_item.title,
+                        ok=True,
+                    )
+                    if next_item is None:
+                        source_hash = result.data.get("source_hash")
+                        if not isinstance(source_hash, str):
+                            raise ConflictException("完整检查没有返回源码 hash")
+                        current["outcome"] = "generated"
+                        current["completed_source_hash"] = source_hash
             elif result.error_code == "CHECK_ENVIRONMENT_UNAVAILABLE":
                 _block_checkpoint(current, result.summary, reason_code=result.error_code)
             else:
@@ -778,6 +941,7 @@ class _EngineeringNodes:
                     }
                     current["active_file_plan"] = None
                     current["active_plan_kind"] = None
+                    # Keep deferred_file_plan so overflow still runs after repair succeeds.
             current_snapshot["checkpoint"] = current
             _save_snapshot(db, execution.execution_id, current_snapshot)
             renew_execution_lease(db, state["task_id"], execution.execution_id)

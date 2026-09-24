@@ -14,6 +14,7 @@ from test_product_manager_workflow import valid_spec
 from app.agents.code_engineer import (
     CODE_ENGINEER_PROFILE,
     CODE_ENGINEER_TOOLS,
+    PlannedFileBatch,
     build_code_engineer_messages,
     decide_next_action,
     plan_work_item_files,
@@ -62,18 +63,20 @@ class EngineeringLoopTests(EngineeringClaimTests):
             db.commit()
 
     @staticmethod
-    def _file_plan(work_item_id: str, *, suffix: str = "") -> ImplementationPlan:
-        return ImplementationPlan(
-            work_item_id=work_item_id,
-            summary=f"实现 {work_item_id}",
-            files=[
-                FileTask(
-                    id=f"write_{work_item_id}{suffix}",
-                    path=f"generated/{work_item_id}.py",
-                    description="实现当前功能的完整模块",
-                    context_paths=["backend/app/main.py"],
-                )
-            ],
+    def _file_plan(work_item_id: str, *, suffix: str = "") -> PlannedFileBatch:
+        return PlannedFileBatch(
+            plan=ImplementationPlan(
+                work_item_id=work_item_id,
+                summary=f"实现 {work_item_id}",
+                files=[
+                    FileTask(
+                        id=f"write_{work_item_id}{suffix}",
+                        path=f"generated/{work_item_id}.py",
+                        description="实现当前功能的完整模块",
+                        context_paths=["backend/app/main.py"],
+                    )
+                ],
+            )
         )
 
     @staticmethod
@@ -162,7 +165,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
             ],
         }
         with patch("app.agents.code_engineer.chat_completion", return_value=json.dumps(payload)):
-            plan = plan_work_item_files(
+            batch = plan_work_item_files(
                 spec=spec,
                 work_item=work_item,
                 workspace_file_index={"paths": ["frontend/package.json"]},
@@ -170,8 +173,9 @@ class EngineeringLoopTests(EngineeringClaimTests):
             )
         root = default_workspace_path(self.workspace_root, self.project.id, self.run.run_id)
         root.mkdir(parents=True, exist_ok=True)
-        normalized = _normalize_plan(root, plan)
+        normalized = _normalize_plan(root, batch.plan)
         self.assertEqual(normalized.files[0].path, "build.config.json")
+        self.assertEqual(batch.deferred_files, ())
 
     def test_plan_work_item_files_forces_json_and_retries_invalid_output(self):
         spec = AppSpec.model_validate(valid_spec())
@@ -197,13 +201,13 @@ class EngineeringLoopTests(EngineeringClaimTests):
             return "备注：\n" + json.dumps(payload)
 
         with patch("app.agents.code_engineer.chat_completion", side_effect=fake_chat):
-            plan = plan_work_item_files(
+            batch = plan_work_item_files(
                 spec=spec,
                 work_item=work_item,
                 workspace_file_index={"paths": ["frontend/src/App.vue"]},
                 system_design=None,
             )
-        self.assertEqual(plan.files[0].path, "frontend/src/views/Jobs.vue")
+        self.assertEqual(batch.plan.files[0].path, "frontend/src/views/Jobs.vue")
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(call["json_output"] is True for call in calls))
         self.assertIn("只重新输出完整 JSON", calls[1]["messages"][-1]["content"])
@@ -225,13 +229,13 @@ class EngineeringLoopTests(EngineeringClaimTests):
         }
         fenced = f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```"
         with patch("app.agents.code_engineer.chat_completion", return_value=fenced) as chat:
-            plan = plan_work_item_files(
+            batch = plan_work_item_files(
                 spec=spec,
                 work_item=work_item,
                 workspace_file_index={"paths": []},
                 system_design=None,
             )
-        self.assertEqual(plan.summary, "实现职位列表页")
+        self.assertEqual(batch.plan.summary, "实现职位列表页")
         self.assertTrue(chat.call_args.kwargs["json_output"])
 
     def test_environment_preflight_blocks_before_planner_or_writer(self):

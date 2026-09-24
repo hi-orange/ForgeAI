@@ -272,7 +272,9 @@ def approve_requirements(
             user,
             project_id,
             ProjectMessageCreate(
-                content=f"已批准需求计划：{payload.goal}（{len(features)} 项功能）",
+                # Approval is a user action in the conversation, not a generated summary.
+                # The immutable AppSpec already carries the exact approved goal and checklist.
+                content="批准",
                 client_message_id=payload.client_message_id,
             ),
         )

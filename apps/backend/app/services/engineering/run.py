@@ -72,7 +72,7 @@ def _record_loop_failure(
                     "ok": False,
                 }
             )
-            checkpoint["activity"] = activity[-80:]
+            checkpoint["activity"] = activity
             snapshot["checkpoint"] = checkpoint
             import json
 
@@ -128,6 +128,30 @@ def _run_and_publish(
         code_item.item_id,
     )
     result.update(code_item_id=code_item.item_id, quality_task_id=quality_task.task_id)
+    # Approval starts one SOP that runs through verification. Previously the worker
+    # stopped after merely creating the QA task, leaving every successful code build
+    # stranded in quality_pending until another HTTP request happened to continue it.
+    from app.orchestration.test_engineer import run_test_engineer_task
+
+    try:
+        report_item = run_test_engineer_task(
+            db,
+            user,
+            project_id,
+            run_id,
+            quality_task.task_id,
+        )
+    except Exception as exc:
+        # Code is already published. Test Engineer records quality_error and fails its
+        # own execution; do not rewrite that as a Code Engineer loop crash.
+        logger.warning(
+            "quality verification failed after code generation run_id=%s error=%s",
+            run_id,
+            exc,
+        )
+        result["quality_error"] = str(exc) or "Test Engineer 执行失败"
+        return result
+    result["test_report_item_id"] = report_item.item_id
     return result
 
 

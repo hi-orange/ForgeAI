@@ -129,5 +129,23 @@ class WorkspaceFilesTests(unittest.TestCase):
                 self.assertIn("template", content.content)
 
 
+class WorkspaceReadyOnPauseTests(unittest.TestCase):
+    def test_retry_and_stopped_still_expose_workspace(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.schemas.requirements import RequirementsStatus
+        from app.services.requirements import _attach_workspace_status
+
+        for state in ("retry_available", "stopped"):
+            status = RequirementsStatus(project_id=9, run_id="run_pause", state=state)
+            with (
+                patch("app.services.requirements.workspace_is_ready", return_value=True),
+                patch.object(settings, "runtime_data_root", "runtime-data"),
+            ):
+                out = _attach_workspace_status(MagicMock(), status)
+            self.assertTrue(out.workspace_ready, state)
+            self.assertTrue(out.workspace_path)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,7 +36,6 @@ _ACTIVITY_LABELS = {
     "terminal_run": "检查工程环境",
     "write_system_design": "提交系统设计",
 }
-MAX_ARCHITECT_ACTIVITIES = 30
 
 
 def _load_task(
@@ -152,7 +151,7 @@ def record_architect_activity(
             "ok": observation.ok,
         }
     )
-    checkpoint["activity"] = activity[-MAX_ARCHITECT_ACTIVITIES:]
+    checkpoint["activity"] = activity
     draft["checkpoint"] = checkpoint
     execution.draft = json.loads(json.dumps(draft, ensure_ascii=False))
     task_execution.renew_execution_lease(db, task_id, execution_id)

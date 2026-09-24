@@ -58,6 +58,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
                 "write_new_code",
                 "edit_file_by_replace",
                 "record_engineering_memory",
+                "install_project_dependency",
                 "run_check",
                 "complete_work_item",
                 "report_blocked",

@@ -14,7 +14,7 @@ from app.agents.prompts.leader import (
 )
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.generation.workspace import prepare_engineering_workspace
-from app.models.build_run import BuildRun
+from app.models.build_run import BuildRun, BuildRunStatus
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
 from app.models.plan import Plan
 from app.models.project import Project, ProjectStatus
@@ -34,6 +34,7 @@ from app.schemas.leader import (
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.task import TaskCreate
+from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import plan as plan_service
 from app.services import project as project_service
 from app.services.app_spec import read_app_spec
@@ -61,6 +62,9 @@ from app.services.test_engineer import load_test_inputs
 class DeliveryPath(StrEnum):
     DIRECT = "direct"
     DESIGNED = "designed"
+
+
+MAX_QUALITY_CYCLES = 3
 
 
 def _build_leader_context(
@@ -765,6 +769,126 @@ def dispatch_completed_code(
     except IntegrityError as exc:
         db.rollback()
         raise ConflictException("质量验证派工保存冲突，请重试") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
+def dispatch_quality_repair(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    report_item_id: str,
+) -> Task | None:
+    """Route failed QA evidence back to Code Engineer, with a hard cycle bound."""
+
+    try:
+        run = lock_run(db, user, project_id, run_id)
+        if run.status != "running" or run.stage != "qa" or run.active_slot != 1:
+            raise ConflictException("当前构建不能从质量验证进入修复")
+        row = db.execute(
+            select(ConfigurationItem, Task, Plan)
+            .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+            .join(Task, Task.task_id == TaskResult.task_id)
+            .join(Plan, Plan.plan_id == Task.plan_id)
+            .where(
+                ConfigurationItem.item_id == report_item_id,
+                ConfigurationItem.project_id == project_id,
+                ConfigurationItem.producer_run_id == run_id,
+                Plan.project_id == project_id,
+                Plan.build_run_id == run_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).one_or_none()
+        if row is None:
+            raise NotFoundException("质量报告不存在或不属于当前构建")
+        report_item, quality_task, quality_plan = row
+        if (
+            report_item.semantic_type != ConfigurationItemType.TEST_REPORT.value
+            or report_item.state != "usable"
+            or quality_task.task_key != QUALITY_TASK_KEY
+            or quality_task.recipient != TaskRecipient.TEST_ENGINEER.value
+            or quality_task.status != "succeeded"
+            or quality_plan.status != "succeeded"
+            or len(report_item.upstream_item_ids) != 1
+        ):
+            raise ConflictException("只有已完成的独立验收报告可以触发修复")
+        report = TestReport.model_validate(report_item.payload)
+        if report.quality_conclusion == QualityConclusion.PASSED:
+            raise ConflictException("已通过的质量报告不需要修复")
+        inputs = load_test_inputs(
+            db,
+            project_id,
+            run_id,
+            report_item.upstream_item_ids[0],
+            lock=True,
+        )
+        if report.code_item_id != inputs.code_item.item_id:
+            raise ConflictException("质量报告与被验证代码身份不一致")
+        latest = db.scalar(
+            select(Plan)
+            .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
+            .order_by(Plan.version.desc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if latest is None or latest.plan_id != quality_plan.plan_id:
+            raise ConflictException("质量报告已进入其他后续计划")
+        quality_tasks = list(
+            db.scalars(
+                select(Task)
+                .join(Plan, Task.plan_id == Plan.plan_id)
+                .where(
+                    Plan.project_id == project_id,
+                    Plan.build_run_id == run_id,
+                    Task.task_key == QUALITY_TASK_KEY,
+                    Task.recipient == TaskRecipient.TEST_ENGINEER.value,
+                )
+            ).all()
+        )
+        if len(quality_tasks) >= MAX_QUALITY_CYCLES:
+            run.status = BuildRunStatus.FAILED.value
+            run.active_slot = None
+            run.error = (f"独立验收连续 {MAX_QUALITY_CYCLES} 轮未通过：{report.summary}")[:500]
+            db.commit()
+            return None
+
+        source_item_id = inputs.code_item.upstream_item_ids[0]
+        plan = plan_service.stage_plan(
+            db,
+            user,
+            project_id,
+            run_id,
+            PlanCreate(
+                version=latest.version + 1,
+                cause_message_id=latest.cause_message_id,
+                tasks=[
+                    TaskCreate(
+                        task_key=ENGINEERING_TASK_KEY,
+                        recipient=TaskRecipient.CODE_ENGINEER,
+                        title=f"根据第 {len(quality_tasks)} 轮独立验收修复代码",
+                        instructions=(
+                            "只修复输入 test_report 中有证据的缺陷，保留已经通过的功能；"
+                            "完成平台检查后重新交给独立 Test Engineer 验收。"
+                        ),
+                        expected_output_type=ConfigurationItemType.CODE,
+                        input_configuration_item_ids=[source_item_id, report_item_id],
+                    )
+                ],
+            ),
+        )
+        task = db.scalar(select(Task).where(Task.plan_id == plan.plan_id))
+        assert task is not None
+        run.error = None
+        db.commit()
+        db.refresh(task)
+        return task
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictException("质量修复派工保存冲突，请重试") from exc
     except Exception:
         db.rollback()
         raise

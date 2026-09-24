@@ -15,9 +15,10 @@ from app.models.plan import Plan
 from app.models.project_message import ProjectMessage, ProjectMessageSender
 from app.models.project_message_classification import ProjectMessageCategory
 from app.models.task import Task
+from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
-from app.orchestration.leader import run_architect_and_continue
+from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.orchestration.test_engineer import run_test_engineer_task
 from app.schemas.product_manager_workflow import (
@@ -174,13 +175,14 @@ def continue_requirements(db: Session, user: User, project_id: int) -> Requireme
         return continue_engineering(db, user, project_id, status.run_id)
 
     if status.state == "ready_for_delivery" and status.result:
-        leader_service.dispatch_approved_requirements(
+        task = leader_service.dispatch_approved_requirements(
             db,
             user,
             project_id,
             status.run_id,
             status.result.configuration_item_id,
         )
+        start_dispatched_delivery(db, user, project_id, status.run_id, task)
         return get_requirements_status(db, user, project_id)
 
     if status.state in CONTINUE_PM_STATES and status.message_id:
@@ -210,13 +212,24 @@ def approve_requirement_plan(
 
     approved_id = persist_approved_requirements(db, user, project_id, run_id, item_id, approval)
     try:
-        leader_service.dispatch_approved_requirements(db, user, project_id, run_id, approved_id)
+        task = leader_service.dispatch_approved_requirements(
+            db, user, project_id, run_id, approved_id
+        )
+        start_dispatched_delivery(db, user, project_id, run_id, task)
     except Exception as exc:
         # Approval is already committed. Keep the approved checkpoint recoverable so the
         # client can continue/dispatch without treating the whole approve call as lost.
         logger.exception("dispatch after approval failed project=%s run=%s", project_id, run_id)
         status = get_requirements_status(db, user, project_id)
-        if status.state == "ready_for_delivery":
+        if status.state in {
+            "ready_for_delivery",
+            "design_pending",
+            "design_running",
+            "engineering_pending",
+            "engineering_running",
+            "quality_pending",
+            "quality_running",
+        }:
             detail = str(exc).strip() or exc.__class__.__name__
             status.error = f"计划已批准，但自动分派下一步失败：{detail[:400]}"
             return status
@@ -270,16 +283,20 @@ def continue_engineering(
     if current_task is not None and current_task.recipient == "Test Engineer":
         if status.state not in ("quality_pending", "retry_available"):
             raise BusinessException("当前没有可继续的 Test Engineer 任务")
-        run_test_engineer_task(
-            db,
-            user,
-            project_id,
-            run_id,
-            current_task.task_id,
-            recovery_execution_id=(
-                status.execution_id if status.state == "retry_available" else None
-            ),
-        )
+        try:
+            run_test_engineer_task(
+                db,
+                user,
+                project_id,
+                run_id,
+                current_task.task_id,
+                recovery_execution_id=(
+                    status.execution_id if status.state == "retry_available" else None
+                ),
+            )
+        except BusinessException:
+            # Task already recorded quality_error / failed execution; surface as paused status.
+            return get_requirements_status(db, user, project_id)
         return get_requirements_status(db, user, project_id)
     raise BusinessException("当前没有可继续的工程任务")
 
@@ -422,6 +439,55 @@ def _activities_from_checkpoint(checkpoint: object) -> list[EngineeringActivity]
     return items
 
 
+def _activities_for_run(db: Session, run_id: str) -> list[EngineeringActivity]:
+    """Rebuild the append-only visible history for every execution in one BuildRun.
+
+    Recovery executions copy the previous checkpoint. Only their new suffix belongs to
+    the new conversational turn; completed Architect/Engineer turns stay visible after
+    the workflow advances to another task.
+    """
+
+    rows = db.execute(
+        select(Task, TaskExecution)
+        .join(Plan, Task.plan_id == Plan.plan_id)
+        .join(TaskExecution, TaskExecution.task_id == Task.task_id)
+        .where(Plan.build_run_id == run_id)
+        .order_by(Plan.version.asc(), Task.position.asc(), TaskExecution.attempt.asc())
+    ).all()
+    previous_by_task: dict[str, list[dict[str, object]]] = {}
+    activities: list[EngineeringActivity] = []
+    for task, execution in rows:
+        draft = execution.draft if isinstance(execution.draft, dict) else None
+        checkpoint = draft.get("checkpoint") if draft else None
+        raw_items = (
+            [item for item in checkpoint.get("activity") or [] if isinstance(item, dict)]
+            if isinstance(checkpoint, dict)
+            else []
+        )
+        previous = previous_by_task.get(task.task_id, [])
+        prefix_matches = len(raw_items) >= len(previous) and raw_items[: len(previous)] == previous
+        visible_items = raw_items[len(previous) :] if prefix_matches else raw_items
+        previous_by_task[task.task_id] = raw_items
+        # Recovery attempts are continuations of the same role assignment. Exposing every
+        # TaskExecution as a new chat block made one failed work item appear dozens of times.
+        phase_label = task.title
+        for index, raw in enumerate(visible_items, start=1):
+            payload = dict(raw)
+            raw_id = str(payload.get("id") or index)
+            payload.update(
+                id=f"{execution.execution_id}:{raw_id}",
+                phase_id=task.task_id,
+                phase_label=phase_label,
+                phase_role=task.recipient,
+                attempt=execution.attempt,
+            )
+            try:
+                activities.append(EngineeringActivity.model_validate(payload))
+            except ValidationError:
+                continue
+    return activities
+
+
 def _checkpoint_has_written_code(checkpoint: object) -> bool:
     if not isinstance(checkpoint, dict):
         return False
@@ -437,7 +503,9 @@ def _checkpoint_has_written_code(checkpoint: object) -> bool:
     return False
 
 
-def _attach_workspace_status(result: RequirementsStatus) -> RequirementsStatus:
+def _attach_workspace_status(db: Session, result: RequirementsStatus) -> RequirementsStatus:
+    if result.run_id is not None:
+        result.activities = _activities_for_run(db, result.run_id)
     if result.run_id is None or result.state not in (
         "design_pending",
         "design_running",
@@ -448,6 +516,9 @@ def _attach_workspace_status(result: RequirementsStatus) -> RequirementsStatus:
         "quality_running",
         "completed",
         "quality_failed",
+        # Budget / check pauses keep the same run workspace; still expose files.
+        "retry_available",
+        "stopped",
     ):
         return result
     ready = workspace_is_ready(result.project_id, result.run_id)
@@ -473,13 +544,13 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
         .limit(1)
     )
     if run is None:
-        return _attach_workspace_status(result)
+        return _attach_workspace_status(db, result)
     result.run_id = run.run_id
     plan = db.scalar(
         select(Plan).where(Plan.build_run_id == run.run_id).order_by(Plan.version.desc()).limit(1)
     )
     if plan is None:
-        return _attach_workspace_status(result)
+        return _attach_workspace_status(db, result)
     tasks = list(db.scalars(select(Task).where(Task.plan_id == plan.plan_id)).all())
     delivery_task = tasks[0] if len(tasks) == 1 else None
     if delivery_task is not None and delivery_task.recipient == "Test Engineer":
@@ -520,7 +591,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
         )
         if plan.status == "pending" and delivery_task.status == "pending":
             result.state = "quality_pending"
-            return _attach_workspace_status(result)
+            return _attach_workspace_status(db, result)
         if plan.status == "running" and delivery_task.status == "running" and run.stage == "qa":
             execution = latest_execution(db, delivery_task.task_id)
             if execution is not None:
@@ -535,7 +606,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 and execution.expires_at > utc_now()
                 else "retry_available"
             )
-            return _attach_workspace_status(result)
+            return _attach_workspace_status(db, result)
         if plan.status == "succeeded" and delivery_task.status == "succeeded":
             saved = db.get(TaskResult, delivery_task.task_id)
             report_item = (
@@ -565,32 +636,34 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 and run.status == "succeeded"
                 else "quality_failed"
             )
-            return _attach_workspace_status(result)
+            return _attach_workspace_status(db, result)
         result.state = "stopped"
-        return _attach_workspace_status(result)
+        return _attach_workspace_status(db, result)
     if run.active_slot != 1:
         result.state = "stopped"
-        return _attach_workspace_status(result)
+        return _attach_workspace_status(db, result)
     if run.status == "running" and run.stage not in ("pm", "architect", "developer", "qa"):
         result.state = "stopped"
-        return _attach_workspace_status(result)
+        return _attach_workspace_status(db, result)
     if delivery_task is not None and delivery_task.recipient in (
         "Code Engineer",
         "Architect",
     ):
-        if len(delivery_task.input_configuration_item_ids) != 1:
-            raise ConflictException("工程交付任务没有固定唯一的需求输入")
         if delivery_task.recipient == "Code Engineer":
             if (
                 delivery_task.task_key,
                 delivery_task.expected_output_type,
             ) != (ENGINEERING_TASK_KEY, "code"):
                 raise ConflictException("工程交付任务定义不符合约定")
+            if len(delivery_task.input_configuration_item_ids) not in {1, 2}:
+                raise ConflictException("工程交付任务缺少工程来源或包含多余输入")
         elif (
             delivery_task.task_key,
             delivery_task.expected_output_type,
         ) != (ARCHITECTURE_TASK_KEY, "system_design"):
             raise ConflictException("设计任务定义不符合约定")
+        elif len(delivery_task.input_configuration_item_ids) != 1:
+            raise ConflictException("设计任务没有固定唯一的需求输入")
         input_item_id = delivery_task.input_configuration_item_ids[0]
         if delivery_task.recipient == "Architect":
             source_item, source_task, source_plan, spec = load_approved_app_spec(
@@ -629,11 +702,26 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             open_questions=[],
         )
         if plan.status == "pending" and delivery_task.status == "pending":
-            verified = (
-                find_architecture_task(db, task_source_plan, input_item_id)
-                if delivery_task.recipient == "Architect"
-                else find_pending_engineering_task(db, task_source_plan, input_item_id)
-            )
+            if (
+                delivery_task.recipient == "Code Engineer"
+                and len(delivery_task.input_configuration_item_ids) == 2
+            ):
+                report_item = db.scalar(
+                    select(ConfigurationItem).where(
+                        ConfigurationItem.item_id == delivery_task.input_configuration_item_ids[1],
+                        ConfigurationItem.project_id == project_id,
+                        ConfigurationItem.producer_run_id == run.run_id,
+                        ConfigurationItem.semantic_type == "test_report",
+                        ConfigurationItem.state == "usable",
+                    )
+                )
+                verified = delivery_task if report_item is not None else None
+            else:
+                verified = (
+                    find_architecture_task(db, task_source_plan, input_item_id)
+                    if delivery_task.recipient == "Architect"
+                    else find_pending_engineering_task(db, task_source_plan, input_item_id)
+                )
             if verified is None or verified.task_id != delivery_task.task_id:
                 raise ConflictException("工程交付任务与需求来源不一致")
             result.state = (
@@ -641,7 +729,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 if delivery_task.recipient == "Architect"
                 else "engineering_pending"
             )
-            return _attach_workspace_status(result)
+            return _attach_workspace_status(db, result)
 
         if (
             delivery_task.recipient == "Architect"
@@ -666,7 +754,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 snapshot = execution.draft if isinstance(execution.draft, dict) else None
                 checkpoint = snapshot.get("checkpoint") if snapshot else None
                 result.activities = _activities_from_checkpoint(checkpoint)
-            return _attach_workspace_status(result)
+            return _attach_workspace_status(db, result)
 
         if (
             delivery_task.recipient == "Code Engineer"
@@ -686,7 +774,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                     result.execution_id = execution.execution_id
                     result.execution_expires_at = execution.expires_at
                     result.error = execution.error
-                return _attach_workspace_status(result)
+                return _attach_workspace_status(db, result)
             result.state = "engineering_running"
             result.execution_id = execution.execution_id
             result.execution_expires_at = execution.expires_at
@@ -715,7 +803,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 result.code_ready = _checkpoint_has_written_code(checkpoint)
             else:
                 result.code_ready = _checkpoint_has_written_code(checkpoint)
-            return _attach_workspace_status(result)
+            return _attach_workspace_status(db, result)
 
         if (
             delivery_task.recipient == "Code Engineer"
@@ -738,13 +826,13 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             result.state = "engineering_generated"
             result.code_ready = True
             result.code_item_id = code_item.item_id
-            return _attach_workspace_status(result)
+            return _attach_workspace_status(db, result)
 
         result.state = "stopped"
-        return _attach_workspace_status(result)
+        return _attach_workspace_status(db, result)
     if len(tasks) != 1 or tasks[0].recipient != "Product Manager":
         result.state = "stopped"
-        return _attach_workspace_status(result)
+        return _attach_workspace_status(db, result)
     task = tasks[0]
     result.plan_id, result.task_id, result.message_id = (
         plan.plan_id,
@@ -806,4 +894,4 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 if execution.status == "running" and execution.expires_at > utc_now()
                 else "retry_available"
             )
-    return _attach_workspace_status(result)
+    return _attach_workspace_status(db, result)

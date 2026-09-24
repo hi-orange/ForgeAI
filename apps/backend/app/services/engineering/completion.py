@@ -109,7 +109,7 @@ def complete_code_engineer_task(
             task.task_key != ENGINEERING_TASK_KEY
             or task.recipient != TaskRecipient.CODE_ENGINEER.value
             or task.expected_output_type != ConfigurationItemType.CODE.value
-            or len(task.input_configuration_item_ids) != 1
+            or len(task.input_configuration_item_ids) not in {1, 2}
             or task.depends_on_task_ids
         ):
             raise BusinessException("Code Engineer 任务定义不符合代码交付约定")

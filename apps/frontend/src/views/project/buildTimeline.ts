@@ -17,6 +17,7 @@ const labels: Record<string, string> = {
   edit_file_by_replace: '修改文件',
   apply_patch: '写入文件', // 仅用于读取旧 checkpoint。
   record_engineering_memory: '记录工程约束',
+  install_project_dependency: '安装项目依赖',
   run_check: '运行检查',
   complete_work_item: '完成当前功能',
   report_blocked: '构建暂停',
@@ -26,6 +27,18 @@ const labels: Record<string, string> = {
   plan_ready: '文件计划就绪',
   check_result: '检查结果',
   check_environment: '检查环境',
+  work_item_complete: '完成当前功能',
+  plan_repair: '规划修复',
+  quality_start: '开始独立验证',
+  quality_result: '独立验证完成',
+  quality_error: '独立验证失败',
+  resume: '继续构建',
+}
+
+const roleLabels: Record<string, string> = {
+  Architect: '架构师',
+  'Code Engineer': '工程师',
+  'Test Engineer': '测试工程师',
 }
 
 const writeActivities = new Set([
@@ -87,6 +100,25 @@ export type BuildGroup = {
   steps: TimelineStep[]
 }
 
+export type BuildPhase = {
+  id: string
+  title: string
+  role: string
+  groups: BuildGroup[]
+}
+
+function compactToolSteps(steps: TimelineStep[]) {
+  if (steps.length <= 4) return steps
+  const candidates = [
+    steps[0],
+    ...steps.filter((step) => !step.ok),
+    [...steps].reverse().find((step) => isWriteActivity(step.name)),
+    steps.at(-1),
+  ].filter((step): step is TimelineStep => Boolean(step))
+  const unique = new Map(candidates.map((step) => [step.operation_id || step.id, step]))
+  return [...unique.values()].slice(0, 4)
+}
+
 /** Narration starts a step; consecutive tools share its collapsed card.
  * Old checkpoints without narration group by work item instead of repeating model calls.
  */
@@ -99,31 +131,82 @@ export function buildGroups(events: TimelineInput[]): BuildGroup[] {
     annotated.push({
       ...event,
       path: event.path ?? null,
-      work_item_title: event.work_item_title || legacyTitle,
-      work_item_id: event.work_item_id || legacyTitle,
+      work_item_title: event.work_item_title || event.phase_label || legacyTitle,
+      work_item_id: event.work_item_id || event.phase_id || legacyTitle,
     })
   }
-  const groups: BuildGroup[] = []
-  for (const step of timelineSteps(annotated)) {
-    if (step.name === 'start') continue
-    let group = groups.at(-1)
-    const title = step.name === 'summary' ? step.detail : step.work_item_title
-    if (
-      !group ||
-      group.workItemId !== step.work_item_id ||
-      (step.name === 'summary' && group.title !== title)
-    ) {
-      // A fallback work-item title can be replaced by the first actual narration.
-      if (group && !group.steps.length && group.workItemId === step.work_item_id)
-        group.title = title
-      else {
-        group = { id: step.id, title, workItemId: step.work_item_id, steps: [] }
-        groups.push(group)
-      }
-    }
-    if (step.name !== 'summary') group.steps.push(step)
+  const narrativeActivities = new Set([
+    'start',
+    'resume',
+    'summary',
+    'plan_files',
+    'plan_repair',
+    'run_check',
+    'work_item_complete',
+    'quality_start',
+    'quality_result',
+    'quality_error',
+  ])
+  const narrativeTitle = (step: TimelineStep) => {
+    if (step.name === 'plan_files') return `开始实现：${step.detail}`
+    if (step.name === 'plan_repair') return `${step.detail}，只修复检查发现的问题。`
+    if (step.name === 'run_check') return step.detail
+    if (step.name === 'work_item_complete') return `“${step.detail}”已完成并通过工程检查。`
+    if (step.name === 'quality_start') return '业务代码已冻结，开始独立验证。'
+    if (step.name === 'quality_result')
+      return step.ok ? `独立验证已完成：${step.detail}` : `独立验证发现问题：${step.detail}`
+    if (step.name === 'quality_error') return `独立验证执行失败：${step.detail}`
+    return step.detail || step.label
   }
-  return groups
+  const continuationTitle = (step: TimelineStep) => {
+    const target = (step.path || step.detail).split('（')[0]
+    if (target && ['generate_file', 'write_file', 'read_file'].includes(step.name))
+      return `继续处理 ${target}`
+    return `继续实现：${step.work_item_title}`
+  }
+
+  const groups: BuildGroup[] = []
+  let group: BuildGroup | undefined
+  for (const step of timelineSteps(annotated)) {
+    if (narrativeActivities.has(step.name)) {
+      group = {
+        id: step.id,
+        title: narrativeTitle(step),
+        workItemId: step.work_item_id,
+        steps: [],
+      }
+      groups.push(group)
+      continue
+    }
+    if (!group || group.workItemId !== step.work_item_id) {
+      group = {
+        id: step.id,
+        title: group ? continuationTitle(step) : step.work_item_title,
+        workItemId: step.work_item_id,
+        steps: [],
+      }
+      groups.push(group)
+    }
+    group.steps.push(step)
+  }
+  return groups.map((item) => ({ ...item, steps: compactToolSteps(item.steps) }))
+}
+
+/** Retries of one role assignment stay in one conversational engineering turn. */
+export function buildPhases(events: TimelineInput[]): BuildPhase[] {
+  const phases = new Map<string, TimelineInput[]>()
+  for (const event of events) {
+    const phaseId = event.phase_id || 'legacy'
+    const phase = phases.get(phaseId) || []
+    phase.push(event)
+    phases.set(phaseId, phase)
+  }
+  return [...phases.entries()].map(([id, steps]) => ({
+    id,
+    title: steps[0]?.phase_label || '构建应用',
+    role: roleLabels[steps[0]?.phase_role || ''] || steps[0]?.phase_role || '工程师',
+    groups: buildGroups(steps),
+  }))
 }
 
 export function isNearThreadBottom(element: {

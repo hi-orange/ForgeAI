@@ -41,10 +41,9 @@ class EngineeringCheckTests(unittest.TestCase):
         (self.root / "frontend/src/App.vue").write_text("changed", encoding="utf-8")
         self.assertNotEqual(source_snapshot(self.root)[1], before)
 
-    def test_container_has_no_host_mount_or_network_and_bounded_resources(self):
+    def test_container_has_no_host_mount_and_bounded_resources(self):
         command = docker_command("docker", "trusted-image", "owned-instance", "all")
         for flag in [
-            "--network=none",
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
@@ -52,6 +51,7 @@ class EngineeringCheckTests(unittest.TestCase):
             "--pull=never",
         ]:
             self.assertIn(flag, command)
+        self.assertNotIn("--network=none", command)
         self.assertNotIn("--volume", command)
         self.assertNotIn("--mount", command)
         self.assertTrue(any(arg.startswith("--memory=") for arg in command))

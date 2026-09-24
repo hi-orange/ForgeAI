@@ -27,6 +27,26 @@ def _content_preview(value: object, *, limit: int = 160) -> str:
     return repr(value[:limit])
 
 
+def _http_error_message(response: httpx.Response | None) -> str:
+    """Map provider HTTP failures to actionable user-facing copy."""
+
+    status = response.status_code if response is not None else None
+    body = (response.text if response is not None else "") or ""
+    lowered = body.lower()
+
+    if status == 401 or "invalid api key" in lowered or "authentication" in lowered:
+        return "大模型鉴权失败，请检查 DEEPSEEK_API_KEY 是否正确"
+    if status == 402 or "insufficient balance" in lowered or "insufficient_balance" in lowered:
+        return "大模型账户余额不足，请前往 DeepSeek 控制台充值后再试"
+    if "quota" in lowered and ("exceed" in lowered or "exhausted" in lowered):
+        return "大模型账户余额不足，请前往 DeepSeek 控制台充值后再试"
+    if status == 429 or "rate limit" in lowered or "too many requests" in lowered:
+        return "大模型请求过于频繁，请稍后再试"
+    if status is not None and status >= 500:
+        return "大模型服务暂时不可用，请稍后重试"
+    return "大模型调用失败，请稍后重试"
+
+
 def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
     """向 DeepSeek chat/completions 发请求，统一处理超时与 HTTP 错误。"""
     if not settings.deepseek_api_key:
@@ -48,7 +68,7 @@ def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:300] if exc.response is not None else str(exc)
         logger.exception("LLM HTTP error: %s", detail)
-        raise BusinessException("大模型调用失败，请稍后重试") from exc
+        raise BusinessException(_http_error_message(exc.response)) from exc
     except httpx.HTTPError as exc:
         logger.exception("LLM network error")
         raise BusinessException("无法连接大模型服务，请检查网络或代理设置后重试") from exc

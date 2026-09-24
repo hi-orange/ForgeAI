@@ -9,13 +9,6 @@ export type RequirementPlanItem = {
   acceptance?: string
 }
 
-const AUTO_ADVANCE_STATES = new Set([
-  'ready_for_delivery',
-  'design_pending',
-  'engineering_pending',
-  'quality_pending',
-])
-
 export function useRequirements(projectId: number) {
   const name = ref('项目需求')
   const status = ref<api.RequirementsStatus | null>(null)
@@ -121,13 +114,15 @@ export function useRequirements(projectId: number) {
     )
   }
 
-  let deliveryAdvanceAttempts = 0
-
   const canResume = computed(
     () =>
       status.value?.state === 'pending' ||
       status.value?.state === 'retry_available' ||
       (status.value?.state === 'ready_for_delivery' && !busy.value) ||
+      (['design_pending', 'engineering_pending', 'quality_pending'].includes(
+        status.value?.state ?? '',
+      ) &&
+        Boolean(status.value?.error)) ||
       (status.value?.state === 'engineering_running' &&
         (Boolean(status.value.error) || !status.value.activities?.length)),
   )
@@ -150,14 +145,14 @@ export function useRequirements(projectId: number) {
   function schedule() {
     clearTimeout(timer)
     if (disposed) return
-    if (status.value?.state !== 'ready_for_delivery') {
-      deliveryAdvanceAttempts = 0
-    }
     if (
       busy.value ||
       status.value?.state === 'running' ||
       status.value?.state === 'design_running' ||
+      status.value?.state === 'design_pending' ||
+      status.value?.state === 'engineering_pending' ||
       (status.value?.state === 'engineering_running' && !status.value.error) ||
+      status.value?.state === 'quality_pending' ||
       status.value?.state === 'quality_running'
     ) {
       timer = setTimeout(
@@ -165,18 +160,6 @@ export function useRequirements(projectId: number) {
         status.value?.state === 'engineering_running' ? 1200 : 2500,
       )
       return
-    }
-    if (
-      status.value?.state === 'ready_for_delivery' &&
-      !busy.value &&
-      deliveryAdvanceAttempts < 3 &&
-      (Boolean(status.value.error) || Boolean(error.value))
-    ) {
-      timer = setTimeout(() => {
-        if (disposed || busy.value || status.value?.state !== 'ready_for_delivery') return
-        deliveryAdvanceAttempts += 1
-        void perform(autoAdvance)
-      }, 1500)
     }
   }
 
@@ -275,12 +258,6 @@ export function useRequirements(projectId: number) {
     loadPlan(status.value)
   }
 
-  async function autoAdvance() {
-    // ready_for_delivery needs one dispatch call and at most one execution-start call.
-    for (let step = 0; step < 2 && AUTO_ADVANCE_STATES.has(status.value?.state ?? ''); step += 1)
-      await continueOnce()
-  }
-
   async function pause() {
     const current = status.value
     if (!current?.run_id || !canPause.value || pausing.value || disposed) return
@@ -331,7 +308,6 @@ export function useRequirements(projectId: number) {
       status.value = await api.approveRequirements(projectId, current.run_id!, itemId, payload)
       loadPlan(status.value)
       lastApproval = null
-      await autoAdvance()
     })
   }
 
@@ -342,10 +318,6 @@ export function useRequirements(projectId: number) {
       name.value = project.name
       await refresh()
       if (disposed) return
-      if (AUTO_ADVANCE_STATES.has(status.value?.state ?? '')) {
-        await perform(autoAdvance)
-        return
-      }
       if (status.value?.state !== 'not_started') return
       if (!messages.value.some((message) => message.sender === 'user') && !project.prompt?.trim()) {
         return
