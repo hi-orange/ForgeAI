@@ -225,6 +225,39 @@ function toggleDir(path: string) {
   padding: 0.35rem 0;
 }
 
+.file-tree,
+.code-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.file-tree:hover,
+.code-scroll:hover {
+  scrollbar-color: rgba(113, 113, 122, 0.24) transparent;
+}
+
+.file-tree::-webkit-scrollbar,
+.code-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.file-tree::-webkit-scrollbar-track,
+.code-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.file-tree::-webkit-scrollbar-thumb,
+.code-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: transparent;
+}
+
+.file-tree:hover::-webkit-scrollbar-thumb,
+.code-scroll:hover::-webkit-scrollbar-thumb {
+  background: rgba(113, 113, 122, 0.24);
+}
+
 .tree-empty,
 .tree-error,
 .code-tab-placeholder {
@@ -354,12 +387,13 @@ function toggleDir(path: string) {
 
 .code-body {
   margin: 0;
+  min-width: max-content;
   padding: 0.85rem 1rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
   line-height: 1.55;
   white-space: pre;
-  overflow: auto;
+  overflow: visible;
 }
 
 .upgrade-banner {

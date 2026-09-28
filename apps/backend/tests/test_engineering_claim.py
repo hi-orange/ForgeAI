@@ -319,6 +319,33 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         with self.session_factory() as db:
             self.assertEqual(db.get(TaskExecution, execution.execution_id).status, "running")
 
+    def test_generated_checkpoint_with_publish_error_remains_retryable(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        _, execution = self._claim(delivery.task_id)
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, execution.execution_id)
+            snapshot = dict(row.draft)
+            snapshot["checkpoint"] = {
+                "kind": "engineering_checkpoint",
+                "schema_version": 1,
+                "work_items": [],
+                "activity": [],
+                "outcome": "generated",
+                "last_error": "代码成果发布失败",
+            }
+            row.draft = snapshot
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(row, "draft")
+            db.commit()
+
+        progress = self._status()
+        self.assertEqual(progress.state, "retry_available")
+        self.assertEqual(progress.error, "代码成果发布失败")
+        self.assertTrue(progress.code_ready)
+        self.assertEqual(progress.execution_id, execution.execution_id)
+
     def test_pause_only_clears_the_worker_marker_after_persisting_the_fence(self):
         published = self._publish_only()
         delivery = self._assign(published.item_id)

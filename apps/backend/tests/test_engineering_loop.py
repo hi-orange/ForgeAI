@@ -282,7 +282,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
 
         def write(*, engineering_context, work_item, **_kwargs):
             contexts.append(engineering_context)
-            return f"FEATURE = {work_item.id!r}\n"
+            return f"FEATURE = {work_item.id!r}\n", 1
 
         with (
             patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
@@ -366,7 +366,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
             patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
             patch(
                 "app.orchestration.code_engineer.generate_file_content",
-                return_value="VALUE = 'fixed'\n",
+                return_value=("VALUE = 'fixed'\n", 1),
             ),
             patch("app.orchestration.code_engineer.check_tools.run_check", side_effect=check),
         ):
@@ -423,6 +423,90 @@ class EngineeringLoopTests(EngineeringClaimTests):
             snapshot = read_frozen_input_snapshot(saved)
             assert snapshot is not None
             self.assertEqual(snapshot["checkpoint"]["blocked_reason"], "模型调用预算已用尽")
+
+    def test_writer_validation_failure_queues_repair_instead_of_blocking(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        task, execution = self._claim(delivery.task_id)
+        from app.agents.code_engineer import FileGenerationError
+
+        write_calls = {"count": 0}
+        repair_contexts: list[dict | None] = []
+
+        def plan(*, work_item, repair_context=None, **_kwargs):
+            repair_contexts.append(repair_context)
+            suffix = "_repair" if repair_context else ""
+            return self._file_plan(work_item.id, suffix=suffix)
+
+        def write(**_kwargs):
+            write_calls["count"] += 1
+            if write_calls["count"] == 1:
+                raise FileGenerationError(
+                    "写码模型返回的 generated/feat_records.py 语法无效（第 1 行）：invalid syntax",
+                    model_calls=3,
+                )
+            return "VALUE = 'ok'\n", 1
+
+        with (
+            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
+            patch("app.orchestration.code_engineer.generate_file_content", side_effect=write),
+            patch(
+                "app.orchestration.code_engineer.check_tools.run_check",
+                side_effect=self._passing_check,
+            ),
+        ):
+            with self.session_factory() as db:
+                result = run_engineering_workflow(
+                    db,
+                    self.owner,
+                    self.project.id,
+                    self.run.run_id,
+                    task.task_id,
+                    execution.execution_id,
+                    session_factory=self.session_factory,
+                )
+
+        self.assertEqual(result["outcome"], "generated")
+        self.assertGreaterEqual(write_calls["count"], 2)
+        self.assertIsNone(repair_contexts[0])
+        self.assertIsNotNone(repair_contexts[1])
+        assert repair_contexts[1] is not None
+        self.assertEqual(repair_contexts[1]["failed_check"]["error_code"], "GENERATION_INVALID")
+        with self.session_factory() as db:
+            saved = db.get(TaskExecution, execution.execution_id)
+            snapshot = read_frozen_input_snapshot(saved)
+            assert snapshot is not None
+            labels = [item["label"] for item in snapshot["checkpoint"]["activity"]]
+            self.assertIn("Generation rejected", labels)
+            self.assertIn("Plan repair", labels)
+
+    def test_generate_file_content_retries_syntax_then_succeeds(self):
+        from app.agents.code_engineer import MAX_WRITER_ATTEMPTS, generate_file_content
+        from app.generation.delivery import WorkItem
+
+        responses = [
+            "def broken(\n",
+            "VALUE = 1\n",
+        ]
+        with patch("app.agents.code_engineer.chat_completion", side_effect=responses) as chat:
+            content, calls = generate_file_content(
+                spec=AppSpec.model_validate(valid_spec()),
+                work_item=WorkItem(
+                    id="feat_records",
+                    requirement_ids=["feat_records"],
+                    title="记录",
+                    summary="实现记录",
+                ),
+                path="generated/feat_records.py",
+                file_description="实现模块",
+                engineering_context={"platform_file_context": {"files": []}},
+                observations=[],
+                system_design=None,
+            )
+        self.assertEqual(content, "VALUE = 1\n")
+        self.assertEqual(calls, 2)
+        self.assertEqual(chat.call_count, 2)
+        self.assertLessEqual(calls, MAX_WRITER_ATTEMPTS)
 
     def test_controller_checkpoint_migrates_without_replaying_observations(self):
         snapshot = {

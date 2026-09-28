@@ -157,16 +157,24 @@ class ConfigurationManagerTests(unittest.TestCase):
                 {"passed": True},
                 [code.item_id],
             )
+            repaired_code = self._register(
+                db,
+                ConfigurationItemType.CODE,
+                {"manifest": ["main.py"], "repair": 1},
+                [design.item_id, report.item_id],
+            )
 
         self.assertEqual(spec_v1.version, 1)
         self.assertEqual(spec_v2.version, 2)
         self.assertEqual(design.version, 1)
         self.assertEqual(code.version, 1)
         self.assertEqual(report.version, 1)
+        self.assertEqual(repaired_code.version, 2)
         self.assertEqual(spec_v2.upstream_item_ids, [spec_v1.item_id])
         self.assertEqual(design.upstream_item_ids, [spec_v2.item_id])
         self.assertEqual(code.upstream_item_ids, [design.item_id])
         self.assertEqual(report.upstream_item_ids, [code.item_id])
+        self.assertEqual(repaired_code.upstream_item_ids, [design.item_id, report.item_id])
         self.assertEqual(spec_v1.content_hash, spec_v2.content_hash)
         self.assertEqual(len(report.content_hash), 64)
         self.assertEqual(report.state, ConfigurationItemState.USABLE.value)
@@ -223,6 +231,14 @@ class ConfigurationManagerTests(unittest.TestCase):
                     ConfigurationItemType.CODE,
                     {"manifest": ["other"]},
                     [code.item_id],
+                )
+
+            with self.assertRaisesRegex(BusinessException, "可选第二上游必须是 test_report"):
+                self._register(
+                    db,
+                    ConfigurationItemType.CODE,
+                    {"manifest": ["ambiguous"]},
+                    [design.item_id, spec.item_id],
                 )
 
             with self.assertRaisesRegex(BusinessException, "test_report 必须引用 code"):

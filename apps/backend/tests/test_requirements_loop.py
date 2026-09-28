@@ -42,14 +42,36 @@ from app.models.task_result import TaskResult
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.schemas.product_manager import ProductManagerResult
 from app.schemas.project_message import ProjectMessageCreate
-from app.schemas.requirements import RequirementsApproval
+from app.schemas.requirements import RequirementsApproval, RequirementsStatus
 from app.schemas.system_design import SystemDesign
 from app.services import leader, product_manager, task, task_execution
 from app.services.app_spec import approve_requirements
-from app.services.requirements import get_requirements_status, pause_active_execution
+from app.services.requirements import (
+    continue_requirements,
+    get_requirements_status,
+    pause_active_execution,
+)
 
 
 class RequirementsLoopTests(ProductManagerWorkflowFixture):
+    def test_duplicate_continue_is_idempotent_while_quality_is_running(self):
+        running = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="quality_running",
+            task_id="task_quality",
+            execution_id="exec_quality",
+        )
+        with (
+            self.session_factory() as db,
+            patch("app.services.requirements.get_requirements_status", return_value=running),
+            patch("app.services.requirements.task_service.get_user_task") as get_task,
+        ):
+            result = continue_requirements(db, self.owner, self.project.id)
+
+        self.assertIs(result, running)
+        get_task.assert_not_called()
+
     def test_late_model_response_cannot_overwrite_recovered_execution(self):
         entered, release = Event(), Event()
 
@@ -535,6 +557,15 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
 class RequirementsApiTests(ProductManagerWorkflowFixture):
     def setUp(self):
         super().setUp()
+        # API lifecycle assertions control the explicit /engineering transition.
+        # Prevent a real daemon worker from racing those assertions or retaining
+        # the temporary SQLite database after the test has finished.
+        self.start_delivery = self.enterContext(
+            patch(
+                "app.services.requirements.start_dispatched_delivery",
+                return_value={"started": False},
+            )
+        )
         self.current_user = self.owner
         app = FastAPI()
         register_exception_handlers(app)

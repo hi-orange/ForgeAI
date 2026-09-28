@@ -37,7 +37,7 @@ TOOL_STRATEGY_VERSION = "planned_files_v1"
 DEFAULT_CALL_BUDGET: dict[str, int] = {
     "max_model_turns": 40,
     "max_tool_calls": 120,
-    "max_repair_rounds": 3,
+    "max_repair_rounds": 8,
 }
 
 

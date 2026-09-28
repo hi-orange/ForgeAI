@@ -532,6 +532,34 @@ test('explicit recovery uses continue', async () => {
   f.unmount()
 })
 
+test('polling clears a stale continue error after quality validation has started', async () => {
+  const f = await fixture(
+    progress('retry_available', {
+      task_id: 'task-quality',
+      execution_id: 'exec-quality',
+      error: '上次执行已暂停',
+    }),
+  )
+  await f.mount()
+  f.api.continueRequirements.mock.mockImplementationOnce(async () => {
+    f.setState(
+      progress('quality_running', {
+        task_id: 'task-quality',
+        execution_id: 'exec-quality-2',
+        activities: [{ id: 'quality-start', name: 'quality_start', ok: true }],
+      }),
+    )
+    throw new Error('当前没有可继续的构建步骤')
+  })
+
+  await f.view.resume()
+
+  assert.equal(f.view.status.value.state, 'quality_running')
+  assert.equal(f.view.error.value, '')
+  assert.equal(f.view.canPause.value, true)
+  f.unmount()
+})
+
 test('an older polling response cannot overwrite the final result', async () => {
   const f = await fixture(progress('needs_user_input'))
   await f.mount()

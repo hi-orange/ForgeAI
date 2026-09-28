@@ -72,6 +72,7 @@
             v-if="status?.activities?.length"
             :activities="status.activities"
             :running="timelineRunning"
+            :failed="status.state === 'retry_available' && Boolean(status.error)"
             @open-file="openWorkspaceFile"
           />
           <section v-if="status?.state === 'completed'" class="delivery-summary">
@@ -99,7 +100,7 @@
             </span>
           </summary>
           <p class="plan-hint">
-            请从以下需求中选择希望优先实现的内容（可多选）。也可以编辑或新增。
+            请从以下功能中选择希望优先实现的内容（可多选）。也可以编辑或新增。
           </p>
           <label v-if="editing" class="goal-label"
             >应用目标<textarea v-model="planGoal" rows="2" maxlength="2000" :disabled="busy" />
@@ -338,12 +339,7 @@ const showApprovedPlan = computed(
 const approvedPlanItems = computed(() => {
   const spec = status.value?.app_spec
   if (!spec) return []
-  return [
-    ...spec.features.map((item) => ({ id: item.id, label: item.text })),
-    ...spec.data_requirements.map((item) => ({ id: item.id, label: item.text })),
-    ...spec.interface_requirements.map((item) => ({ id: item.id, label: item.text })),
-    ...spec.constraints.map((item) => ({ id: item.id, label: item.text })),
-  ]
+  return spec.features.map((item) => ({ id: item.id, label: item.text }))
 })
 function onApprovalToggle(event: Event) {
   const target = event.target
@@ -694,6 +690,23 @@ summary:focus-visible {
   overflow-y: auto;
   padding: 28px 10px 14px;
   scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.chat-thread:hover {
+  scrollbar-color: rgba(113, 113, 122, 0.24) transparent;
+}
+.chat-thread::-webkit-scrollbar {
+  width: 6px;
+}
+.chat-thread::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-thread::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: transparent;
+}
+.chat-thread:hover::-webkit-scrollbar-thumb {
+  background: rgba(113, 113, 122, 0.24);
 }
 .message {
   margin: 0 0 28px;

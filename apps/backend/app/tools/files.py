@@ -38,7 +38,14 @@ def list_files(
     files: list[dict[str, object]] = []
     truncated = False
     for candidate in sorted(start.rglob("*")):
-        if not candidate.is_file():
+        try:
+            is_file = candidate.is_file()
+        except OSError:
+            # Generated dependency/build trees can disappear while a background
+            # worker replaces them. A directory listing is observational, so a
+            # vanished entry must not fail the whole engineering execution.
+            continue
+        if not is_file:
             continue
         relative_parts = candidate.relative_to(base).parts
         if any(part in SKIP_DIRS for part in relative_parts):
@@ -46,7 +53,11 @@ def list_files(
         relative = candidate.relative_to(base).as_posix()
         if relative.startswith("forgeai/") or not is_text_file(candidate):
             continue
-        files.append({"path": relative, "size_bytes": candidate.stat().st_size})
+        try:
+            size_bytes = candidate.stat().st_size
+        except OSError:
+            continue
+        files.append({"path": relative, "size_bytes": size_bytes})
         if len(files) >= MAX_LISTED_FILES:
             truncated = True
             break

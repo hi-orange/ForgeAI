@@ -18,7 +18,7 @@ class AgentRoleProfile:
 ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
     TaskRecipient.PRODUCT_MANAGER: AgentRoleProfile(
         display_name=TaskRecipient.PRODUCT_MANAGER.value,
-        goal="产出可审批 PRD；在用户要求或产品决策需要证据时完成市场与竞品调研。",
+        goal=("重述需求并产出短功能勾选清单与可观察验收；条数与条目随产品而定，不做市场调研专章。"),
         deliverables=("app_spec",),
         allowed_tools=frozenset(
             {
@@ -76,6 +76,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
                 "read_file",
                 "search_code",
                 "run_check",
+                "capture_screenshots",
                 "record_defect",
                 "write_test_report",
             }

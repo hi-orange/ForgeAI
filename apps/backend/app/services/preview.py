@@ -567,8 +567,8 @@ def _boot_session(session: _PreviewSession) -> None:
         with session.lock:
             proc = session.backend_proc
             server = session.proxy_server
-            backend_port = session.backend_port
-            preview_port = session.preview_port
+            released_backend_port = session.backend_port
+            released_preview_port = session.preview_port
             session.backend_proc = None
             session.proxy_server = None
             session.backend_port = None
@@ -584,4 +584,4 @@ def _boot_session(session: _PreviewSession) -> None:
                 pass
         if proc is not None:
             _stop_process(proc)
-        _release_ports(backend_port, preview_port)
+        _release_ports(released_backend_port, released_preview_port)

@@ -31,6 +31,17 @@ CODE_ENGINEER_TOOLS = [
     tool for tool in ALL_CODE_ENGINEER_TOOLS if tool.name in CODE_ENGINEER_PROFILE.allowed_tools
 ]
 
+# Same-file regeneration after unwrap/syntax/protocol validation failures (includes first try).
+MAX_WRITER_ATTEMPTS = 3
+
+
+class FileGenerationError(BusinessException):
+    """Writer validation exhausted; carries how many model calls were spent."""
+
+    def __init__(self, message: str, *, model_calls: int) -> None:
+        super().__init__(message)
+        self.model_calls = model_calls
+
 
 @dataclass(frozen=True, slots=True)
 class PlannedFileBatch:
@@ -316,11 +327,15 @@ def generate_file_content(
     engineering_context: dict[str, Any],
     observations: list[ToolExecutionResult],
     system_design: SystemDesign | None,
-) -> str:
-    """Generate exactly one complete file from platform-assembled context."""
+) -> tuple[str, int]:
+    """Generate exactly one complete file from platform-assembled context.
+
+    Returns ``(content, model_calls)``. Validation failures (syntax / protocol residue)
+    trigger same-file regeneration up to ``MAX_WRITER_ATTEMPTS`` before raising.
+    """
 
     recent_memory = [observation.model_dump(mode="json") for observation in observations]
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": CODE_WRITER_SYSTEM_PROMPT},
         {
             "role": "user",
@@ -341,26 +356,39 @@ def generate_file_content(
             ),
         },
     ]
-    raw = chat_completion(messages=list(messages), temperature=0.2, max_tokens=8192)
-    try:
-        return _unwrap_file_content(raw, path=path)
-    except BusinessException as exc:
-        # Provider control tokens and syntax errors are generation failures, not source
-        # changes. Repair them before the platform writes anything to the workspace.
-        messages.extend(
-            [
-                {"role": "assistant", "content": raw},
-                {
-                    "role": "user",
-                    "content": (
-                        f"上一次 {path} 输出不能写入：{exc}。请重新输出完整文件正文；"
-                        "不得包含 Markdown 围栏、工具调用、DSML/协议标记或解释文字。"
-                    ),
-                },
-            ]
+    last_error: BusinessException | None = None
+    model_calls = 0
+    for attempt in range(MAX_WRITER_ATTEMPTS):
+        raw = chat_completion(
+            messages=list(messages),
+            temperature=0.2 if attempt == 0 else 0.0,
+            max_tokens=8192,
         )
-        repaired = chat_completion(messages=list(messages), temperature=0.0, max_tokens=8192)
-        return _unwrap_file_content(repaired, path=path)
+        model_calls += 1
+        try:
+            return _unwrap_file_content(raw, path=path), model_calls
+        except BusinessException as exc:
+            last_error = exc
+            if attempt + 1 >= MAX_WRITER_ATTEMPTS:
+                break
+            # Provider control tokens and syntax errors are generation failures, not
+            # source changes. Regenerate before the platform writes anything.
+            messages.extend(
+                [
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"上一次 {path} 输出不能写入（第 {attempt + 1}/"
+                            f"{MAX_WRITER_ATTEMPTS} 次）：{exc}。"
+                            "请重新输出完整文件正文；不得包含 Markdown 围栏、工具调用、"
+                            "DSML/协议标记或解释文字。"
+                        ),
+                    },
+                ]
+            )
+    assert last_error is not None
+    raise FileGenerationError(str(last_error), model_calls=model_calls) from last_error
 
 
 def build_code_engineer_messages(

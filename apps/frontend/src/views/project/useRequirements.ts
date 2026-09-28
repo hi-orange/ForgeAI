@@ -52,32 +52,14 @@ export function useRequirements(projectId: number) {
     lastApproval = null
     const spec = current.app_spec
     planGoal.value = spec?.goal ?? ''
-    planItems.value = [
-      ...(spec?.features ?? []).map((item): RequirementPlanItem => ({
-        id: item.id,
-        label: item.text,
-        checked: true,
-        kind: 'feature',
-      })),
-      ...(spec?.data_requirements ?? []).map((item): RequirementPlanItem => ({
-        id: item.id,
-        label: item.text,
-        checked: true,
-        kind: 'data',
-      })),
-      ...(spec?.interface_requirements ?? []).map((item): RequirementPlanItem => ({
-        id: item.id,
-        label: item.text,
-        checked: true,
-        kind: 'interface',
-      })),
-      ...(spec?.constraints ?? []).map((item): RequirementPlanItem => ({
-        id: item.id,
-        label: item.text,
-        checked: true,
-        kind: 'constraint',
-      })),
-    ]
+    // Approval UI matches a short feature checklist (Atoms-style). Data / interface /
+    // constraints stay on app_spec for engineering but are not separate checkboxes.
+    planItems.value = (spec?.features ?? []).map((item): RequirementPlanItem => ({
+      id: item.id,
+      label: item.text,
+      checked: true,
+      kind: 'feature',
+    }))
   }
 
   function addPlanItem(label: string) {
@@ -94,24 +76,14 @@ export function useRequirements(projectId: number) {
   function needsAcceptance(item: RequirementPlanItem) {
     if (item.kind !== 'feature' || !item.checked) return false
     const spec = status.value?.app_spec
-    const unchanged = new Set(
-      planItems.value
-        .filter(
-          (entry) =>
-            entry.kind === 'feature' &&
-            entry.checked &&
-            !entry.acceptance?.trim() &&
-            spec?.features.some(
-              (original) => original.id === entry.id && original.text === entry.label.trim(),
-            ),
-        )
-        .map((entry) => entry.id),
-    )
-    return !spec?.acceptance_criteria.some(
-      (criterion) =>
-        criterion.source_ids.includes(item.id) &&
-        criterion.source_ids.every((id) => unchanged.has(id)),
-    )
+    // PM already attached acceptance — do not open a per-row "怎样算完成" editor.
+    if (spec?.acceptance_criteria.some((criterion) => criterion.source_ids.includes(item.id))) {
+      return false
+    }
+    const original = spec?.features.find((feature) => feature.id === item.id)
+    // Unchanged PM suggestion: keep checklist clean even if AC was omitted.
+    if (original && original.text === item.label.trim()) return false
+    return !item.acceptance?.trim()
   }
 
   const canResume = computed(
@@ -169,6 +141,21 @@ export function useRequirements(projectId: number) {
       const current = await api.getRequirements(projectId)
       if (disposed) return
       status.value = current
+      // A Continue request can race with automatic dispatch: the mutation may report that
+      // there is nothing left to start while the authoritative status has already advanced.
+      // Do not leave that stale request error beside a healthy running/completed state.
+      if (
+        [
+          'running',
+          'design_running',
+          'engineering_running',
+          'quality_running',
+          'completed',
+          'quality_failed',
+        ].includes(current.state)
+      ) {
+        error.value = ''
+      }
       loadPlan(current)
       // 消息只追加，分页读取可以恢复刷新前的对话，不把后来的消息作为任务输入。
       let page: api.RequirementMessage[]

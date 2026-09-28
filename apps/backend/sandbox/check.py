@@ -185,13 +185,13 @@ def stop_process(process):
         process.wait()
 
 
-def start_backend():
+def start_backend(port=8080):
     process = subprocess.Popen(
-        ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8080"],
+        ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=ROOT / "backend",
     )
-    wait_http("http://127.0.0.1:8080/api/v1/health", process, "后端")
-    with urllib.request.urlopen("http://127.0.0.1:8080/openapi.json", timeout=2) as response:
+    wait_http(f"http://127.0.0.1:{port}/api/v1/health", process, "后端")
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/openapi.json", timeout=2) as response:
         paths = json.load(response)["paths"]
     print("已注册接口:", json.dumps(paths, ensure_ascii=False)[:12000], flush=True)
     return process
@@ -250,15 +250,55 @@ def runtime_smoke():
         stop_process(backend_process)
 
 
+def visual(route):
+    """Render real Chromium screenshots while generated code remains isolated."""
+
+    database()
+    backend_process = start_backend(port=8000)
+    frontend_process = None
+    try:
+        frontend()
+        frontend_process = subprocess.Popen(
+            [
+                "node",
+                str(ROOT / "frontend" / "node_modules" / "vite" / "bin" / "vite.js"),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173",
+                "--strictPort",
+            ],
+            cwd=ROOT / "frontend",
+        )
+        wait_http("http://127.0.0.1:5173/", frontend_process, "浏览器截图页面")
+        command(
+            [
+                "node",
+                "/opt/forgeai/capture.mjs",
+                f"http://127.0.0.1:5173{route}",
+                "/tmp/evidence",
+            ],
+            ROOT / "frontend",
+            timeout=90,
+        )
+        print("Chromium 桌面端与移动端截图已生成。", flush=True)
+    finally:
+        if frontend_process is not None:
+            stop_process(frontend_process)
+        stop_process(backend_process)
+
+
 def main():
     check = sys.argv[1]
-    if check not in {"database", "backend", "frontend", "all"}:
+    if check not in {"database", "backend", "frontend", "all", "visual"}:
         raise ValueError("Unknown check")
     materialize(json.load(sys.stdin))
     if check == "database":
         database()
     if check == "all":
         runtime_smoke()
+    elif check == "visual":
+        visual(sys.argv[2] if len(sys.argv) > 2 else "/")
     elif check == "backend":
         backend()
     elif check == "frontend":

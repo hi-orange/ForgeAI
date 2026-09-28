@@ -122,10 +122,30 @@ class PreviewServiceTests(unittest.TestCase):
         self.assertIn(61234, preview_service._reserved_ports)
 
     def test_allocate_port_does_not_reuse_reserved(self) -> None:
+        class FakeSock:
+            def __init__(self, *args, **kwargs) -> None:
+                self._port = 0
+
+            def bind(self, address) -> None:
+                self._port = address[1]
+
+            def getsockname(self):
+                return ("127.0.0.1", self._port)
+
+            def close(self) -> None:
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
         preview_service._reserved_ports.add(18101)
         with (
             patch.object(settings, "preview_port_min", 18101),
             patch.object(settings, "preview_port_max", 18102),
+            patch.object(preview_service.socket, "socket", side_effect=lambda *a, **k: FakeSock()),
         ):
             port = preview_service._allocate_port("127.0.0.1")
         self.assertEqual(port, 18102)

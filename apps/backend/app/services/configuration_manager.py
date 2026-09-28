@@ -25,7 +25,7 @@ _REQUIRED_UPSTREAM_TYPE = {
     ConfigurationItemType.TEST_REPORT: ConfigurationItemType.CODE,
 }
 
-_CODE_UPSTREAM_TYPES = {
+_CODE_PRIMARY_UPSTREAM_TYPES = {
     ConfigurationItemType.APP_SPEC.value,
     ConfigurationItemType.SYSTEM_DESIGN.value,
 }
@@ -106,8 +106,17 @@ def _validate_upstream_types(
     if semantic_type == ConfigurationItemType.CODE:
         if not upstream_items:
             raise BusinessException("code 必须引用 app_spec 或 system_design")
-        if any(item.semantic_type not in _CODE_UPSTREAM_TYPES for item in upstream_items):
+        # A repair stays rooted in the same approved intent and records the failed
+        # QA report as its optional second direct input for end-to-end traceability.
+        if upstream_items[0].semantic_type not in _CODE_PRIMARY_UPSTREAM_TYPES:
             raise BusinessException("code 的直接上游只能是 app_spec 或 system_design")
+        if len(upstream_items) > 2:
+            raise BusinessException("code 最多引用一个工程来源和一个 test_report")
+        if (
+            len(upstream_items) == 2
+            and upstream_items[1].semantic_type != ConfigurationItemType.TEST_REPORT.value
+        ):
+            raise BusinessException("code 的可选第二上游必须是 test_report")
         return
 
     required_type = _REQUIRED_UPSTREAM_TYPE[semantic_type]

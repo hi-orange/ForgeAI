@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -14,7 +15,7 @@ from app.models.configuration_item import ConfigurationItem
 from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.services import test_engineer as test_engineer_service
-from app.services.task_execution import fail_execution
+from app.services.task_execution import fail_execution, renew_execution_lease
 
 logger = logging.getLogger("forgeai")
 
@@ -53,6 +54,36 @@ def _record_quality_activity(
     db.refresh(execution)
 
 
+def _saved_quality_progress(execution: TaskExecution) -> object:
+    draft = execution.draft if isinstance(execution.draft, dict) else None
+    checkpoint = draft.get("checkpoint") if draft else None
+    if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "quality_checkpoint":
+        return None
+    return checkpoint.get("verification")
+
+
+def _save_quality_progress(
+    db: Session,
+    execution: TaskExecution,
+    progress: dict[str, Any],
+) -> None:
+    """Persist resumable QA evidence and renew the execution fence atomically."""
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    draft = dict(execution.draft or {})
+    checkpoint = draft.get("checkpoint")
+    if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "quality_checkpoint":
+        checkpoint = {"kind": "quality_checkpoint", "activity": []}
+    checkpoint["verification"] = progress
+    draft["checkpoint"] = checkpoint
+    execution.draft = json.loads(json.dumps(draft, ensure_ascii=False))
+    flag_modified(execution, "draft")
+    db.flush()
+    renew_execution_lease(db, execution.task_id, execution.execution_id)
+    db.refresh(execution)
+
+
 def run_test_engineer_task(
     db: Session,
     user: User,
@@ -88,12 +119,22 @@ def run_test_engineer_task(
         )
     workspace_root = default_workspace_path(settings.runtime_data_root, project_id, run_id)
     try:
+
+        def heartbeat() -> None:
+            renew_execution_lease(db, task_id, execution.execution_id)
+
+        def save_progress(progress: dict[str, Any]) -> None:
+            _save_quality_progress(db, execution, progress)
+
         report = verify_code(
             spec=inputs.app_spec,
             system_design=inputs.system_design,
             code_item_id=inputs.code_item.item_id,
             code_source_hash=inputs.code_artifact.source_hash,
             workspace_root=workspace_root,
+            saved_progress=_saved_quality_progress(execution),
+            heartbeat=heartbeat,
+            on_progress=save_progress,
         )
         _record_quality_activity(
             db,

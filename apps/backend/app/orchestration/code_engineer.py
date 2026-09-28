@@ -9,7 +9,11 @@ from typing import Any, TypedDict, cast
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.agents.code_engineer import generate_file_content, plan_work_item_files
+from app.agents.code_engineer import (
+    FileGenerationError,
+    generate_file_content,
+    plan_work_item_files,
+)
 from app.core.exceptions import BusinessException, ConflictException
 from app.core.settings import settings
 from app.generation.delivery import (
@@ -199,6 +203,7 @@ def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
         history = checkpoint.get("plan_history")
         latest = history[-1] if isinstance(history, list) and history else None
         failed_check = latest.get("check") if isinstance(latest, dict) else None
+        previous_plan = latest.get("plan") if isinstance(latest, dict) else None
         if current is not None and isinstance(failed_check, dict):
             rounds = checkpoint.get("repair_rounds")
             rounds = rounds if isinstance(rounds, dict) else {}
@@ -207,7 +212,7 @@ def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
             checkpoint["repair_context"] = {
                 "round": 1,
                 "failed_check": failed_check,
-                "previous_plan": latest.get("plan"),
+                "previous_plan": previous_plan,
                 "modified_files": list(checkpoint.get("modified_files") or []),
             }
             checkpoint["active_file_plan"] = None
@@ -659,6 +664,77 @@ class _EngineeringNodes:
             renew_execution_lease(db, state["task_id"], execution.execution_id)
             return self._result(checkpoint)
 
+    def _queue_generation_repair(
+        self,
+        state: _WorkflowState,
+        *,
+        work_item: WorkItem,
+        plan: ImplementationPlan,
+        task: FileTask,
+        message: str,
+        writer_model_calls: int,
+        tool_calls: int,
+    ) -> _WorkflowUpdate:
+        """Turn exhausted writer validation into a repair round (same path as failed checks)."""
+
+        with self._session_factory() as db:
+            execution, snapshot, checkpoint = _locked_current(db, state)
+            checkpoint["model_turns"] = int(checkpoint.get("model_turns") or 0) + writer_model_calls
+            checkpoint["writer_model_calls"] = (
+                int(checkpoint.get("writer_model_calls") or 0) + writer_model_calls
+            )
+            checkpoint["tool_calls"] = int(checkpoint.get("tool_calls") or 0) + tool_calls
+            checkpoint["last_error"] = message[:500]
+            _append_activity(
+                checkpoint,
+                name="write_invalid",
+                label="Generation rejected",
+                detail=f"{task.path}：{message}",
+                ok=False,
+            )
+            rounds = checkpoint.get("repair_rounds")
+            rounds = rounds if isinstance(rounds, dict) else {}
+            round_number = int(rounds.get(work_item.id) or 0) + 1
+            rounds[work_item.id] = round_number
+            checkpoint["repair_rounds"] = rounds
+            if round_number > _call_budget(snapshot, "max_repair_rounds"):
+                _block_checkpoint(
+                    checkpoint,
+                    f"自动修复轮次已用尽，生成校验仍未通过：{message}",
+                    reason_code="GENERATION_INVALID",
+                )
+            else:
+                checkpoint["repair_context"] = {
+                    "round": round_number,
+                    "failed_check": {
+                        "tool_call_id": f"write_validate_{task.id}",
+                        "name": "generate_file",
+                        "ok": False,
+                        "error_code": "GENERATION_INVALID",
+                        "summary": f"{task.path} 生成校验失败",
+                        "data": {
+                            "path": task.path,
+                            "output": message[:2000],
+                            "check_id": "generate_file",
+                        },
+                    },
+                    "previous_plan": plan.model_dump(mode="json"),
+                    "modified_files": list(checkpoint.get("modified_files") or []),
+                }
+                checkpoint["active_file_plan"] = None
+                checkpoint["active_plan_kind"] = None
+                _append_activity(
+                    checkpoint,
+                    name="plan_repair",
+                    label="Plan repair",
+                    detail=f"根据生成校验错误规划第 {round_number} 轮修复",
+                    ok=True,
+                )
+            snapshot["checkpoint"] = checkpoint
+            _save_snapshot(db, execution.execution_id, snapshot)
+            renew_execution_lease(db, state["task_id"], execution.execution_id)
+            return self._result(checkpoint)
+
     def _plan_step(
         self,
         state: _WorkflowState,
@@ -766,7 +842,7 @@ class _EngineeringNodes:
             "quality_report": snapshot.get("quality_report"),
         }
         try:
-            content = generate_file_content(
+            content, writer_calls = generate_file_content(
                 spec=spec,
                 work_item=work_item,
                 path=task.path,
@@ -774,6 +850,18 @@ class _EngineeringNodes:
                 engineering_context=engineering_context,
                 observations=[],
                 system_design=system_design,
+            )
+        except FileGenerationError as exc:
+            # Exhausted same-file regeneration: fold into repair planning instead of
+            # pausing the user on cheap syntax / protocol validation failures.
+            return self._queue_generation_repair(
+                state,
+                work_item=work_item,
+                plan=plan,
+                task=task,
+                message=str(exc),
+                writer_model_calls=exc.model_calls,
+                tool_calls=read_count,
             )
         except BusinessException as exc:
             return self._persist_failure(
@@ -796,8 +884,9 @@ class _EngineeringNodes:
                 expected_hash=expected_hash,
                 tool_call_id=f"write_{work_item.id}_{current_task.id}",
             )
-            current["model_turns"] = int(current.get("model_turns") or 0) + 1
-            current["writer_model_calls"] = int(current.get("writer_model_calls") or 0) + 1
+            current["model_turns"] = int(current.get("model_turns") or 0) + writer_calls
+            writer_total = int(current.get("writer_model_calls") or 0) + writer_calls
+            current["writer_model_calls"] = writer_total
             current["tool_calls"] = int(current.get("tool_calls") or 0) + read_count + 1
             if not written.ok:
                 _block_checkpoint(current, written.summary, reason_code=written.error_code)

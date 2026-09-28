@@ -8,8 +8,8 @@
         :aria-expanded="openPhases.has(phase.id)"
         @click="togglePhase(phase.id)"
       >
-        <span>{{ isRunningPhase(phaseIndex) ? '◌' : '✓' }}</span>
-        {{ isRunningPhase(phaseIndex) ? '正在处理' : '已处理' }} {{ phase.groups.length }} 步
+        <span>{{ phaseMark(phaseIndex) }}</span>
+        {{ phaseState(phaseIndex) }} {{ phase.groups.length }} 步
         <span>{{ openPhases.has(phase.id) ? '⌃' : '⌄' }}</span>
       </button>
       <p v-if="!openPhases.has(phase.id)" class="timeline-current" role="status">
@@ -78,7 +78,11 @@ import { computed, ref, watch } from 'vue'
 import type { EngineeringActivity } from '@/api/modules/requirements'
 import { buildPhases, isWriteActivity, type BuildGroup } from '../buildTimeline'
 
-const props = defineProps<{ activities: EngineeringActivity[]; running: boolean }>()
+const props = defineProps<{
+  activities: EngineeringActivity[]
+  running: boolean
+  failed?: boolean
+}>()
 defineEmits<{ 'open-file': [path: string] }>()
 const openPhases = ref(new Set<string>())
 const openGroups = ref(new Set<string>())
@@ -96,6 +100,19 @@ watch(
 )
 function isRunningPhase(index: number) {
   return props.running && index === phases.value.length - 1
+}
+function isFailedPhase(index: number) {
+  return props.failed && index === phases.value.length - 1
+}
+function phaseMark(index: number) {
+  if (isRunningPhase(index)) return '◌'
+  if (isFailedPhase(index)) return '!'
+  return '✓'
+}
+function phaseState(index: number) {
+  if (isRunningPhase(index)) return '正在处理'
+  if (isFailedPhase(index)) return '处理暂停'
+  return '已处理'
 }
 function togglePhase(id: string) {
   const next = new Set(openPhases.value)

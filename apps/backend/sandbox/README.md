@@ -31,6 +31,10 @@ docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-v1 .
 - `backend`：上述数据库检查、启动 Uvicorn、请求健康接口与 OpenAPI，输出注册路由。
 - `frontend`：按清单安装前端依赖（如有变更）、Vue/TypeScript 检查、Vite 生产构建、检查首页产物存在。
 - `all`：后端与前端检查。每个功能提交都会运行，不复用旧源码的检查结论。
+- `capture_screenshots`（Test Engineer 工具）：在同一隔离镜像内启动后端与 Vite 页面，使用
+  Chromium + Playwright 分别以 1440×900 和 390×844 渲染指定站内路由；导出 PNG，并记录
+  控制台错误、页面异常和横向溢出。截图写入工作区的平台目录
+  `forgeai/evidence/<source_hash>/`，不计入生成源码身份。
 
 临时数据库只用于验证，检查结束后销毁；不能把“验证建表成功”理解为生产数据库已经部署。
 这些工程检查不会证明所有业务验收条款、权限流程或浏览器交互都已满足。
@@ -44,7 +48,8 @@ docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-v1 .
 容器非 root、根文件系统只读，移除 capabilities，并限制 CPU、内存、进程和临时磁盘。
 为按生成清单安装依赖，检查容器允许出网，且 `/tmp` tmpfs 带 `exec`
 （原生 npm 二进制需要可执行）；安装使用 `--ignore-scripts` 降低供应链风险。
-输出仅保留有界日志尾部。超时会清理本次命名的容器。
+输出仅保留有界日志尾部。截图通过 `docker cp` 从已经停止的命名容器取出，不使用宿主目录挂载；
+无论成功、失败或超时都会清理本次命名的容器。
 边界参数依据 [Docker run 文档](https://docs.docker.com/reference/cli/docker/container/run/)。
 
 工作区文件锁覆盖整个执行及恢复操作，防止同一主机多进程写入。此实现假设后端进程共享同一

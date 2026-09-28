@@ -19,10 +19,19 @@ from app.agents.prompts.product_manager import (
 
 class AgentPromptContractTests(unittest.TestCase):
     def test_product_manager_research_is_optional_and_approval_safe(self):
-        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v3"))
+        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v10"))
         self.assertIn("普通、明确的应用需求不强制联网", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("需由用户勾选、编辑和批准", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("source_ids", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("短标题：一句用户可见说明", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("宁少勿滥", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("禁止套用固定范文", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("不做市场/竞品调研专章", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("不自动等于用户确认", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("Vue + FastAPI + SQLite", APP_SPEC_SYSTEM_PROMPT)
+        self.assertNotIn("初始化全栈项目：Vue", APP_SPEC_SYSTEM_PROMPT)
+        self.assertNotIn("视觉设计：…风格要点", APP_SPEC_SYSTEM_PROMPT)
+        self.assertNotIn("模式 2", APP_SPEC_SYSTEM_PROMPT)
 
     def test_architect_produces_implementation_ready_cross_layer_contracts(self):
         self.assertTrue(ARCHITECT_PROMPT_VERSION.endswith("_v2"))

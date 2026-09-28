@@ -22,6 +22,16 @@ from app.tools import files as file_tools
 
 _DEFECT_SCHEMA = DefectRecord.model_json_schema()
 _TEST_REPORT_SCHEMA = TestReport.model_json_schema()
+QUALITY_PROGRESS_SCHEMA_VERSION = 1
+MAX_CHECKPOINT_OUTPUT_CHARS = 8_000
+_NON_REUSABLE_CHECK_ERRORS = frozenset(
+    {
+        "CHECK_ENVIRONMENT_UNAVAILABLE",
+        "CHECK_TIMEOUT",
+        "SOURCE_CHANGED",
+        "SOURCE_MISMATCH",
+    }
+)
 
 TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
@@ -91,6 +101,25 @@ TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
         },
     ),
     ToolDefinition(
+        name="capture_screenshots",
+        description=(
+            "在隔离环境启动准确代码，用 Chromium 生成 1440x900 桌面端和 390x844 移动端截图，"
+            "并检查控制台错误、页面异常和横向溢出。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "route": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "description": "站内绝对路径，例如 / 或 /jobs。",
+                }
+            },
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
         name="record_defect",
         description="记录一个有证据、严重度和需求关联的缺陷；不修改代码。",
         parameters={
@@ -123,6 +152,79 @@ class TestEngineerToolState:
     checks: dict[str, ToolExecutionResult] = field(default_factory=dict)
     defects: dict[str, DefectRecord] = field(default_factory=dict)
     explore_before_check: int = 0
+
+
+def _is_reusable_check(result: ToolExecutionResult) -> bool:
+    output = result.data.get("output")
+    stale_visual_runtime = result.name == "capture_screenshots" and (
+        isinstance(output, str) and "Unknown check" in output
+    )
+    return result.error_code not in _NON_REUSABLE_CHECK_ERRORS and not stale_visual_runtime
+
+
+def export_test_engineer_progress(state: TestEngineerToolState) -> dict[str, Any]:
+    """Create a bounded, source-bound checkpoint for a recoverable QA attempt."""
+
+    checks: dict[str, dict[str, Any]] = {}
+    for check_id, result in state.checks.items():
+        payload = result.model_dump(mode="json")
+        data = dict(payload.get("data") or {})
+        output = data.get("output")
+        if isinstance(output, str) and len(output) > MAX_CHECKPOINT_OUTPUT_CHARS:
+            data["output"] = output[-MAX_CHECKPOINT_OUTPUT_CHARS:]
+            payload["truncated"] = True
+        payload["data"] = data
+        checks[check_id] = payload
+    return {
+        "schema_version": QUALITY_PROGRESS_SCHEMA_VERSION,
+        "code_item_id": state.code_item_id,
+        "source_hash": state.code_source_hash,
+        "checks": checks,
+        "defects": [defect.model_dump(mode="json") for defect in state.defects.values()],
+        "explore_before_check": state.explore_before_check,
+    }
+
+
+def restore_test_engineer_progress(
+    state: TestEngineerToolState,
+    progress: object,
+) -> None:
+    """Restore only reusable evidence produced for the exact frozen code identity."""
+
+    if not isinstance(progress, dict) or (
+        progress.get("schema_version") != QUALITY_PROGRESS_SCHEMA_VERSION
+        or progress.get("code_item_id") != state.code_item_id
+        or progress.get("source_hash") != state.code_source_hash
+    ):
+        return
+    raw_checks = progress.get("checks")
+    if isinstance(raw_checks, dict):
+        for check_id, raw in raw_checks.items():
+            if not isinstance(check_id, str) or not isinstance(raw, dict):
+                continue
+            try:
+                result = ToolExecutionResult.model_validate(raw)
+            except ValidationError:
+                continue
+            if not _is_reusable_check(result):
+                continue
+            observed_hash = result.data.get("source_hash")
+            if observed_hash != state.code_source_hash:
+                continue
+            state.checks[check_id] = result
+    requirement_ids = {item.id for item in state.app_spec.acceptance_criteria}
+    raw_defects = progress.get("defects")
+    if isinstance(raw_defects, list):
+        for raw in raw_defects:
+            try:
+                defect = DefectRecord.model_validate(raw)
+            except ValidationError:
+                continue
+            if set(defect.related_requirement_ids).issubset(requirement_ids):
+                state.defects[defect.defect_id] = defect
+    explore_before_check = progress.get("explore_before_check")
+    if isinstance(explore_before_check, int):
+        state.explore_before_check = max(0, min(explore_before_check, _MAX_EXPLORE_BEFORE_CHECK))
 
 
 # Allow a few targeted reads after artifacts; then force run_check(all).
@@ -159,12 +261,28 @@ def _validated_report(call: ToolCall, state: TestEngineerToolState) -> TestRepor
         raise BusinessException("测试报告必须逐条覆盖 PRD 验收条件")
     if "all" not in state.checks:
         raise BusinessException("提交测试报告前必须运行完整 all 检查")
+    visual_check_ids = [check_id for check_id in state.checks if check_id.startswith("visual")]
+    if not visual_check_ids:
+        raise BusinessException("提交测试报告前必须生成桌面端与移动端截图")
     reported_checks = {item.check_id: item for item in report.check_results}
     if set(reported_checks) != set(state.checks):
         raise BusinessException("测试报告必须记录本轮全部实际检查")
     for check_id, result in state.checks.items():
         if reported_checks[check_id].status != _result_status(result):
             raise BusinessException(f"检查 {check_id} 的报告状态与实际结果不一致")
+    for check_id in visual_check_ids:
+        visual_result = state.checks[check_id]
+        if visual_result.ok:
+            raw_screenshots = visual_result.data.get("screenshots")
+            screenshots = raw_screenshots if isinstance(raw_screenshots, list) else []
+            paths = [
+                str(item.get("path"))
+                for item in screenshots
+                if isinstance(item, dict) and item.get("path")
+            ]
+            visual_evidence = reported_checks[check_id].evidence
+            if len(paths) != 2 or any(path not in visual_evidence for path in paths):
+                raise BusinessException(f"检查 {check_id} 的证据必须引用本轮桌面端与移动端截图路径")
     reported_defects = {item.defect_id: item for item in report.defects}
     if set(reported_defects) != set(state.defects) or any(
         reported_defects[key] != value for key, value in state.defects.items()
@@ -268,6 +386,17 @@ def execute_test_engineer_tool(
             return result.model_copy(update={"arguments": dict(call.arguments)}), None
         if call.name == "run_check":
             check_id = str(call.arguments.get("check_id") or "")
+            cached = state.checks.get(check_id)
+            if cached is not None and _is_reusable_check(cached):
+                reused = cached.model_copy(
+                    update={
+                        "tool_call_id": call.id,
+                        "summary": f"复用已完成检查：{cached.summary}",
+                        "arguments": dict(call.arguments),
+                    }
+                )
+                state.checks[check_id] = reused
+                return reused, None
             result = check_tools.run_check(
                 state.workspace_root, check_id=check_id, tool_call_id=call.id
             ).model_copy(update={"arguments": dict(call.arguments)})
@@ -280,6 +409,48 @@ def execute_test_engineer_tool(
                         "summary": "检查源码与指定代码结果不一致",
                     }
                 )
+            state.checks[check_id] = result
+            return result, None
+        if call.name == "capture_screenshots":
+            if "all" not in state.checks:
+                raise BusinessException('截图前必须先 run_check(check_id="all")')
+            route = str(call.arguments.get("route") or "/")
+            cached = next(
+                (
+                    result
+                    for check_id, result in state.checks.items()
+                    if check_id.startswith("visual")
+                    and result.data.get("route") == route
+                    and _is_reusable_check(result)
+                ),
+                None,
+            )
+            if cached is not None:
+                reused = cached.model_copy(
+                    update={
+                        "tool_call_id": call.id,
+                        "summary": f"复用已完成截图：{cached.summary}",
+                        "arguments": dict(call.arguments),
+                    }
+                )
+                check_id = str(reused.data.get("check_id") or "visual")
+                state.checks[check_id] = reused
+                return reused, None
+            result = check_tools.capture_screenshots(
+                state.workspace_root,
+                route=route,
+                tool_call_id=call.id,
+            ).model_copy(update={"arguments": dict(call.arguments)})
+            observed_hash = result.data.get("source_hash")
+            if isinstance(observed_hash, str) and observed_hash != state.code_source_hash:
+                result = result.model_copy(
+                    update={
+                        "ok": False,
+                        "error_code": "SOURCE_MISMATCH",
+                        "summary": "截图源码与指定代码结果不一致",
+                    }
+                )
+            check_id = str(result.data.get("check_id") or "visual")
             state.checks[check_id] = result
             return result, None
         if call.name == "record_defect":

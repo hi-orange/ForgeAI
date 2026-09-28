@@ -157,6 +157,12 @@ def continue_requirements(db: Session, user: User, project_id: int) -> Requireme
     if not status.run_id:
         raise BusinessException("当前没有可继续的构建")
 
+    # Continue is a coarse, user-facing action and can race with automatic dispatch or
+    # polling. Once Architect / QA already owns an active execution, a duplicate request
+    # is successful and idempotent rather than an invalid transition.
+    if status.state in {"design_running", "quality_running"}:
+        return status
+
     current_task = (
         task_service.get_user_task(db, user, project_id, status.task_id) if status.task_id else None
     )
@@ -447,39 +453,60 @@ def _activities_for_run(db: Session, run_id: str) -> list[EngineeringActivity]:
     the workflow advances to another task.
     """
 
-    rows = db.execute(
-        select(Task, TaskExecution)
+    # Sort only narrow columns. Ordering rows that include TaskExecution.draft (large JSON)
+    # can exhaust MySQL sort_buffer ("Out of sort memory").
+    ordered = db.execute(
+        select(
+            Task.task_id,
+            Task.title,
+            Task.recipient,
+            TaskExecution.execution_id,
+            TaskExecution.attempt,
+        )
         .join(Plan, Task.plan_id == Plan.plan_id)
         .join(TaskExecution, TaskExecution.task_id == Task.task_id)
         .where(Plan.build_run_id == run_id)
         .order_by(Plan.version.asc(), Task.position.asc(), TaskExecution.attempt.asc())
     ).all()
+    if not ordered:
+        return []
+
+    execution_ids = [row.execution_id for row in ordered]
+    drafts = {
+        execution_id: draft
+        for execution_id, draft in db.execute(
+            select(TaskExecution.execution_id, TaskExecution.draft).where(
+                TaskExecution.execution_id.in_(execution_ids)
+            )
+        ).all()
+    }
+
     previous_by_task: dict[str, list[dict[str, object]]] = {}
     activities: list[EngineeringActivity] = []
-    for task, execution in rows:
-        draft = execution.draft if isinstance(execution.draft, dict) else None
+    for task_id, title, recipient, execution_id, attempt in ordered:
+        draft = drafts.get(execution_id)
+        draft = draft if isinstance(draft, dict) else None
         checkpoint = draft.get("checkpoint") if draft else None
         raw_items = (
             [item for item in checkpoint.get("activity") or [] if isinstance(item, dict)]
             if isinstance(checkpoint, dict)
             else []
         )
-        previous = previous_by_task.get(task.task_id, [])
+        previous = previous_by_task.get(task_id, [])
         prefix_matches = len(raw_items) >= len(previous) and raw_items[: len(previous)] == previous
         visible_items = raw_items[len(previous) :] if prefix_matches else raw_items
-        previous_by_task[task.task_id] = raw_items
+        previous_by_task[task_id] = raw_items
         # Recovery attempts are continuations of the same role assignment. Exposing every
         # TaskExecution as a new chat block made one failed work item appear dozens of times.
-        phase_label = task.title
         for index, raw in enumerate(visible_items, start=1):
             payload = dict(raw)
             raw_id = str(payload.get("id") or index)
             payload.update(
-                id=f"{execution.execution_id}:{raw_id}",
-                phase_id=task.task_id,
-                phase_label=phase_label,
-                phase_role=task.recipient,
-                attempt=execution.attempt,
+                id=f"{execution_id}:{raw_id}",
+                phase_id=task_id,
+                phase_label=title,
+                phase_role=recipient,
+                attempt=attempt,
             )
             try:
                 activities.append(EngineeringActivity.model_validate(payload))
@@ -782,7 +809,18 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             snapshot = read_frozen_input_snapshot(execution)
             checkpoint = snapshot.get("checkpoint") if snapshot else None
             result.activities = _activities_from_checkpoint(checkpoint)
-            if isinstance(checkpoint, dict) and checkpoint.get("outcome") == "generated":
+            if (
+                isinstance(checkpoint, dict)
+                and checkpoint.get("outcome") == "generated"
+                and checkpoint.get("last_error")
+            ):
+                # Source generation and code publication are separate steps. A generated
+                # checkpoint with a later publication error is recoverable, but it is not
+                # yet a published code result and must keep the Continue action available.
+                result.state = "retry_available"
+                result.error = str(checkpoint["last_error"])
+                result.code_ready = True
+            elif isinstance(checkpoint, dict) and checkpoint.get("outcome") == "generated":
                 result.state = "engineering_generated"
                 result.code_ready = True
             elif isinstance(checkpoint, dict) and checkpoint.get("outcome") == "blocked":

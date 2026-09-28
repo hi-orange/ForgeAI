@@ -42,6 +42,40 @@ class QualityActivityPersistenceTests(unittest.TestCase):
         self.assertEqual(db.commit.call_count, 2)
         self.assertEqual(db.refresh.call_count, 2)
 
+    def test_quality_progress_is_persisted_without_losing_activity_and_renews_lease(self) -> None:
+        execution = MagicMock()
+        execution.task_id = "task_quality"
+        execution.execution_id = "exec_quality"
+        execution.draft = {
+            "checkpoint": {
+                "kind": "quality_checkpoint",
+                "activity": [{"name": "quality_start"}],
+            }
+        }
+        db = MagicMock()
+        progress = {
+            "schema_version": 1,
+            "code_item_id": "ci_code",
+            "source_hash": "a" * 64,
+            "checks": {},
+            "defects": [],
+            "explore_before_check": 0,
+        }
+
+        with (
+            patch("sqlalchemy.orm.attributes.flag_modified") as flag,
+            patch("app.orchestration.test_engineer.renew_execution_lease") as renew,
+        ):
+            orch._save_quality_progress(db, execution, progress)
+
+        checkpoint = execution.draft["checkpoint"]
+        self.assertEqual(checkpoint["activity"], [{"name": "quality_start"}])
+        self.assertEqual(checkpoint["verification"], progress)
+        flag.assert_called_once_with(execution, "draft")
+        db.flush.assert_called_once_with()
+        renew.assert_called_once_with(db, "task_quality", "exec_quality")
+        db.refresh.assert_called_once_with(execution)
+
 
 if __name__ == "__main__":
     unittest.main()

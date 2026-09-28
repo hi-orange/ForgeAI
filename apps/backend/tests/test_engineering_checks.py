@@ -13,11 +13,14 @@ from app.core.exceptions import ConflictException
 from app.generation.lock import workspace_lock
 from app.generation.workspace import create_workspace
 from app.tools.checks import (
+    CHECK_RUNTIME_VERSION,
     _execute,
+    capture_screenshots,
     check_environment,
     docker_command,
     run_check,
     source_snapshot,
+    visual_docker_command,
 )
 
 
@@ -57,6 +60,66 @@ class EngineeringCheckTests(unittest.TestCase):
         self.assertTrue(any(arg.startswith("--memory=") for arg in command))
         self.assertTrue(any(arg.startswith("--pids-limit=") for arg in command))
 
+    def test_visual_container_is_copyable_without_host_mount(self):
+        command = visual_docker_command("docker", "trusted-image", "visual-instance", "/jobs")
+        self.assertNotIn("--rm", command)
+        self.assertNotIn("--volume", command)
+        self.assertNotIn("--mount", command)
+        self.assertEqual(command[-2:], ["visual", "/jobs"])
+
+    def test_capture_screenshots_returns_real_artifact_metadata(self):
+        screenshots = [
+            {
+                "viewport": "desktop",
+                "path": "forgeai/evidence/hash/desktop.png",
+                "horizontal_overflow": False,
+                "console_errors": [],
+                "page_errors": [],
+            },
+            {
+                "viewport": "mobile",
+                "path": "forgeai/evidence/hash/mobile.png",
+                "horizontal_overflow": False,
+                "console_errors": [],
+                "page_errors": [],
+            },
+        ]
+        with (
+            patch("app.tools.checks.shutil.which", return_value="docker"),
+            patch("app.tools.checks._execute", return_value=(0, "captured", False)),
+            patch(
+                "app.tools.checks._collect_visual_evidence",
+                return_value=(screenshots, {"browser": "chromium"}),
+            ),
+            patch("app.tools.checks.subprocess.run"),
+        ):
+            result = capture_screenshots(self.root, route="/jobs")
+        self.assertTrue(result.ok, result.model_dump())
+        self.assertEqual(result.data["route"], "/jobs")
+        self.assertTrue(result.data["check_id"].startswith("visual_"))
+        self.assertEqual(result.data["screenshots"], screenshots)
+
+    def test_capture_screenshots_rejects_external_url(self):
+        with patch("app.tools.checks._execute") as execute:
+            result = capture_screenshots(self.root, route="https://example.com")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_ROUTE")
+        execute.assert_not_called()
+
+    def test_capture_screenshots_classifies_old_runtime_as_environment_failure(self):
+        with (
+            patch("app.tools.checks.shutil.which", return_value="docker"),
+            patch(
+                "app.tools.checks._execute",
+                return_value=(1, 'raise ValueError("Unknown check")', False),
+            ),
+            patch("app.tools.checks.subprocess.run"),
+        ):
+            result = capture_screenshots(self.root)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "CHECK_ENVIRONMENT_UNAVAILABLE")
+        self.assertIn("版本过旧", result.summary)
+
     def test_missing_environment_does_not_report_success(self):
         with patch("app.tools.checks.shutil.which", return_value=None):
             result = run_check(self.root, check_id="all")
@@ -68,7 +131,10 @@ class EngineeringCheckTests(unittest.TestCase):
             args=["docker", "info"], returncode=0, stdout="27.5.1\n", stderr=""
         )
         image = subprocess.CompletedProcess(
-            args=["docker", "image", "inspect"], returncode=0, stdout="[]", stderr=""
+            args=["docker", "image", "inspect"],
+            returncode=0,
+            stdout=CHECK_RUNTIME_VERSION,
+            stderr="",
         )
         with (
             patch("app.tools.checks.shutil.which", return_value="docker"),
@@ -79,6 +145,22 @@ class EngineeringCheckTests(unittest.TestCase):
         self.assertEqual(result.data["server_version"], "27.5.1")
         self.assertEqual(run.call_args_list[0].args[0][0:2], ["docker", "info"])
         self.assertEqual(run.call_args_list[1].args[0][0:3], ["docker", "image", "inspect"])
+
+    def test_environment_preflight_rejects_stale_image(self):
+        daemon = subprocess.CompletedProcess(
+            args=["docker", "info"], returncode=0, stdout="27.5.1\n", stderr=""
+        )
+        stale_image = subprocess.CompletedProcess(
+            args=["docker", "image", "inspect"], returncode=0, stdout="<no value>\n", stderr=""
+        )
+        with (
+            patch("app.tools.checks.shutil.which", return_value="docker"),
+            patch("app.tools.checks.subprocess.run", side_effect=[daemon, stale_image]),
+        ):
+            result = check_environment()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "CHECK_ENVIRONMENT_UNAVAILABLE")
+        self.assertIn("版本过旧", result.summary)
 
     def test_environment_preflight_stops_when_daemon_is_unavailable(self):
         daemon = subprocess.CompletedProcess(
@@ -142,7 +224,15 @@ class EngineeringCheckTests(unittest.TestCase):
     @unittest.skipUnless(
         os.getenv("FORGEAI_TEST_DOCKER") == "1", "requires built check image and Docker"
     )
-    def test_real_template_migrations_backend_and_frontend(self):
+    def test_real_template_checks_and_browser_screenshots(self):
         result = run_check(self.root, check_id="all")
         self.assertTrue(result.ok, result.model_dump())
         self.assertIn("实际表结构", result.data["output"])
+        visual = capture_screenshots(self.root)
+        self.assertTrue(visual.ok, visual.model_dump())
+        self.assertEqual(
+            {item["viewport"] for item in visual.data["screenshots"]},
+            {"desktop", "mobile"},
+        )
+        for item in visual.data["screenshots"]:
+            self.assertTrue((self.root / item["path"]).is_file())
