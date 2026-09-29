@@ -9,6 +9,7 @@ from app.agents.prompts.architect import (
 from app.agents.prompts.code_engineer import (
     CODE_ENGINEER_SYSTEM_PROMPT,
     CODE_WRITER_SYSTEM_PROMPT,
+    FILE_PLANNER_SYSTEM_PROMPT,
 )
 from app.agents.prompts.leader import LEADER_SYSTEM_PROMPT
 from app.agents.prompts.product_manager import (
@@ -19,7 +20,7 @@ from app.agents.prompts.product_manager import (
 
 class AgentPromptContractTests(unittest.TestCase):
     def test_product_manager_research_is_optional_and_approval_safe(self):
-        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v10"))
+        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v12"))
         self.assertIn("普通、明确的应用需求不强制联网", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("需由用户勾选、编辑和批准", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("source_ids", APP_SPEC_SYSTEM_PROMPT)
@@ -28,16 +29,20 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("禁止套用固定范文", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("不做市场/竞品调研专章", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("不自动等于用户确认", APP_SPEC_SYSTEM_PROMPT)
-        self.assertIn("Vue + FastAPI + SQLite", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("React + TypeScript + FastAPI + SQLite", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("刷新后仍能读取持久化结果", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("开发种子数据", APP_SPEC_SYSTEM_PROMPT)
         self.assertNotIn("初始化全栈项目：Vue", APP_SPEC_SYSTEM_PROMPT)
         self.assertNotIn("视觉设计：…风格要点", APP_SPEC_SYSTEM_PROMPT)
         self.assertNotIn("模式 2", APP_SPEC_SYSTEM_PROMPT)
 
     def test_architect_produces_implementation_ready_cross_layer_contracts(self):
-        self.assertTrue(ARCHITECT_PROMPT_VERSION.endswith("_v2"))
+        self.assertTrue(ARCHITECT_PROMPT_VERSION.endswith("_v4"))
         self.assertIn("批准功能 → 模块 → 接口 → 数据结构", ARCHITECT_SYSTEM_PROMPT)
         self.assertIn("method/path", ARCHITECT_SYSTEM_PROMPT)
-        self.assertIn("FastAPI、Vue 和 SQLite", ARCHITECT_SYSTEM_PROMPT)
+        self.assertIn("React、TypeScript、FastAPI 和 SQLite", ARCHITECT_SYSTEM_PROMPT)
+        self.assertIn("forgeai.smoke.json", ARCHITECT_SYSTEM_PROMPT)
+        self.assertIn("通用蓝白后台", ARCHITECT_SYSTEM_PROMPT)
 
     def test_code_prompts_require_observation_and_bounded_single_file_writes(self):
         self.assertIn("观察已有状态", CODE_ENGINEER_SYSTEM_PROMPT)
@@ -47,6 +52,10 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("install_project_dependency", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("禁止 apt", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("一次工具调用只修改一个文件", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("真实业务 API", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("默认蓝白卡片", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("不得借新增功能擅自换色", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("frontend/src/index.css", FILE_PLANNER_SYSTEM_PROMPT)
         self.assertIn("只输出目标文件正文", CODE_WRITER_SYSTEM_PROMPT)
         self.assertIn("不输出 TODO", CODE_WRITER_SYSTEM_PROMPT)
 

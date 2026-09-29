@@ -6,7 +6,8 @@ import json
 from pathlib import Path
 
 FULLSTACK_V1 = "fullstack-v1"
-DEFAULT_TEMPLATE_VERSION = FULLSTACK_V1
+FULLSTACK_REACT_V1 = "fullstack-react-v1"
+DEFAULT_TEMPLATE_VERSION = FULLSTACK_REACT_V1
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 TEMPLATES_DIR = BACKEND_DIR / "templates"
@@ -26,6 +27,7 @@ def get_template_root(template_version: str = DEFAULT_TEMPLATE_VERSION) -> Path:
     required = (
         root / "template.json",
         root / "README.template.md",
+        root / "forgeai.smoke.json",
         root / "frontend" / "package.json",
         root / "backend" / "app" / "main.py",
         root / "backend" / "alembic" / "versions" / "0001_create_app_meta.py",

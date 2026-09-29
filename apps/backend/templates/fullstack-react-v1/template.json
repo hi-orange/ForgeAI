@@ -1,0 +1,14 @@
+{
+  "template_version": "fullstack-react-v1",
+  "stack": {
+    "frontend": "react",
+    "backend": "fastapi",
+    "database": "sqlite"
+  },
+  "reference": {
+    "repository": "https://github.com/fastapi/full-stack-fastapi-template",
+    "license": "MIT",
+    "adaptation": "ForgeAI preview profile using SQLite and a single /api/v1 contract"
+  },
+  "description": "Modern React and FastAPI skeleton for generated websites. Business features are added from approved requirements."
+}

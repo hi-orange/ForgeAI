@@ -2,6 +2,7 @@
 
 from app.generation.template_registry import (
     DEFAULT_TEMPLATE_VERSION,
+    FULLSTACK_REACT_V1,
     FULLSTACK_V1,
     TemplateNotFoundError,
     get_template_root,
@@ -17,6 +18,7 @@ from app.generation.workspace import (
 
 __all__ = [
     "DEFAULT_TEMPLATE_VERSION",
+    "FULLSTACK_REACT_V1",
     "FULLSTACK_V1",
     "TemplateNotFoundError",
     "WorkspaceExistsError",

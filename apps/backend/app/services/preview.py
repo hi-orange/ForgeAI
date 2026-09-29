@@ -24,6 +24,7 @@ from app.core.settings import settings
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
 from app.services import project as project_service
+from app.services.preview_design import inject_design_bridge
 from app.services.requirements import get_requirements_status
 
 logger = logging.getLogger("forgeai.preview")
@@ -349,7 +350,7 @@ def _wait_http(url: str, *, timeout: float, label: str) -> None:
     raise BusinessException(f"{label}未在时限内就绪" + (f"：{last_error}" if last_error else ""))
 
 
-def _make_proxy_handler(dist_root: Path, backend_port: int, bind_host: str):
+def _make_proxy_handler(dist_root: Path, backend_port: int, bind_host: str, workspace: Path):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -430,6 +431,8 @@ def _make_proxy_handler(dist_root: Path, backend_port: int, bind_host: str):
             data = file_path.read_bytes()
             content_type = "text/html; charset=utf-8"
             suffix = file_path.suffix.lower()
+            if suffix == ".html":
+                data = inject_design_bridge(data, workspace)
             if suffix == ".js":
                 content_type = "text/javascript; charset=utf-8"
             elif suffix == ".css":
@@ -482,8 +485,9 @@ def _start_proxy(
     bind_host: str,
     preview_port: int,
     backend_port: int,
+    workspace: Path,
 ) -> ThreadingHTTPServer:
-    handler = _make_proxy_handler(dist_root, backend_port, bind_host)
+    handler = _make_proxy_handler(dist_root, backend_port, bind_host, workspace)
     server = ThreadingHTTPServer((bind_host, preview_port), handler)
     thread = threading.Thread(
         target=server.serve_forever,
@@ -538,7 +542,7 @@ def _boot_session(session: _PreviewSession) -> None:
             label="预览后端",
         )
         dist_root = session.workspace / "frontend" / "dist"
-        proxy = _start_proxy(dist_root, bind_host, preview_port, backend_port)
+        proxy = _start_proxy(dist_root, bind_host, preview_port, backend_port, session.workspace)
         with session.lock:
             session.proxy_server = proxy
         url = f"http://{bind_host}:{preview_port}/"

@@ -1,12 +1,15 @@
-"""Tests for fullstack-v1 template copying into engineering workspaces."""
+"""Tests for versioned template copying into engineering workspaces."""
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from app.generation import (
+    DEFAULT_TEMPLATE_VERSION,
+    FULLSTACK_REACT_V1,
     FULLSTACK_V1,
     TemplateNotFoundError,
     WorkspaceExistsError,
@@ -19,17 +22,22 @@ from app.generation import (
 
 class CreateWorkspaceTests(unittest.TestCase):
     def test_template_metadata_and_root(self) -> None:
-        meta = load_template_metadata(FULLSTACK_V1)
-        self.assertEqual(meta["template_version"], FULLSTACK_V1)
-        root = get_template_root(FULLSTACK_V1)
+        self.assertEqual(DEFAULT_TEMPLATE_VERSION, FULLSTACK_REACT_V1)
+        meta = load_template_metadata()
+        self.assertEqual(meta["template_version"], FULLSTACK_REACT_V1)
+        self.assertEqual(meta["stack"]["frontend"], "react")
+        root = get_template_root()
         self.assertTrue((root / "frontend" / "package.json").is_file())
+        self.assertTrue((root / "frontend" / "src" / "App.tsx").is_file())
+        self.assertTrue((root / "frontend" / "src" / "router.tsx").is_file())
+        self.assertTrue((root / "forgeai.smoke.json").is_file())
         self.assertTrue((root / "backend" / "app" / "main.py").is_file())
         self.assertTrue(
             (root / "backend" / "alembic" / "versions" / "0001_create_app_meta.py").is_file()
         )
 
     def test_template_has_no_jobhub_business_modules(self) -> None:
-        root = get_template_root(FULLSTACK_V1)
+        root = get_template_root(FULLSTACK_REACT_V1)
         forbidden_names = {"jobs.py", "applications.py", "job.py", "application.py", "resume.py"}
         found = {
             path.name
@@ -40,7 +48,7 @@ class CreateWorkspaceTests(unittest.TestCase):
         text_blob = "\n".join(
             path.read_text(encoding="utf-8", errors="ignore")
             for path in root.rglob("*")
-            if path.is_file() and path.suffix in {".py", ".vue", ".ts", ".md", ".json"}
+            if path.is_file() and path.suffix in {".py", ".tsx", ".ts", ".md", ".json"}
         )
         self.assertNotIn("job_posting", text_blob.lower())
         self.assertNotIn("/api/v1/jobs", text_blob.lower())
@@ -48,12 +56,21 @@ class CreateWorkspaceTests(unittest.TestCase):
     def test_create_workspace_copies_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "work" / "1" / "exec_a"
-            workspace = create_workspace(dest, template_version=FULLSTACK_V1)
+            workspace = create_workspace(dest)
             self.assertEqual(workspace, dest.resolve())
             self.assertTrue((workspace / "README.md").is_file())
-            self.assertTrue((workspace / "frontend" / "src" / "App.vue").is_file())
+            self.assertTrue((workspace / "frontend" / "src" / "App.tsx").is_file())
             self.assertTrue((workspace / "backend" / "app" / "api" / "health.py").is_file())
             self.assertTrue((workspace / "manifest.schema.json").is_file())
+            smoke = json.loads((workspace / "forgeai.smoke.json").read_text(encoding="utf-8"))
+            self.assertEqual(smoke["version"], 1)
+            self.assertTrue(smoke["api_checks"])
+            self.assertTrue(smoke["browser_checks"])
+
+    def test_legacy_vue_template_remains_available_for_frozen_runs(self) -> None:
+        meta = load_template_metadata(FULLSTACK_V1)
+        self.assertEqual(meta["stack"]["frontend"], "vue")
+        self.assertTrue((get_template_root(FULLSTACK_V1) / "frontend/src/App.vue").is_file())
 
     def test_create_workspace_refuses_existing_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

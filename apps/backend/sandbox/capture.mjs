@@ -1,5 +1,7 @@
-import { chromium } from "/opt/visual/node_modules/playwright-core/index.js";
+import playwright from "/opt/visual/node_modules/playwright-core/index.js";
 import fs from "node:fs/promises";
+
+const { chromium } = playwright;
 
 const [url, outputDirectory] = process.argv.slice(2);
 if (!url || !outputDirectory) {
@@ -30,11 +32,22 @@ try {
       locale: "zh-CN",
     });
     const page = await context.newPage();
+    page.setDefaultTimeout(15000);
+    page.setDefaultNavigationTimeout(30000);
     const consoleErrors = [];
     const pageErrors = [];
     page.on("console", (message) => {
-      if (message.type() === "error" && consoleErrors.length < 20) {
-        consoleErrors.push(message.text().slice(0, 500));
+      const text = message.text();
+      const locationUrl = message.location().url;
+      let isMissingFavicon = false;
+      try {
+        isMissingFavicon =
+          text.includes("404") && new URL(locationUrl).pathname === "/favicon.ico";
+      } catch {
+        // Keep malformed or absent console locations visible as real evidence.
+      }
+      if (message.type() === "error" && !isMissingFavicon && consoleErrors.length < 20) {
+        consoleErrors.push(text.slice(0, 500));
       }
     });
     page.on("pageerror", (error) => {
@@ -42,7 +55,13 @@ try {
     });
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-    await page.evaluate(() => document.fonts?.ready);
+    await page.evaluate(async () => {
+      if (!document.fonts) return;
+      await Promise.race([
+        document.fonts.ready,
+        new Promise((resolve) => window.setTimeout(resolve, 3000)),
+      ]);
+    });
     const horizontalOverflow = await page.evaluate(
       () => document.documentElement.scrollWidth > window.innerWidth + 1,
     );

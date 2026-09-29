@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 from app.core.exceptions import BusinessException
 from app.core.settings import settings
 from app.services import preview as preview_service
+from app.services import preview_design
 
 
 class PreviewServiceTests(unittest.TestCase):
@@ -149,6 +150,104 @@ class PreviewServiceTests(unittest.TestCase):
         ):
             port = preview_service._allocate_port("127.0.0.1")
         self.assertEqual(port, 18102)
+
+    def test_design_state_is_versioned_and_recoverable(self) -> None:
+        db = MagicMock()
+        user = MagicMock()
+        status = MagicMock(state="completed", run_id="run_design")
+        with tempfile.TemporaryDirectory(prefix="forgeai-design-") as tmp:
+            workspace = Path(tmp)
+            with (
+                patch.object(preview_design.project_service, "get_user_project"),
+                patch.object(preview_design, "get_requirements_status", return_value=status),
+                patch.object(preview_design, "workspace_is_ready", return_value=True),
+                patch.object(preview_design, "default_workspace_path", return_value=workspace),
+            ):
+                initial = preview_design.get_design_state(db, user, 29)
+                self.assertEqual(initial.revision, 0)
+                update = preview_design.PreviewDesignUpdate(
+                    theme={**initial.theme.model_dump(), "name": "My Theme"},
+                    elements=[
+                        {
+                            "selector": "#hero",
+                            "label": "Hero",
+                            "styles": {"padding": "32px", "borderRadius": "16px"},
+                            "text": "Welcome",
+                        }
+                    ],
+                )
+                first = preview_design.save_design_state(db, user, 29, update)
+                second = preview_design.save_design_state(db, user, 29, update)
+                loaded = preview_design.get_design_state(db, user, 29)
+
+            self.assertEqual((first.revision, second.revision, loaded.revision), (1, 2, 2))
+            self.assertEqual(loaded.elements[0].text, "Welcome")
+            self.assertTrue((workspace / "forgeai/design/revisions/000001.json").is_file())
+            self.assertTrue((workspace / "forgeai/design/revisions/000002.json").is_file())
+            self.assertTrue((workspace / "forgeai/design/current.json").is_file())
+
+    def test_design_rejects_unfinished_build(self) -> None:
+        with (
+            patch.object(preview_design.project_service, "get_user_project"),
+            patch.object(
+                preview_design,
+                "get_requirements_status",
+                return_value=MagicMock(state="engineering_running", run_id="run_design"),
+            ),
+            self.assertRaisesRegex(BusinessException, "独立验收通过"),
+        ):
+            preview_design.get_design_state(MagicMock(), MagicMock(), 29)
+
+    def test_design_bridge_embeds_saved_state_without_script_breakout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="forgeai-design-") as tmp:
+            workspace = Path(tmp)
+            root = workspace / "forgeai/design"
+            root.mkdir(parents=True)
+            state = preview_design.PreviewDesignState(
+                revision=1,
+                elements=[
+                    {
+                        "selector": "#hero",
+                        "label": "Hero",
+                        "styles": {"color": "#112233"},
+                        "text": "safe </script><script>alert(1)</script>",
+                    }
+                ],
+            )
+            (root / "current.json").write_text(state.model_dump_json(), encoding="utf-8")
+            output = preview_design.inject_design_bridge(
+                b"<html><body>Hello</body></html>", workspace
+            )
+
+        html = output.decode("utf-8")
+        self.assertIn("forgeai-preview-design", html)
+        self.assertIn("#112233", html)
+        self.assertNotIn("safe </script><script>", html)
+        self.assertLess(html.index("forgeai-preview-design"), html.index("</body>"))
+
+    def test_design_save_never_overwrites_an_existing_revision(self) -> None:
+        db = MagicMock()
+        user = MagicMock()
+        status = MagicMock(state="completed", run_id="run_design")
+        with tempfile.TemporaryDirectory(prefix="forgeai-design-") as tmp:
+            workspace = Path(tmp)
+            revisions = workspace / "forgeai/design/revisions"
+            revisions.mkdir(parents=True)
+            existing = revisions / "000001.json"
+            existing.write_text("historical revision", encoding="utf-8")
+            with (
+                patch.object(preview_design.project_service, "get_user_project"),
+                patch.object(preview_design, "get_requirements_status", return_value=status),
+                patch.object(preview_design, "workspace_is_ready", return_value=True),
+                patch.object(preview_design, "default_workspace_path", return_value=workspace),
+            ):
+                saved = preview_design.save_design_state(
+                    db, user, 29, preview_design.PreviewDesignUpdate()
+                )
+
+            self.assertEqual(saved.revision, 2)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "historical revision")
+            self.assertTrue((revisions / "000002.json").is_file())
 
 
 if __name__ == "__main__":

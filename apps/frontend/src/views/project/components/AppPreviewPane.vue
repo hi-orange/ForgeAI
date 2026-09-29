@@ -2,6 +2,17 @@
   <section class="app-viewer" aria-label="App 预览">
     <header class="viewer-toolbar">
       <strong>App 预览</strong>
+      <button
+        type="button"
+        class="design-toggle"
+        :class="{ active: designOpen }"
+        :disabled="preview?.status !== 'ready' || designLoading"
+        title="打开 Design"
+        @click="toggleDesign"
+      >
+        <WorkbenchIcon name="paintbrush" />
+        <span>{{ designLoading ? '加载中…' : 'Design' }}</span>
+      </button>
       <div class="device-switcher" aria-label="预览设备">
         <button
           v-for="option in devices"
@@ -18,7 +29,17 @@
       </div>
       <div class="viewer-address">
         <WorkbenchIcon name="home" />
-        {{ preview?.url || 'Home' }}
+        <select
+          v-if="previewPages.length > 1"
+          :value="currentPath"
+          aria-label="切换预览页面"
+          @change="navigatePreview(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="page in previewPages" :key="page.path" :value="page.path">
+            {{ page.label }} · {{ page.path }}
+          </option>
+        </select>
+        <span v-else>{{ displayAddress }}</span>
       </div>
       <div class="viewer-actions">
         <button
@@ -51,114 +72,143 @@
       </div>
     </header>
 
-    <div class="viewer-stage">
-      <div class="device-frame" :style="frameStyle" :data-device="device">
-        <section v-if="status?.error" class="viewer-error" role="alert">
-          <span class="error-badge">!</span>
-          <h2>构建遇到问题</h2>
-          <p>{{ status.error }}</p>
-          <button v-if="canResume" type="button" :disabled="busy" @click="$emit('resolve')">
-            {{ busy ? '正在处理…' : '修复问题' }}
-          </button>
-        </section>
+    <div class="viewer-body">
+      <PreviewDesignPanel
+        v-if="designOpen"
+        :state="designState"
+        :selection="designSelection"
+        :dirty="designDirty"
+        :saving="designSaving"
+        @close="closeDesign"
+        @save="saveDesign"
+        @discard="discardDesign"
+        @apply-theme="applyTheme"
+        @update-theme="updateTheme"
+        @update-selection="updateSelection"
+      />
+      <div class="viewer-main">
+        <div class="viewer-stage">
+          <div class="device-frame" :style="frameStyle" :data-device="device">
+            <section v-if="status?.error" class="viewer-error" role="alert">
+              <span class="error-badge">!</span>
+              <h2>构建遇到问题</h2>
+              <p>{{ status.error }}</p>
+              <button v-if="canResume" type="button" :disabled="busy" @click="$emit('resolve')">
+                {{ busy ? '正在处理…' : '修复问题' }}
+              </button>
+            </section>
 
-        <div v-else-if="showPlanOverview" class="plan-overview">
-          <span class="eyebrow">{{ canApprove ? '待批准的建议' : '当前计划' }}</span>
-          <h1>{{ planGoal }}</h1>
-          <ul>
-            <li v-for="item in selectedItems" :key="item.id">
-              <WorkbenchIcon name="check" />{{ item.label }}
-            </li>
-          </ul>
-          <p v-if="canApprove">在左侧勾选、编辑或新增需求，批准后继续。</p>
-        </div>
-
-        <div v-else-if="preview?.status === 'ready' && preview.url" class="live-preview">
-          <iframe
-            :key="iframeKey"
-            class="preview-frame"
-            :src="preview.url"
-            title="生成应用预览"
-            referrerpolicy="no-referrer"
-          />
-        </div>
-
-        <div v-else class="preview-empty">
-          <div class="preview-illustration" aria-hidden="true">
-            <div class="mini-sidebar"><i /><i /><i /></div>
-            <div class="mini-page">
-              <div class="mini-nav"><i /><i /></div>
-              <div class="mini-hero" />
-              <div class="mini-cards"><i /><i /><i /></div>
+            <div v-else-if="showPlanOverview" class="plan-overview">
+              <span class="eyebrow">{{ canApprove ? '待批准的建议' : '当前计划' }}</span>
+              <h1>{{ planGoal }}</h1>
+              <ul>
+                <li v-for="item in selectedItems" :key="item.id">
+                  <WorkbenchIcon name="check" />{{ item.label }}
+                </li>
+              </ul>
+              <p v-if="canApprove">在左侧勾选、编辑或新增需求，批准后继续。</p>
             </div>
-            <span class="preview-spark">✦</span>
+
+            <div v-else-if="preview?.status === 'ready' && preview.url" class="live-preview">
+              <iframe
+                :key="iframeKey"
+                ref="iframeRef"
+                class="preview-frame"
+                :src="preview.url"
+                title="生成应用预览"
+                referrerpolicy="no-referrer"
+                @load="requestBridgeState"
+              />
+            </div>
+
+            <div v-else class="preview-empty">
+              <div class="preview-illustration" aria-hidden="true">
+                <div class="mini-sidebar"><i /><i /><i /></div>
+                <div class="mini-page">
+                  <div class="mini-nav"><i /><i /></div>
+                  <div class="mini-hero" />
+                  <div class="mini-cards"><i /><i /><i /></div>
+                </div>
+                <span class="preview-spark">✦</span>
+              </div>
+              <span class="eyebrow">从想法到应用</span>
+              <h1>{{ previewTitle }}</h1>
+              <p>{{ previewDescription }}</p>
+              <div class="progress-steps" aria-label="构建进度">
+                <span class="done">描述想法</span><i />
+                <span :class="{ done: planReady }">确认计划</span><i />
+                <span :class="{ done: status?.code_ready }">生成应用</span><i />
+                <span :class="{ done: status?.state === 'completed' }">运行验证</span>
+              </div>
+              <p v-if="preview?.status === 'starting'" class="preview-note verified">
+                {{ preview.message || '正在启动本地预览（首次可能需要构建前端）…' }}
+              </p>
+              <p
+                v-else-if="preview?.status === 'error'"
+                class="preview-note preview-error"
+                role="alert"
+              >
+                {{ preview.message || '预览启动失败' }}
+              </p>
+              <p v-else-if="preview?.status === 'disabled'" class="preview-note">
+                本地预览未启用。可在后端配置 PREVIEW_ENABLED=true。
+              </p>
+              <p v-else-if="status?.state === 'completed'" class="preview-note verified">
+                独立验收已通过。点击下方按钮启动本机预览。
+              </p>
+              <p v-else-if="status?.code_ready" class="preview-note">
+                源码已经生成，可在顶部“编辑器”中查看；正在进行独立验收和隔离运行验证。
+              </p>
+              <button
+                v-if="status?.state === 'completed' && preview?.status !== 'starting'"
+                type="button"
+                class="preview-start"
+                :disabled="previewBusy"
+                @click="ensurePreview(true)"
+              >
+                {{
+                  previewBusy ? '启动中…' : preview?.status === 'error' ? '重试预览' : '启动预览'
+                }}
+              </button>
+            </div>
           </div>
-          <span class="eyebrow">从想法到应用</span>
-          <h1>{{ previewTitle }}</h1>
-          <p>{{ previewDescription }}</p>
-          <div class="progress-steps" aria-label="构建进度">
-            <span class="done">描述想法</span><i />
-            <span :class="{ done: planReady }">确认计划</span><i />
-            <span :class="{ done: status?.code_ready }">生成应用</span><i />
-            <span :class="{ done: status?.state === 'completed' }">运行验证</span>
-          </div>
-          <p v-if="preview?.status === 'starting'" class="preview-note verified">
-            {{ preview.message || '正在启动本地预览（首次可能需要构建前端）…' }}
-          </p>
-          <p
-            v-else-if="preview?.status === 'error'"
-            class="preview-note preview-error"
-            role="alert"
-          >
-            {{ preview.message || '预览启动失败' }}
-          </p>
-          <p v-else-if="preview?.status === 'disabled'" class="preview-note">
-            本地预览未启用。可在后端配置 PREVIEW_ENABLED=true。
-          </p>
-          <p v-else-if="status?.state === 'completed'" class="preview-note verified">
-            独立验收已通过。点击下方按钮启动本机预览。
-          </p>
-          <p v-else-if="status?.code_ready" class="preview-note">
-            源码已经生成，可在顶部“编辑器”中查看；正在进行独立验收和隔离运行验证。
-          </p>
-          <button
-            v-if="status?.state === 'completed' && preview?.status !== 'starting'"
-            type="button"
-            class="preview-start"
-            :disabled="previewBusy"
-            @click="ensurePreview(true)"
-          >
-            {{ previewBusy ? '启动中…' : preview?.status === 'error' ? '重试预览' : '启动预览' }}
-          </button>
         </div>
+
+        <aside v-if="consoleOpen" class="viewer-console" aria-label="运行日志">
+          <div class="console-heading">
+            <strong>运行日志</strong>
+            <span>{{ consoleRows.length }} 条</span>
+          </div>
+          <p v-if="!consoleRows.length" class="console-empty">
+            开始构建后，文件操作、页面日志和错误会显示在这里。
+          </p>
+          <ol v-else>
+            <li v-for="row in consoleRows" :key="row.id" :class="{ failed: !row.ok }">
+              <span>{{ row.ok ? '●' : '×' }}</span>
+              <strong>{{ row.label }}</strong>
+              <code v-if="row.detail">{{ row.detail }}</code>
+            </li>
+          </ol>
+        </aside>
       </div>
     </div>
-
-    <aside v-if="consoleOpen" class="viewer-console" aria-label="运行日志">
-      <div class="console-heading">
-        <strong>运行日志</strong>
-        <span>{{ consoleRows.length }} 条</span>
-      </div>
-      <p v-if="!consoleRows.length" class="console-empty">
-        开始构建后，文件操作和错误会显示在这里。
-      </p>
-      <ol v-else>
-        <li v-for="row in consoleRows" :key="row.id" :class="{ failed: !row.ok }">
-          <span>{{ row.ok ? '●' : '×' }}</span>
-          <strong>{{ row.label }}</strong>
-          <code v-if="row.detail">{{ row.detail }}</code>
-        </li>
-      </ol>
-    </aside>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as previewApi from '@/api/modules/preview'
-import type { PreviewStatus } from '@/api/modules/preview'
+import type {
+  PreviewDesignState,
+  PreviewElementOverride,
+  PreviewPage,
+  PreviewSelection,
+  PreviewStatus,
+  PreviewTheme,
+} from '@/api/modules/preview'
 import type { RequirementsStatus } from '@/api/modules/requirements'
 import type { RequirementPlanItem } from '../useRequirements'
+import PreviewDesignPanel from './PreviewDesignPanel.vue'
 import WorkbenchIcon, { type WorkbenchIconName } from './WorkbenchIcon.vue'
 
 type PreviewDevice = 'desktop' | 'tablet' | 'mobile'
@@ -180,6 +230,44 @@ const consoleOpen = ref(false)
 const preview = ref<PreviewStatus | null>(null)
 const previewBusy = ref(false)
 const iframeKey = ref(0)
+const iframeRef = ref<HTMLIFrameElement | null>(null)
+const designOpen = ref(false)
+const designLoading = ref(false)
+const designSaving = ref(false)
+const designDirty = ref(false)
+const designLoadedKey = ref<string | null>(null)
+const designSelection = ref<PreviewSelection | null>(null)
+const previewPages = ref<PreviewPage[]>([])
+const currentPath = ref('/')
+const previewConsoleRows = ref<
+  Array<{ id: string; level: string; message: string; source: 'page' | 'design' }>
+>([])
+let consoleSequence = 0
+let activePreviewIdentity: string | null = null
+
+function defaultDesignState(): PreviewDesignState {
+  return {
+    revision: 0,
+    saved_at: null,
+    theme: {
+      preset_id: 'forge',
+      name: 'Forge',
+      background: '#f8fafc',
+      surface: '#ffffff',
+      text: '#0f172a',
+      primary: '#2563eb',
+      muted: '#64748b',
+      border: '#e2e8f0',
+      font_family: 'Inter, system-ui, sans-serif',
+      radius: 12,
+      shadow: '0 12px 32px rgba(15, 23, 42, 0.08)',
+    },
+    elements: [],
+  }
+}
+
+const designState = ref<PreviewDesignState>(defaultDesignState())
+const savedDesignState = ref<PreviewDesignState>(defaultDesignState())
 let pollTimer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
 const devices: Array<{ id: PreviewDevice; label: string; icon: WorkbenchIconName }> = [
@@ -191,6 +279,15 @@ const devices: Array<{ id: PreviewDevice; label: string; icon: WorkbenchIconName
 const frameStyle = computed(() => ({
   width: ({ desktop: '100%', tablet: '768px', mobile: '390px' } as const)[device.value],
 }))
+const displayAddress = computed(() => {
+  if (!preview.value?.url) return 'Home'
+  try {
+    const url = new URL(preview.value.url)
+    return `${url.origin}${currentPath.value}`
+  } catch {
+    return preview.value.url
+  }
+})
 const selectedItems = computed(() => props.planItems.filter((item) => item.checked))
 const showPlanOverview = computed(() => Boolean(props.status?.app_spec) && props.canApprove)
 const postApproval = computed(() =>
@@ -250,8 +347,186 @@ const consoleRows = computed(() => {
       ok: preview.value.status === 'ready',
     })
   }
+  for (const row of previewConsoleRows.value) {
+    rows.push({
+      id: row.id,
+      label: `${row.source === 'design' ? 'Design' : '页面'} ${row.level}`,
+      detail: row.message,
+      ok: row.level !== 'error',
+    })
+  }
   return rows
 })
+
+function cloneDesign(state: PreviewDesignState) {
+  return JSON.parse(JSON.stringify(state)) as PreviewDesignState
+}
+
+function postBridge(type: string, payload: Record<string, unknown> = {}) {
+  const message = JSON.parse(
+    JSON.stringify({ channel: 'forgeai-preview-design', type, ...payload }),
+  ) as Record<string, unknown>
+  iframeRef.value?.contentWindow?.postMessage(message, '*')
+}
+
+function requestBridgeState() {
+  postBridge('apply-state', { state: designState.value })
+  postBridge('design-mode', { enabled: designOpen.value })
+  postBridge('request-state')
+}
+
+function handleBridgeMessage(event: MessageEvent) {
+  if (event.source !== iframeRef.value?.contentWindow) return
+  const message = event.data as Record<string, unknown> | null
+  if (!message || message.channel !== 'forgeai-preview-design') return
+  if (message.type === 'ready' || message.type === 'route') {
+    if (typeof message.path === 'string') currentPath.value = message.path
+    if (Array.isArray(message.pages)) previewPages.value = message.pages as PreviewPage[]
+    if (message.type === 'ready') requestBridgeState()
+    return
+  }
+  if (message.type === 'selection') {
+    designSelection.value = (message.selection as PreviewSelection | null) ?? null
+    return
+  }
+  if (message.type === 'console' && typeof message.message === 'string') {
+    previewConsoleRows.value.push({
+      id: `page-log-${++consoleSequence}`,
+      level: typeof message.level === 'string' ? message.level : 'log',
+      message: message.message,
+      source: 'page',
+    })
+    if (previewConsoleRows.value.length > 100) previewConsoleRows.value.shift()
+  }
+}
+
+async function loadDesign(force = false) {
+  const key = `${props.projectId}:${props.status?.run_id ?? ''}`
+  if (
+    designLoading.value ||
+    props.status?.state !== 'completed' ||
+    (!force && designLoadedKey.value === key)
+  )
+    return
+  designLoading.value = true
+  try {
+    const state = await previewApi.getPreviewDesign(props.projectId)
+    designState.value = cloneDesign(state)
+    savedDesignState.value = cloneDesign(state)
+    designDirty.value = false
+    designLoadedKey.value = key
+    postBridge('apply-state', { state })
+  } catch (err) {
+    previewConsoleRows.value.push({
+      id: `page-log-${++consoleSequence}`,
+      level: 'error',
+      message: err instanceof Error ? err.message : '读取 Design 状态失败',
+      source: 'design',
+    })
+  } finally {
+    designLoading.value = false
+  }
+}
+
+async function toggleDesign() {
+  if (designOpen.value) {
+    closeDesign()
+    return
+  }
+  await loadDesign()
+  designOpen.value = true
+  postBridge('design-mode', { enabled: true })
+}
+
+function closeDesign() {
+  if (designDirty.value && !window.confirm('Design 中有未保存的更改。要放弃并退出吗？')) return
+  if (designDirty.value) discardDesign()
+  designOpen.value = false
+  designSelection.value = null
+  postBridge('design-mode', { enabled: false })
+}
+
+function markDesignChanged() {
+  designDirty.value = true
+  postBridge('apply-state', { state: designState.value })
+}
+
+function applyTheme(theme: PreviewTheme) {
+  designState.value.theme = JSON.parse(JSON.stringify(theme)) as PreviewTheme
+  markDesignChanged()
+}
+
+function updateTheme(patch: Partial<PreviewTheme>) {
+  designState.value.theme = { ...designState.value.theme, ...patch, preset_id: 'custom' }
+  markDesignChanged()
+}
+
+function updateSelection(
+  patch: Partial<Pick<PreviewElementOverride, 'styles' | 'text' | 'image_url'>>,
+) {
+  const selection = designSelection.value
+  if (!selection) return
+  let override = designState.value.elements.find((item) => item.selector === selection.selector)
+  if (!override) {
+    override = {
+      selector: selection.selector,
+      label: selection.label,
+      styles: {},
+      text: null,
+      image_url: null,
+    }
+    designState.value.elements.push(override)
+  }
+  if (patch.styles) {
+    override.styles = { ...override.styles, ...patch.styles }
+    selection.styles = { ...selection.styles, ...patch.styles }
+  }
+  if ('text' in patch) {
+    override.text = patch.text ?? null
+    selection.text = patch.text ?? null
+  }
+  if ('image_url' in patch) {
+    override.image_url = patch.image_url ?? null
+    selection.image_url = patch.image_url ?? null
+  }
+  markDesignChanged()
+}
+
+async function saveDesign() {
+  if (!designDirty.value || designSaving.value) return
+  designSaving.value = true
+  try {
+    const saved = await previewApi.savePreviewDesign(props.projectId, {
+      theme: designState.value.theme,
+      elements: designState.value.elements,
+    })
+    designState.value = cloneDesign(saved)
+    savedDesignState.value = cloneDesign(saved)
+    designDirty.value = false
+    postBridge('apply-state', { state: saved })
+  } catch (err) {
+    previewConsoleRows.value.push({
+      id: `page-log-${++consoleSequence}`,
+      level: 'error',
+      message: err instanceof Error ? err.message : '保存 Design 失败',
+      source: 'design',
+    })
+    consoleOpen.value = true
+  } finally {
+    designSaving.value = false
+  }
+}
+
+function discardDesign() {
+  designState.value = cloneDesign(savedDesignState.value)
+  designDirty.value = false
+  postBridge('apply-state', { state: designState.value })
+}
+
+function navigatePreview(path: string) {
+  if (!path || path === currentPath.value) return
+  postBridge('navigate', { path })
+}
 
 function clearPoll() {
   clearTimeout(pollTimer)
@@ -282,7 +557,10 @@ async function refreshPreview() {
     return
   }
   if (preview.value.status === 'starting') schedulePoll()
-  else clearPoll()
+  else {
+    clearPoll()
+    if (preview.value.status === 'ready') void loadDesign()
+  }
 }
 
 async function ensurePreview(force = false) {
@@ -296,6 +574,7 @@ async function ensurePreview(force = false) {
     preview.value = await previewApi.startPreview(props.projectId)
     if (preview.value.status === 'starting') schedulePoll()
     if (preview.value.status === 'ready') iframeKey.value += 1
+    if (preview.value.status === 'ready') await loadDesign()
   } catch (err) {
     preview.value = {
       status: 'error',
@@ -326,34 +605,69 @@ async function reload() {
 }
 
 watch(
-  () => props.status?.state,
-  (state) => {
+  () => [props.projectId, props.status?.run_id, props.status?.state] as const,
+  ([projectId, runId, state]) => {
+    const identity = `${projectId}:${runId ?? ''}`
+    if (activePreviewIdentity !== identity) {
+      activePreviewIdentity = identity
+      clearPoll()
+      preview.value = null
+      designOpen.value = false
+      designDirty.value = false
+      designLoadedKey.value = null
+      designSelection.value = null
+      designState.value = defaultDesignState()
+      savedDesignState.value = defaultDesignState()
+      previewPages.value = []
+      previewConsoleRows.value = []
+      currentPath.value = '/'
+    }
     if (state === 'completed') void ensurePreview(false)
     else {
       clearPoll()
       preview.value = null
+      designOpen.value = false
+      designDirty.value = false
+      designLoadedKey.value = null
+      designSelection.value = null
+      previewPages.value = []
+      currentPath.value = '/'
     }
   },
   { immediate: true },
 )
 
+onMounted(() => window.addEventListener('message', handleBridgeMessage))
+
 onBeforeUnmount(() => {
   disposed = true
   clearPoll()
+  window.removeEventListener('message', handleBridgeMessage)
 })
 </script>
 
 <style scoped lang="scss">
 .app-viewer {
+  position: relative;
   display: flex;
   flex: 1;
   min-height: 0;
   flex-direction: column;
   background: #f5f5f7;
 }
+.viewer-body,
+.viewer-main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.viewer-main {
+  flex-direction: column;
+}
 .viewer-toolbar {
   display: grid;
-  grid-template-columns: auto auto minmax(120px, 1fr) auto;
+  grid-template-columns: auto auto auto minmax(120px, 1fr) auto;
   align-items: center;
   gap: 12px;
   min-height: 42px;
@@ -388,6 +702,10 @@ onBeforeUnmount(() => {
     opacity: 0.38;
   }
 }
+.design-toggle {
+  padding: 0 8px;
+  border: 1px solid #e4e4e7 !important;
+}
 .device-switcher,
 .viewer-actions {
   display: flex;
@@ -410,6 +728,19 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  select {
+    width: 100%;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+  }
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 .viewer-stage {
   display: flex;
@@ -418,6 +749,22 @@ onBeforeUnmount(() => {
   justify-content: center;
   overflow: auto;
   padding: 16px;
+  scrollbar-color: transparent transparent;
+  scrollbar-width: thin;
+  &:hover {
+    scrollbar-color: rgba(113, 113, 122, 0.36) transparent;
+  }
+  &::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: transparent;
+  }
+  &:hover::-webkit-scrollbar-thumb {
+    background: rgba(113, 113, 122, 0.36);
+  }
 }
 .device-frame {
   display: flex;
@@ -661,13 +1008,21 @@ onBeforeUnmount(() => {
 }
 @media (max-width: 760px) {
   .viewer-toolbar {
-    grid-template-columns: auto auto 1fr;
+    grid-template-columns: auto auto auto 1fr;
   }
   .viewer-address {
     display: none;
   }
   .viewer-actions span {
     display: none;
+  }
+}
+@media (max-width: 980px) {
+  .design-panel {
+    position: absolute;
+    inset: 42px auto 0 0;
+    z-index: 20;
+    box-shadow: 14px 0 40px rgba(15, 23, 42, 0.14);
   }
 }
 </style>

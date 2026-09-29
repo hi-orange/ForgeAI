@@ -1,6 +1,6 @@
 # 工程检查环境
 
-工程 Agent 在 `fullstack-v1` 工作区按功能读写代码，并使用 `run_check` 获取真实反馈。
+工程 Agent 在 `fullstack-react-v1` 工作区按功能读写代码，并使用 `run_check` 获取真实反馈。
 项目级依赖通过有界工具 `install_project_dependency`（npm/pnpm/uv/pip）增删；
 写入 `frontend/package.json` 后平台会尝试在工作区同步安装。系统包（apt 等）不在此工具范围。
 提交 `complete_work_item` 会强制运行全部工程检查；失败保留当前功能并交回模型修复。
@@ -11,12 +11,12 @@
 在安装并启动 Linux 容器模式的 Docker 后，从 `apps/backend` 执行：
 
 ```sh
-docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-v1 .
+docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-react-v1 .
 ```
 
 镜像构建阶段预装模板依赖，作为与模板清单一致时的快速路径。
 运行检查时：若生成应用的 `package.json` / `pyproject.toml` 与模板一致，复用预装模块；
-若清单已演进（例如增加 `vue-router`），检查控制器会按生成清单联网安装依赖后再构建。
+若清单已演进（例如增加新的 UI 组件包），检查控制器会按生成清单联网安装依赖后再构建。
 生产环境应在可信构建机器预构建镜像并将 `ENGINEERING_CHECK_IMAGE` 指向审核过的镜像摘要。
 更新 `sandbox/check.py` 或模板基线依赖后需重新构建镜像。
 
@@ -29,7 +29,7 @@ docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-v1 .
 - `database`：Python 编译、按清单安装后端依赖（如有变更）、空 SQLite 库迁移到 head、
   Alembic 模型一致性检查、输出实际表结构。
 - `backend`：上述数据库检查、启动 Uvicorn、请求健康接口与 OpenAPI，输出注册路由。
-- `frontend`：按清单安装前端依赖（如有变更）、Vue/TypeScript 检查、Vite 生产构建、检查首页产物存在。
+- `frontend`：按清单安装前端依赖（如有变更）、React/TypeScript 检查、Vite 生产构建、检查首页产物存在。
 - `all`：后端与前端检查。每个功能提交都会运行，不复用旧源码的检查结论。
 - `capture_screenshots`（Test Engineer 工具）：在同一隔离镜像内启动后端与 Vite 页面，使用
   Chromium + Playwright 分别以 1440×900 和 390×844 渲染指定站内路由；导出 PNG，并记录
@@ -45,11 +45,11 @@ docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-v1 .
 ## 隔离与恢复
 
 源码通过标准输入传入容器，不挂载宿主目录或 Docker socket，不传入平台环境变量。
-容器非 root、根文件系统只读，移除 capabilities，并限制 CPU、内存、进程和临时磁盘。
-为按生成清单安装依赖，检查容器允许出网，且 `/tmp` tmpfs 带 `exec`
-（原生 npm 二进制需要可执行）；安装使用 `--ignore-scripts` 降低供应链风险。
-输出仅保留有界日志尾部。截图通过 `docker cp` 从已经停止的命名容器取出，不使用宿主目录挂载；
-无论成功、失败或超时都会清理本次命名的容器。
+容器非 root、移除 capabilities，并限制 CPU、内存和进程。普通代码检查使用只读根文件系统，
+且 `/tmp` tmpfs 带 `exec`（原生 npm 二进制需要可执行）。为按生成清单安装依赖，检查容器允许出网；
+安装使用 `--ignore-scripts` 降低供应链风险。
+输出仅保留有界日志尾部。视觉检查使用无宿主挂载的一次性容器写层暂存截图，以便容器停止后
+通过 `docker cp` 取出；无论成功、失败或超时都会立即清理本次命名的容器。
 边界参数依据 [Docker run 文档](https://docs.docker.com/reference/cli/docker/container/run/)。
 
 工作区文件锁覆盖整个执行及恢复操作，防止同一主机多进程写入。此实现假设后端进程共享同一

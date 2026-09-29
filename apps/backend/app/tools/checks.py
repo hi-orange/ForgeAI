@@ -21,7 +21,7 @@ from app.tools.paths import MAX_FILE_BYTES, SKIP_DIRS, is_text_file, safe_path_u
 
 CHECK_IDS = {"database", "backend", "frontend", "all"}
 CHECK_RUNTIME_LABEL = "org.forgeai.check-runtime-version"
-CHECK_RUNTIME_VERSION = "2"
+CHECK_RUNTIME_VERSION = "9"
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 32 * 1024
 MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024
@@ -167,7 +167,7 @@ def docker_command(binary: str, image: str, name: str, check_id: str) -> list[st
         "--cpus=2",
         "--memory=1536m",
         "--memory-swap=1536m",
-        "--pids-limit=128",
+        "--pids-limit=256",
         "--log-driver=none",
         "--init",
         "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=768m,mode=1777",
@@ -181,10 +181,12 @@ def docker_command(binary: str, image: str, name: str, check_id: str) -> list[st
 
 
 def visual_docker_command(binary: str, image: str, name: str, route: str) -> list[str]:
-    """Keep the stopped container long enough to copy binary screenshot evidence out."""
+    """Persist evidence until it can be copied from the stopped disposable container."""
 
     command = docker_command(binary, image, name, "visual")
     command.remove("--rm")
+    command.remove("--read-only")
+    command.remove("--tmpfs=/tmp:rw,exec,nosuid,nodev,size=768m,mode=1777")
     command.append(route)
     return command
 

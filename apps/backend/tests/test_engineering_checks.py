@@ -41,7 +41,7 @@ class EngineeringCheckTests(unittest.TestCase):
         self.assertIn("template.json", files)
         (self.root / "build.config.json").write_text('{"target":"app"}', encoding="utf-8")
         self.assertIn("build.config.json", json.loads(source_snapshot(self.root)[0]))
-        (self.root / "frontend/src/App.vue").write_text("changed", encoding="utf-8")
+        (self.root / "frontend/src/App.tsx").write_text("changed", encoding="utf-8")
         self.assertNotEqual(source_snapshot(self.root)[1], before)
 
     def test_container_has_no_host_mount_and_bounded_resources(self):
@@ -59,12 +59,17 @@ class EngineeringCheckTests(unittest.TestCase):
         self.assertNotIn("--mount", command)
         self.assertTrue(any(arg.startswith("--memory=") for arg in command))
         self.assertTrue(any(arg.startswith("--pids-limit=") for arg in command))
+        self.assertIn("--pids-limit=256", command)
 
     def test_visual_container_is_copyable_without_host_mount(self):
         command = visual_docker_command("docker", "trusted-image", "visual-instance", "/jobs")
         self.assertNotIn("--rm", command)
+        self.assertNotIn("--read-only", command)
+        self.assertFalse(any(arg.startswith("--tmpfs=/tmp:") for arg in command))
         self.assertNotIn("--volume", command)
         self.assertNotIn("--mount", command)
+        self.assertIn("--pids-limit=256", command)
+        self.assertNotIn("--pids-limit=128", command)
         self.assertEqual(command[-2:], ["visual", "/jobs"])
 
     def test_capture_screenshots_returns_real_artifact_metadata(self):

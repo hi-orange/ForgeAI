@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "api_checks": [
+    {
+      "id": "health",
+      "method": "GET",
+      "path": "/api/v1/health",
+      "expect_status": 200,
+      "expect_json_paths": ["code", "data.status", "data.template_version"]
+    }
+  ],
+  "browser_checks": [
+    {
+      "id": "home",
+      "route": "/",
+      "expect_text": ["Generated App", "fullstack-v1"],
+      "expect_api": ["/api/v1/health"],
+      "actions": []
+    }
+  ]
+}

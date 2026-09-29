@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     # Isolated engineering workspaces: runtime-data/work/{project}/{execution}
     runtime_data_root: str = "runtime-data"
 
-    # Disposable Linux check containers for generated fullstack-v1 apps.
-    engineering_check_image: str = "forgeai-checks:fullstack-v1"
+    # Disposable Linux check containers for generated fullstack-react-v1 apps.
+    engineering_check_image: str = "forgeai-checks:fullstack-react-v1"
     engineering_check_timeout_seconds: int = 300
 
     # Local loopback preview of a completed generated app (not a multi-tenant gateway).

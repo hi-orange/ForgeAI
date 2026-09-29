@@ -38,7 +38,7 @@ def valid_spec() -> AppSpec:
 
 def valid_design() -> dict:
     return {
-        "architecture_overview": "Vue 调用 FastAPI，FastAPI 通过 SQLAlchemy 持久化到 SQLite。",
+        "architecture_overview": "React 调用 FastAPI，FastAPI 通过 SQLAlchemy 持久化到 SQLite。",
         "architecture_notes": ["采用单体分层结构，保持部署和调试简单。"],
         "modules": [
             {

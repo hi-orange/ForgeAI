@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "visual_contract": {
+    "theme_file": "frontend/src/index.css",
+    "theme_mode": "template",
+    "theme_reason": "空模板使用默认视觉基线，业务生成时再按批准意图决定",
+    "required_tokens": ["--color-primary", "--color-accent", "--color-muted"],
+    "local_assets": []
+  },
+  "api_checks": [
+    {
+      "id": "health",
+      "method": "GET",
+      "path": "/api/v1/health",
+      "expect_status": 200,
+      "expect_json_paths": ["code", "data.status", "data.template_version"]
+    }
+  ],
+  "browser_checks": [
+    {
+      "id": "home",
+      "route": "/",
+      "expect_text": ["Build the product", "Full-stack baseline ready"],
+      "expect_api": ["/api/v1/health"],
+      "actions": [
+        {
+          "type": "click",
+          "selector": "button"
+        },
+        {
+          "type": "expect_text",
+          "text": "fullstack-react-v1"
+        }
+      ]
+    }
+  ]
+}

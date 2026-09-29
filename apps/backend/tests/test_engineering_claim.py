@@ -14,6 +14,7 @@ from test_product_manager_workflow import (
 )
 
 from app.core.exceptions import BusinessException, ConflictException
+from app.generation import DEFAULT_TEMPLATE_VERSION
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
 from app.models.plan import Plan
@@ -148,7 +149,7 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         assert snapshot is not None
         self.assertEqual(snapshot["kind"], INPUT_SNAPSHOT_KIND)
         self.assertEqual(snapshot["approved_item_id"], published.item_id)
-        self.assertEqual(snapshot["template_version"], "fullstack-v1")
+        self.assertEqual(snapshot["template_version"], DEFAULT_TEMPLATE_VERSION)
         self.assertEqual(snapshot["tool_strategy_version"], TOOL_STRATEGY_VERSION)
         self.assertEqual(snapshot["base_revision_id"], None)
         self.assertEqual(snapshot["workspace_key"], self.run.run_id)

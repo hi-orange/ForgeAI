@@ -739,3 +739,42 @@ test('HTTP wrappers post coarse actions without embedding tokens', async () => {
     ['/api/v1/projects/7/requirements/continue', { method: 'POST' }],
   ])
 })
+
+test('preview design wrapper passes an object body without double serialization', async () => {
+  const request = mock.fn(async () => ({}))
+  const api = await loadModule('../src/api/modules/preview.ts', {
+    '../request': { apiRequest: request },
+  })
+  const state = {
+    theme: {
+      preset_id: 'forge',
+      name: 'Forge',
+      background: '#f8fafc',
+      surface: '#ffffff',
+      text: '#0f172a',
+      primary: '#2563eb',
+      muted: '#64748b',
+      border: '#e2e8f0',
+      font_family: 'Inter, system-ui, sans-serif',
+      radius: 12,
+      shadow: 'none',
+    },
+    elements: [
+      {
+        selector: '#hero',
+        label: 'Hero',
+        styles: { fontSize: '13px', fontWeight: '400' },
+        text: null,
+        image_url: null,
+      },
+    ],
+  }
+
+  await api.savePreviewDesign(4, state)
+
+  const call = JSON.parse(JSON.stringify(Array.from(request.mock.calls[0].arguments)))
+  assert.deepEqual(call, [
+    '/api/v1/projects/4/preview/design',
+    { method: 'PUT', body: state },
+  ])
+})

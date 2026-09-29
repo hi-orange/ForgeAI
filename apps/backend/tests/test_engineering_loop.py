@@ -47,7 +47,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
                     name="check_environment",
                     ok=True,
                     summary="隔离检查环境已就绪",
-                    data={"image": "forgeai-checks:fullstack-v1"},
+                    data={"image": "forgeai-checks:fullstack-react-v1"},
                 ),
             )
         )

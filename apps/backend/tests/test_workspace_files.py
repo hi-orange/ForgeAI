@@ -87,7 +87,7 @@ class WorkspaceFilesTests(unittest.TestCase):
                 )
                 self.assertTrue(listing.ready)
                 paths = {item.path for item in listing.files}
-                self.assertIn("frontend/src/App.vue", paths)
+                self.assertIn("frontend/src/App.tsx", paths)
                 self.assertIn("backend/app/main.py", paths)
                 self.assertTrue(all(not path.startswith("forgeai/") for path in paths))
                 content = workspace_files_service.read_project_workspace_file(
@@ -122,11 +122,11 @@ class WorkspaceFilesTests(unittest.TestCase):
                     db, self._owner(), self.project_id
                 )
                 self.assertTrue(listing.ready)
-                self.assertIn("frontend/src/App.vue", {item.path for item in listing.files})
+                self.assertIn("frontend/src/App.tsx", {item.path for item in listing.files})
                 content = workspace_files_service.read_project_workspace_file(
-                    db, self._owner(), self.project_id, "frontend/src/App.vue"
+                    db, self._owner(), self.project_id, "frontend/src/App.tsx"
                 )
-                self.assertIn("template", content.content)
+                self.assertIn("HomePage", content.content)
 
 
 class WorkspaceReadyOnPauseTests(unittest.TestCase):
