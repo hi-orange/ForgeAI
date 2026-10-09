@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import struct
 import subprocess
 import threading
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
@@ -21,14 +23,31 @@ from app.tools.paths import MAX_FILE_BYTES, SKIP_DIRS, is_text_file, safe_path_u
 
 CHECK_IDS = {"database", "backend", "frontend", "all"}
 CHECK_RUNTIME_LABEL = "org.forgeai.check-runtime-version"
-CHECK_RUNTIME_VERSION = "9"
+CHECK_RUNTIME_VERSION = "13"
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
+MAX_BINARY_ASSETS_BYTES = 32 * 1024 * 1024
 MAX_LOG_BYTES = 32 * 1024
 MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024
+BINARY_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+SMOKE_CONTRACT_PATH = Path(__file__).resolve().parents[2] / "sandbox" / "smoke_contract.json"
 VISUAL_VIEWPORTS = {
     "desktop": (1440, 900),
     "mobile": (390, 844),
 }
+
+
+@lru_cache(maxsize=1)
+def load_smoke_contract() -> dict[str, object]:
+    """Return the authoritative model/validator/browser smoke protocol."""
+
+    try:
+        value = json.loads(SMOKE_CONTRACT_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BusinessException("平台浏览器检查契约缺失或无效") from exc
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise BusinessException("平台浏览器检查契约版本无效")
+    return value
 
 
 def check_environment(*, tool_call_id: str = "check_environment") -> ToolExecutionResult:
@@ -126,25 +145,45 @@ def check_environment(*, tool_call_id: str = "check_environment") -> ToolExecuti
 
 
 def source_snapshot(root: Path) -> tuple[bytes, str]:
-    """Export only app sources, never platform markers, secrets, data or symlinks."""
-    files: dict[str, str] = {}
-    size = 0
+    """Export app sources and bounded public images without host mounts or secrets."""
+    files: dict[str, str | dict[str, str]] = {}
+    text_size = 0
+    binary_size = 0
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if any(part in SKIP_DIRS for part in relative.parts) or not path.is_file():
             continue
         if relative.parts[0] == "forgeai":
             continue
-        if not is_text_file(path) or path.name.startswith(".env"):
+        if path.name.startswith(".env"):
+            continue
+        is_text = is_text_file(path)
+        is_public_image = (
+            len(relative.parts) >= 3
+            and relative.parts[:2] == ("frontend", "public")
+            and path.suffix.lower() in BINARY_ASSET_SUFFIXES
+        )
+        if not is_text and not is_public_image:
             continue
         if any(parent.is_symlink() for parent in [path, *path.parents] if parent != root):
             raise BusinessException("工作区包含符号链接，不能交给执行器")
         safe_path_under_root(root, relative.as_posix())
         raw = path.read_bytes()
-        size += len(raw)
-        if len(raw) > MAX_FILE_BYTES or size > MAX_SOURCE_BYTES or len(files) >= 400:
-            raise BusinessException("工作区源码超过检查上限")
-        files[relative.as_posix()] = raw.decode("utf-8")
+        if len(files) >= 400:
+            raise BusinessException("工作区文件数量超过检查上限")
+        if is_text:
+            text_size += len(raw)
+            if len(raw) > MAX_FILE_BYTES or text_size > MAX_SOURCE_BYTES:
+                raise BusinessException("工作区源码超过检查上限")
+            files[relative.as_posix()] = raw.decode("utf-8")
+            continue
+        binary_size += len(raw)
+        if len(raw) > MAX_BINARY_ASSET_BYTES or binary_size > MAX_BINARY_ASSETS_BYTES:
+            raise BusinessException("工作区本地图片超过检查上限")
+        files[relative.as_posix()] = {
+            "encoding": "base64",
+            "content": base64.b64encode(raw).decode("ascii"),
+        }
     payload = json.dumps(files, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return payload, hashlib.sha256(payload).hexdigest()
 

@@ -10,7 +10,12 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.core.exceptions import BusinessException, ConflictException
-from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
+from app.schemas.agent_action import (
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionResult,
+    inline_model_json_schema,
+)
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
 from app.tools import files as file_tools
@@ -18,7 +23,7 @@ from app.tools.paths import SKIP_DIRS
 
 MAX_TERMINAL_OUTPUT_CHARS = 12_000
 MAX_ARCHITECT_INSPECTIONS = 4
-_SYSTEM_DESIGN_SCHEMA = SystemDesign.model_json_schema()
+_SYSTEM_DESIGN_SCHEMA = inline_model_json_schema(SystemDesign)
 
 ARCHITECT_TOOLS: list[ToolDefinition] = [
     ToolDefinition(

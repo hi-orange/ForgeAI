@@ -107,18 +107,6 @@ export type BuildPhase = {
   groups: BuildGroup[]
 }
 
-function compactToolSteps(steps: TimelineStep[]) {
-  if (steps.length <= 4) return steps
-  const candidates = [
-    steps[0],
-    ...steps.filter((step) => !step.ok),
-    [...steps].reverse().find((step) => isWriteActivity(step.name)),
-    steps.at(-1),
-  ].filter((step): step is TimelineStep => Boolean(step))
-  const unique = new Map(candidates.map((step) => [step.operation_id || step.id, step]))
-  return [...unique.values()].slice(0, 4)
-}
-
 /** Narration starts a step; consecutive tools share its collapsed card.
  * Old checkpoints without narration group by work item instead of repeating model calls.
  */
@@ -189,7 +177,7 @@ export function buildGroups(events: TimelineInput[]): BuildGroup[] {
     }
     group.steps.push(step)
   }
-  return groups.map((item) => ({ ...item, steps: compactToolSteps(item.steps) }))
+  return groups
 }
 
 /** Retries of one role assignment stay in one conversational engineering turn. */

@@ -1,4 +1,4 @@
-"""Code Engineer model turn: choose a tool against frozen requirements."""
+"""Code Engineer 与模型交互：在冻结需求下规划文件、写码并选择下一步工具。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from app.agents.prompts.code_engineer import (
 from app.agents.roles import get_role_profile
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_completion, chat_with_tools
+from app.core.llm_response import CompletionContentError
+from app.core.settings import settings
 from app.generation.delivery import MAX_FILES_PER_WORK_ITEM, FileTask, ImplementationPlan, WorkItem
 from app.models.task import TaskRecipient
 from app.schemas.agent_action import ChatWithToolsResult, ToolDefinition, ToolExecutionResult
@@ -27,16 +29,17 @@ from app.schemas.system_design import SystemDesign
 from app.tools.code_engineer import CODE_ENGINEER_TOOLS as ALL_CODE_ENGINEER_TOOLS
 
 CODE_ENGINEER_PROFILE = get_role_profile(TaskRecipient.CODE_ENGINEER)
+# 只保留角色白名单内的工具定义。
 CODE_ENGINEER_TOOLS = [
     tool for tool in ALL_CODE_ENGINEER_TOOLS if tool.name in CODE_ENGINEER_PROFILE.allowed_tools
 ]
 
-# Same-file regeneration after unwrap/syntax/protocol validation failures (includes first try).
+# 同一文件在拆包/语法/协议校验失败后的重生次数（含首次）。
 MAX_WRITER_ATTEMPTS = 3
 
 
 class FileGenerationError(BusinessException):
-    """Writer validation exhausted; carries how many model calls were spent."""
+    """写码校验耗尽；携带本次已消耗的模型调用次数。"""
 
     def __init__(self, message: str, *, model_calls: int) -> None:
         super().__init__(message)
@@ -45,13 +48,15 @@ class FileGenerationError(BusinessException):
 
 @dataclass(frozen=True, slots=True)
 class PlannedFileBatch:
-    """Current executable batch plus any overflow kept for later batches."""
+    """本批可执行文件计划，以及留给后续批次的溢出文件。"""
 
     plan: ImplementationPlan
     deferred_files: tuple[FileTask, ...] = ()
 
 
 def _unwrap_json_object(value: str) -> dict[str, Any]:
+    """从模型回复中抽出 JSON 对象（兼容 Markdown 代码围栏与前后杂质）。"""
+
     text = value.strip()
     if not text:
         raise BusinessException("文件级实施规划器没有返回合法 JSON")
@@ -78,7 +83,7 @@ def _unwrap_json_object(value: str) -> dict[str, Any]:
             continue
         if isinstance(payload, dict):
             return payload
-        last_error = ValueError("JSON root is not an object")
+        last_error = ValueError("JSON 根节点不是对象")
     raise BusinessException("文件级实施规划器没有返回合法 JSON") from last_error
 
 
@@ -90,6 +95,8 @@ def _planner_messages(
     system_design: SystemDesign | None,
     repair_context: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
+    """组装文件规划器对话；有修复上下文时改用修复规划 prompt。"""
+
     return [
         {
             "role": "system",
@@ -114,6 +121,9 @@ def _planner_messages(
                         "max_files_per_work_item": MAX_FILES_PER_WORK_ITEM,
                         "files_array_length": f"1..{MAX_FILES_PER_WORK_ITEM}",
                         "prefer_at_most": min(12, MAX_FILES_PER_WORK_ITEM),
+                        "image_generation_available": settings.image_generation_enabled,
+                        "image_provider": "Volcengine Ark / Seedream",
+                        "image_default_size": "2K",
                     },
                     "output_schema": ImplementationPlan.model_json_schema(),
                 },
@@ -124,6 +134,8 @@ def _planner_messages(
 
 
 def _validate_implementation_plan(raw: str, *, work_item: WorkItem) -> PlannedFileBatch:
+    """解析并校验规划器输出，得到本批计划与延期文件。"""
+
     payload, deferred = _normalize_planner_payload(_unwrap_json_object(raw), work_item=work_item)
     try:
         plan = ImplementationPlan.model_validate(payload)
@@ -143,7 +155,7 @@ def _validate_implementation_plan(raw: str, *, work_item: WorkItem) -> PlannedFi
 def _normalize_planner_payload(
     payload: dict[str, Any], *, work_item: WorkItem
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Accept harmless provider variations while keeping execution scope platform-owned."""
+    """容忍供应商无害字段差异，但执行范围仍由平台控制（批大小、去重、补全）。"""
 
     raw_files = payload.get("files")
     if not isinstance(raw_files, list) or not raw_files:
@@ -189,15 +201,19 @@ def _normalize_planner_payload(
             "id": f"file_{len(files) + len(deferred) + 1:02d}",
             "path": path,
             "description": description,
+            "kind": "image" if raw_file.get("kind") == "image" else "source",
+            "image_size": raw_file.get("image_size", "2K"),
+            "image_watermark": raw_file.get("image_watermark", True),
             "context_paths": contexts,
             "status": "pending",
             "content_hash": None,
         }
         if len(files) >= MAX_FILES_PER_WORK_ITEM:
+            # 超出本批上限的文件延后，等本批检查通过后再写。
             deferred.append(entry)
             continue
         files.append(entry)
-    # Re-number deferred ids so each promoted batch can renumber cleanly later.
+    # 延期项单独编号，便于后续批次提升时重新编号。
     for offset, item in enumerate(deferred, start=1):
         item["id"] = f"deferred_{offset:02d}"
     if not files:
@@ -231,7 +247,7 @@ def plan_work_item_files(
     system_design: SystemDesign | None,
     repair_context: dict[str, Any] | None = None,
 ) -> PlannedFileBatch:
-    """Turn one approved work item into an ordered, validated file graph."""
+    """把一个已批准工作单元变成有序、已校验的文件实施计划。"""
 
     messages = _planner_messages(
         spec=spec,
@@ -254,8 +270,7 @@ def plan_work_item_files(
             last_error = exc
             if attempt == 2:
                 raise
-        # Feed the exact validation observation back instead of repeating a vague
-        # request that commonly makes the model return the same invalid structure.
+        # 把具体校验错误贴回去重试；模糊重提容易让模型原样再错一遍。
         messages.extend(
             [
                 {"role": "assistant", "content": raw},
@@ -276,22 +291,9 @@ def plan_work_item_files(
     raise last_error
 
 
-_MODEL_PROTOCOL_MARKERS = (
-    "dsml",
-    "<tool_call",
-    "</tool_call",
-    "<|tool_call",
-    "<function=",
-    "<|function",
-)
-
-
 def _validate_generated_file(path: str, content: str) -> None:
-    """Reject provider/tool protocol residue and cheap syntax failures before disk writes."""
+    """写盘前做廉价语法检查，尽早拦下明显坏内容。"""
 
-    lowered = content.lower()
-    if any(marker in lowered for marker in _MODEL_PROTOCOL_MARKERS):
-        raise BusinessException("写码模型返回了工具协议标记，已拒绝写入源码")
     try:
         if path.lower().endswith(".py"):
             ast.parse(content, filename=path)
@@ -305,7 +307,9 @@ def _validate_generated_file(path: str, content: str) -> None:
         raise BusinessException(f"写码模型返回的 {path} 语法无效{location}：{exc}") from exc
 
 
-def _unwrap_file_content(value: str, *, path: str) -> str:
+def _normalize_source_candidate(value: str, *, path: str) -> str:
+    """去掉围栏、补换行，并做语法校验后返回可写入内容。"""
+
     content = value.strip()
     if content.startswith("```") and content.endswith("```"):
         first_newline = content.find("\n")
@@ -328,10 +332,10 @@ def generate_file_content(
     observations: list[ToolExecutionResult],
     system_design: SystemDesign | None,
 ) -> tuple[str, int]:
-    """Generate exactly one complete file from platform-assembled context.
+    """根据平台组装的上下文生成恰好一个完整文件。
 
-    Returns ``(content, model_calls)``. Validation failures (syntax / protocol residue)
-    trigger same-file regeneration up to ``MAX_WRITER_ATTEMPTS`` before raising.
+    返回 ``(content, model_calls)``。协议或语法失败时对同一文件重生，
+    最多 ``MAX_WRITER_ATTEMPTS`` 次后抛错。
     """
 
     recent_memory = [observation.model_dump(mode="json") for observation in observations]
@@ -359,34 +363,39 @@ def generate_file_content(
     last_error: BusinessException | None = None
     model_calls = 0
     for attempt in range(MAX_WRITER_ATTEMPTS):
-        raw = chat_completion(
-            messages=list(messages),
-            temperature=0.2 if attempt == 0 else 0.0,
-            max_tokens=8192,
-        )
-        model_calls += 1
+        raw = ""
         try:
-            return _unwrap_file_content(raw, path=path), model_calls
-        except BusinessException as exc:
-            last_error = exc
-            if attempt + 1 >= MAX_WRITER_ATTEMPTS:
-                break
-            # Provider control tokens and syntax errors are generation failures, not
-            # source changes. Regenerate before the platform writes anything.
-            messages.extend(
-                [
-                    {"role": "assistant", "content": raw},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"上一次 {path} 输出不能写入（第 {attempt + 1}/"
-                            f"{MAX_WRITER_ATTEMPTS} 次）：{exc}。"
-                            "请重新输出完整文件正文；不得包含 Markdown 围栏、工具调用、"
-                            "DSML/协议标记或解释文字。"
-                        ),
-                    },
-                ]
+            raw = chat_completion(
+                messages=list(messages),
+                temperature=0.2 if attempt == 0 else 0.0,
+                max_tokens=8192,
+                content_kind="source",
             )
+        except CompletionContentError as exc:
+            model_calls += 1
+            last_error = exc
+        else:
+            model_calls += 1
+            try:
+                return _normalize_source_candidate(raw, path=path), model_calls
+            except BusinessException as exc:
+                last_error = exc
+        assert last_error is not None
+        if attempt + 1 >= MAX_WRITER_ATTEMPTS:
+            break
+        messages.extend(
+            [
+                {"role": "assistant", "content": raw},
+                {
+                    "role": "user",
+                    "content": (
+                        f"上一次 {path} 输出不能写入（第 {attempt + 1}/"
+                        f"{MAX_WRITER_ATTEMPTS} 次）：{last_error}。"
+                        "请按系统约定重新输出唯一的 whole-file 代码围栏，不得包含解释文字。"
+                    ),
+                },
+            ]
+        )
     assert last_error is not None
     raise FileGenerationError(str(last_error), model_calls=model_calls) from last_error
 
@@ -399,7 +408,8 @@ def build_code_engineer_messages(
     observations: list[ToolExecutionResult],
     system_design: SystemDesign | None,
 ) -> list[dict[str, Any]]:
-    """OpenAI/DeepSeek tool history: each tool result follows its assistant tool_calls."""
+    """组装工具对话历史：每条工具结果紧跟对应的 assistant tool_calls。"""
+
     history: list[dict[str, Any]] = [
         {"role": "system", "content": CODE_ENGINEER_SYSTEM_PROMPT},
         {
@@ -425,6 +435,7 @@ def build_code_engineer_messages(
             ),
         },
     ]
+    # 把已执行工具的观察结果回放进历史，供模型决定下一步。
     for observation in observations:
         history.append(
             {
@@ -464,6 +475,8 @@ def decide_next_action(
     system_design: SystemDesign | None,
     tools: list[ToolDefinition] | None = None,
 ) -> ChatWithToolsResult:
+    """让模型选择下一步工具；只保留第一个工具调用。"""
+
     available_tools = tools or CODE_ENGINEER_TOOLS
     result = chat_with_tools(
         messages=build_code_engineer_messages(

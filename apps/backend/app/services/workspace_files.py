@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
@@ -41,8 +43,27 @@ _TEXT_SUFFIXES = {
     ".mako",
     ".example",
 }
-_MAX_FILE_BYTES = 512 * 1024
+_IMAGE_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".svg",
+}
+_IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+}
+_MAX_TEXT_BYTES = 512 * 1024
+_MAX_IMAGE_BYTES = 2 * 1024 * 1024
 _MAX_LISTED_FILES = 400
+
+WorkspaceFileKind = Literal["text", "image"]
 
 
 class WorkspaceFileEntry(BaseModel):
@@ -50,6 +71,7 @@ class WorkspaceFileEntry(BaseModel):
 
     path: str = Field(min_length=1, max_length=512)
     size_bytes: int = Field(ge=0)
+    kind: WorkspaceFileKind = "text"
 
 
 class WorkspaceListing(BaseModel):
@@ -65,9 +87,20 @@ class WorkspaceFileContent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
+    kind: WorkspaceFileKind = "text"
     content: str
+    media_type: str | None = None
     truncated: bool = False
     size_bytes: int = Field(ge=0)
+
+
+def _file_kind(path: Path) -> WorkspaceFileKind | None:
+    suffix = path.suffix.lower()
+    if suffix in _TEXT_SUFFIXES or path.name in {"README", "LICENSE", ".env.example"}:
+        return "text"
+    if suffix in _IMAGE_SUFFIXES:
+        return "image"
+    return None
 
 
 def list_project_workspace(db: Session, user: User, project_id: int) -> WorkspaceListing:
@@ -90,10 +123,10 @@ def list_project_workspace(db: Session, user: User, project_id: int) -> Workspac
         relative = path.relative_to(root).as_posix()
         if relative.startswith("forgeai/"):
             continue
-        suffix = path.suffix.lower()
-        if suffix not in _TEXT_SUFFIXES and path.name not in {"README", "LICENSE", ".env.example"}:
+        kind = _file_kind(path)
+        if kind is None:
             continue
-        files.append(WorkspaceFileEntry(path=relative, size_bytes=path.stat().st_size))
+        files.append(WorkspaceFileEntry(path=relative, size_bytes=path.stat().st_size, kind=kind))
         if len(files) >= _MAX_LISTED_FILES:
             break
     return WorkspaceListing(
@@ -119,15 +152,31 @@ def read_project_workspace_file(
     target = _safe_file_under_root(root, relative_path)
     if not target.is_file():
         raise NotFoundException("文件不存在")
+    kind = _file_kind(target)
+    if kind is None:
+        raise ConflictException(f"{relative_path} 不是可预览的工作区文件")
     raw = target.read_bytes()
-    truncated = len(raw) > _MAX_FILE_BYTES
-    payload = raw[:_MAX_FILE_BYTES]
+    normalized = relative_path.replace("\\", "/")
+    if kind == "image":
+        truncated = len(raw) > _MAX_IMAGE_BYTES
+        payload = raw[:_MAX_IMAGE_BYTES]
+        return WorkspaceFileContent(
+            path=normalized,
+            kind="image",
+            content=base64.b64encode(payload).decode("ascii"),
+            media_type=_IMAGE_MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream"),
+            truncated=truncated,
+            size_bytes=len(raw),
+        )
+    truncated = len(raw) > _MAX_TEXT_BYTES
+    payload = raw[:_MAX_TEXT_BYTES]
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ConflictException("该文件不是可预览的文本文件") from exc
+        raise ConflictException(f"{normalized} 不是可预览的文本文件") from exc
     return WorkspaceFileContent(
-        path=relative_path.replace("\\", "/"),
+        path=normalized,
+        kind="text",
         content=text,
         truncated=truncated,
         size_bytes=len(raw),

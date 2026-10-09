@@ -21,10 +21,11 @@ from app.db.database import Base
 
 
 class ConfigurationItemType(StrEnum):
-    """ConfigurationManager 当前识别的四种正式成果。"""
+    """ConfigurationManager 当前识别的正式成果。"""
 
     APP_SPEC = "app_spec"
     SYSTEM_DESIGN = "system_design"
+    ACCEPTANCE_TEST_PLAN = "acceptance_test_plan"
     CODE = "code"
     TEST_REPORT = "test_report"
 
@@ -42,7 +43,8 @@ class ConfigurationItem(Base):
     __tablename__ = "configuration_item"
     __table_args__ = (
         CheckConstraint(
-            "semantic_type IN ('app_spec', 'system_design', 'code', 'test_report')",
+            "semantic_type IN ('app_spec', 'system_design', 'acceptance_test_plan', "
+            "'code', 'test_report')",
             name="ck_configuration_item_semantic_type",
         ),
         CheckConstraint("version > 0", name="ck_configuration_item_positive_version"),
@@ -104,7 +106,7 @@ class ConfigurationItem(Base):
     semantic_type: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        comment="成果类型：app_spec/system_design/code/test_report",
+        comment=("成果类型：app_spec/system_design/acceptance_test_plan/code/test_report"),
     )
     version: Mapped[int] = mapped_column(
         Integer,

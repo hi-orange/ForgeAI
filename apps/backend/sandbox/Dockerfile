@@ -16,9 +16,10 @@ RUN npm install --ignore-scripts --no-audit --no-fund
 COPY templates/fullstack-react-v1/backend/pyproject.toml /opt/backend/pyproject.toml
 RUN python -c "import tomllib,subprocess; p=tomllib.load(open('/opt/backend/pyproject.toml','rb')); subprocess.check_call(['pip','install','--no-cache-dir',*p['project']['dependencies']])"
 COPY sandbox/check.py /opt/forgeai/check.py
+COPY sandbox/smoke_contract.json /opt/forgeai/smoke_contract.json
 COPY sandbox/capture.mjs /opt/forgeai/capture.mjs
 COPY sandbox/probe.mjs /opt/forgeai/probe.mjs
-LABEL org.forgeai.check-runtime-version="9"
+LABEL org.forgeai.check-runtime-version="13"
 ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /tmp
 USER 65534:65534

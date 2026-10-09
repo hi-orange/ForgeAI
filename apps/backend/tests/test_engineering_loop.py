@@ -15,11 +15,13 @@ from app.agents.code_engineer import (
     CODE_ENGINEER_PROFILE,
     CODE_ENGINEER_TOOLS,
     PlannedFileBatch,
+    _normalize_source_candidate,
     build_code_engineer_messages,
     decide_next_action,
     plan_work_item_files,
 )
 from app.core.exceptions import BusinessException
+from app.core.settings import settings
 from app.generation.delivery import FileTask, ImplementationPlan, plan_delivery
 from app.generation.workspace import default_workspace_path
 from app.models.task_execution import TaskExecution
@@ -27,13 +29,16 @@ from app.orchestration.code_engineer import (
     EXECUTION_MODE,
     _load_checkpoint,
     _normalize_plan,
+    _platform_file_context,
+    _resume_blocked_checkpoint,
     run_engineering_workflow,
 )
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
 from app.services.engineering import read_frozen_input_snapshot
-from app.tools.checks import source_snapshot
+from app.tools.check_diagnostics import analyze_check_failure, check_output_excerpt
+from app.tools.checks import CHECK_RUNTIME_VERSION, source_snapshot
 
 
 class EngineeringLoopTests(EngineeringClaimTests):
@@ -333,6 +338,132 @@ class EngineeringLoopTests(EngineeringClaimTests):
             self.assertIn("Run checks", labels)
             self.assertIn("Checks passed", labels)
 
+    def test_platform_file_context_keeps_image_deps_as_binary_metadata(self):
+        root = Path(self.workspace_root) / "binary-context"
+        image = root / "frontend/public/images/cafe-hero.jpg"
+        api = root / "frontend/src/lib/api.ts"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        api.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"\xff\xd8\xfffake-jpeg")
+        api.write_text("export const ok = true\n", encoding="utf-8")
+        task = FileTask(
+            id="file_home",
+            kind="source",
+            path="frontend/src/pages/HomePage.tsx",
+            description="首页",
+            context_paths=[
+                "frontend/src/lib/api.ts",
+                "frontend/public/images/cafe-hero.jpg",
+            ],
+        )
+
+        context, expected_hash, read_count = _platform_file_context(root, task)
+
+        self.assertIsNone(expected_hash)
+        self.assertEqual(read_count, 1)
+        by_path = {item["path"]: item for item in context["files"]}
+        self.assertFalse(by_path["frontend/src/pages/HomePage.tsx"]["exists"])
+        self.assertIn("content", by_path["frontend/src/lib/api.ts"])
+        image_meta = by_path["frontend/public/images/cafe-hero.jpg"]
+        self.assertTrue(image_meta["exists"])
+        self.assertTrue(image_meta["binary"])
+        self.assertNotIn("content", image_meta)
+        self.assertEqual(image_meta["bytes"], len(b"\xff\xd8\xfffake-jpeg"))
+
+    def test_writer_normalizes_source_without_provider_protocol_rules(self):
+        content = _normalize_source_candidate(
+            "```ts\nexport const value = 1\n```", path="frontend/src/value.ts"
+        )
+        self.assertEqual(content, "export const value = 1\n")
+
+    def test_normalize_plan_routes_image_suffix_through_image_generator(self):
+        root = default_workspace_path(settings.runtime_data_root, self.project.id, self.run.run_id)
+        root.mkdir(parents=True, exist_ok=True)
+        plan = ImplementationPlan(
+            work_item_id="feat_visual",
+            summary="生成首页图",
+            files=[
+                FileTask(
+                    id="hero",
+                    kind="source",
+                    path="frontend/public/images/hero.jpg",
+                    description="首页主视觉",
+                )
+            ],
+        )
+        with patch.object(settings, "ark_api_key", "secret"):
+            normalized = _normalize_plan(root, plan)
+        self.assertEqual(normalized.files[0].kind, "image")
+
+    def test_planned_executor_generates_image_tasks_before_checks(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        task, execution = self._claim(delivery.task_id)
+
+        def plan(*, work_item, **_kwargs):
+            return PlannedFileBatch(
+                plan=ImplementationPlan(
+                    work_item_id=work_item.id,
+                    summary=f"生成 {work_item.id} 配图",
+                    files=[
+                        FileTask(
+                            id=f"image_{work_item.id}",
+                            kind="image",
+                            path=f"frontend/public/assets/{work_item.id}.png",
+                            description=f"{work_item.title} 的业务插画",
+                        )
+                    ],
+                )
+            )
+
+        def generate(root, *, path, tool_call_id, **_kwargs):
+            actual = path.removesuffix(".png") + ".jpg"
+            target = root / actual
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"\xff\xd8\xffgenerated")
+            return ToolExecutionResult(
+                tool_call_id=tool_call_id,
+                name="generate_image",
+                ok=True,
+                summary=f"已生成本地图片 {actual}",
+                data={"path": actual, "content_hash": "image-hash", "media_type": "image/jpeg"},
+            )
+
+        with (
+            patch.object(settings, "ark_api_key", "secret"),
+            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
+            patch(
+                "app.orchestration.code_engineer.image_tools.generate_project_image",
+                side_effect=generate,
+            ) as image_generator,
+            patch("app.orchestration.code_engineer.generate_file_content") as writer,
+            patch(
+                "app.orchestration.code_engineer.check_tools.run_check",
+                side_effect=self._passing_check,
+            ),
+        ):
+            with self.session_factory() as db:
+                result = run_engineering_workflow(
+                    db,
+                    self.owner,
+                    self.project.id,
+                    self.run.run_id,
+                    task.task_id,
+                    execution.execution_id,
+                    session_factory=self.session_factory,
+                )
+
+        self.assertEqual(result["outcome"], "generated")
+        self.assertEqual(image_generator.call_count, len(valid_spec()["features"]))
+        writer.assert_not_called()
+        with self.session_factory() as db:
+            saved = db.get(TaskExecution, execution.execution_id)
+            snapshot = read_frozen_input_snapshot(saved)
+            assert snapshot is not None
+            labels = [item["label"] for item in snapshot["checkpoint"]["activity"]]
+            self.assertIn("Generate image", labels)
+            self.assertIn("Image generated", labels)
+
     def test_failed_check_creates_repair_plan_then_rechecks(self):
         published = self._publish_only()
         delivery = self._assign(published.item_id)
@@ -393,6 +524,223 @@ class EngineeringLoopTests(EngineeringClaimTests):
             checkpoint = snapshot["checkpoint"]
             self.assertEqual(checkpoint["repair_rounds"]["feat_records"], 1)
             self.assertTrue(any(item["kind"] == "repair" for item in checkpoint["plan_history"]))
+
+    def test_failure_signature_uses_normalized_full_output(self):
+        template = (
+            "运行: alembic check\n"
+            "FAILED: New upgrade operations detected: "
+            "[('remove_index', Index('ix_signature_drink_sort_order', "
+            "Column('sort_order', INTEGER(), table=<signature_drink>))]\n"
+            "Traceback (most recent call last):\n"
+            '  File "/opt/forgeai/check.py", line {line}, in check_database\n'
+            "subprocess.CalledProcessError: Command '['alembic', 'check']' "
+            "returned non-zero exit status 255.\n"
+        )
+        output_a = template.format(line=194)
+        output_b = template.format(line=208)
+        different = (
+            "运行: alembic check\n"
+            "FAILED: New upgrade operations detected: "
+            "[('add_column', Column('note', TEXT()))]\n"
+            "subprocess.CalledProcessError: Command '['alembic', 'check']' "
+            "returned non-zero exit status 255.\n"
+        )
+        excerpt = check_output_excerpt(output_a, summary="all 检查失败")
+        self.assertIn("ix_signature_drink_sort_order", excerpt)
+        self.assertIn("CalledProcessError", excerpt)
+        typescript_excerpt = check_output_excerpt(
+            "src/lib/api.ts(90,2): error TS1110: Type expected.\n"
+            + "Traceback noise\n" * 80
+            + "subprocess.CalledProcessError: tsc failed",
+            summary="all 检查失败",
+        )
+        self.assertIn("src/lib/api.ts(90,2): error TS1110", typescript_excerpt)
+
+        result_a = ToolExecutionResult(
+            tool_call_id="check",
+            name="run_check",
+            ok=False,
+            error_code="CHECK_FAILED",
+            summary="all 检查失败",
+            data={"output": output_a},
+        )
+        result_b = result_a.model_copy(update={"data": {"output": output_b}})
+        result_c = result_a.model_copy(update={"data": {"output": different}})
+        analysis_a = analyze_check_failure(result_a)
+        analysis_b = analyze_check_failure(result_b)
+        analysis_c = analyze_check_failure(result_c)
+        self.assertEqual(analysis_a.fingerprint, analysis_b.fingerprint)
+        self.assertNotEqual(analysis_a.fingerprint, analysis_c.fingerprint)
+        self.assertIn("ix_signature_drink_sort_order", analysis_a.excerpt)
+
+        typescript = analyze_check_failure(
+            result_a.model_copy(
+                update={"data": {"output": "src/lib/api.ts(90,2): error TS1110: Type expected."}}
+            )
+        )
+        self.assertEqual(typescript.diagnostics[0].kind, "typescript")
+        self.assertEqual(typescript.diagnostics[0].path, "src/lib/api.ts")
+        self.assertEqual(typescript.diagnostics[0].line, 90)
+        self.assertEqual(typescript.diagnostics[0].code, "TS1110")
+
+        same_typescript_with_runtime_noise = analyze_check_failure(
+            result_a.model_copy(
+                update={
+                    "data": {
+                        "output": (
+                            "INFO: Started server process [981]\n"
+                            "INFO: 127.0.0.1:54321 - GET /health 200\n"
+                            "src/lib/api.ts(90,2): error TS1110: Type expected.\n"
+                            "subprocess.CalledProcessError: tsc failed"
+                        )
+                    }
+                }
+            )
+        )
+        self.assertEqual(typescript.fingerprint, same_typescript_with_runtime_noise.fingerprint)
+
+        browser = analyze_check_failure(
+            result_a.model_copy(
+                update={
+                    "data": {
+                        "output": (
+                            "BROWSER_CHECK_FAILED hours_status /: TimeoutError: "
+                            "waiting for getByText('营业中') to be visible\n"
+                            "subprocess.CalledProcessError: probe.mjs failed"
+                        )
+                    }
+                }
+            )
+        )
+        self.assertEqual(browser.diagnostics[0].kind, "browser")
+        self.assertEqual(browser.diagnostics[0].code, "hours_status")
+        self.assertIn("waiting for getByText('营业中')", browser.excerpt)
+
+    def test_repeated_identical_check_failure_stops_after_three_checks(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        task, execution = self._claim(delivery.task_id)
+
+        def plan(*, work_item, repair_context=None, **_kwargs):
+            return self._file_plan(work_item.id, suffix="_repair" if repair_context else "")
+
+        def same_failure(root, *, check_id, tool_call_id):
+            return ToolExecutionResult(
+                tool_call_id=tool_call_id,
+                name="run_check",
+                ok=False,
+                error_code="CHECK_FAILED",
+                summary="all 检查失败",
+                data={
+                    "check_id": check_id,
+                    "source_hash": source_snapshot(root)[1],
+                    "output": (
+                        "Traceback (most recent call last):\n"
+                        "ValueError: 响应缺少 JSON 路径：$[0].name"
+                    ),
+                },
+            )
+
+        with (
+            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
+            patch(
+                "app.orchestration.code_engineer.generate_file_content",
+                return_value=("VALUE = 'still-broken'\n", 1),
+            ),
+            patch(
+                "app.orchestration.code_engineer.check_tools.run_check",
+                side_effect=same_failure,
+            ) as checks,
+        ):
+            with self.session_factory() as db:
+                result = run_engineering_workflow(
+                    db,
+                    self.owner,
+                    self.project.id,
+                    self.run.run_id,
+                    task.task_id,
+                    execution.execution_id,
+                    session_factory=self.session_factory,
+                )
+
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(checks.call_count, 3)
+        with self.session_factory() as db:
+            saved = db.get(TaskExecution, execution.execution_id)
+            snapshot = read_frozen_input_snapshot(saved)
+            assert snapshot is not None
+            checkpoint = snapshot["checkpoint"]
+            self.assertEqual(checkpoint["blocked_reason_code"], "REPEATED_CHECK_FAILURE")
+            self.assertEqual(
+                checkpoint["blocked_check_runtime_version"],
+                CHECK_RUNTIME_VERSION,
+            )
+            self.assertEqual(checkpoint["repair_rounds"]["feat_records"], 3)
+            self.assertEqual(checkpoint["failure_streaks"]["feat_records"]["count"], 3)
+            self.assertFalse(_resume_blocked_checkpoint(checkpoint))
+            checkpoint["blocked_executor_runtime_version"] = "planned_files_v1"
+            self.assertTrue(_resume_blocked_checkpoint(checkpoint))
+            self.assertEqual(checkpoint["outcome"], "running")
+            self.assertNotIn("feat_records", checkpoint["repair_rounds"])
+            self.assertNotIn("feat_records", checkpoint["failure_streaks"])
+
+    def test_unchanged_source_stops_even_when_failure_logs_vary(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        task, execution = self._claim(delivery.task_id)
+        check_calls = {"count": 0}
+
+        def plan(*, work_item, repair_context=None, **_kwargs):
+            return self._file_plan(work_item.id, suffix="_repair" if repair_context else "")
+
+        def varying_failure(root, *, check_id, tool_call_id):
+            check_calls["count"] += 1
+            return ToolExecutionResult(
+                tool_call_id=tool_call_id,
+                name="run_check",
+                ok=False,
+                error_code="CHECK_FAILED",
+                summary="all 检查失败",
+                data={
+                    "check_id": check_id,
+                    "source_hash": source_snapshot(root)[1],
+                    "output": f"transient runtime nonce {check_calls['count']}",
+                },
+            )
+
+        with (
+            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
+            patch(
+                "app.orchestration.code_engineer.generate_file_content",
+                return_value=("VALUE = 'unchanged'\n", 1),
+            ),
+            patch(
+                "app.orchestration.code_engineer.check_tools.run_check",
+                side_effect=varying_failure,
+            ) as checks,
+        ):
+            with self.session_factory() as db:
+                result = run_engineering_workflow(
+                    db,
+                    self.owner,
+                    self.project.id,
+                    self.run.run_id,
+                    task.task_id,
+                    execution.execution_id,
+                    session_factory=self.session_factory,
+                )
+
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(checks.call_count, 3)
+        with self.session_factory() as db:
+            saved = db.get(TaskExecution, execution.execution_id)
+            snapshot = read_frozen_input_snapshot(saved)
+            assert snapshot is not None
+            checkpoint = snapshot["checkpoint"]
+            self.assertEqual(checkpoint["blocked_reason_code"], "NO_SOURCE_PROGRESS")
+            streak = checkpoint["failure_streaks"]["feat_records"]
+            self.assertEqual(streak["count"], 1)
+            self.assertEqual(streak["unchanged_source_count"], 3)
 
     def test_model_budget_counts_planner_and_writer(self):
         published = self._publish_only()
@@ -506,6 +854,9 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertEqual(content, "VALUE = 1\n")
         self.assertEqual(calls, 2)
         self.assertEqual(chat.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["content_kind"] == "source" for call in chat.call_args_list)
+        )
         self.assertLessEqual(calls, MAX_WRITER_ATTEMPTS)
 
     def test_controller_checkpoint_migrates_without_replaying_observations(self):
@@ -518,6 +869,8 @@ class EngineeringLoopTests(EngineeringClaimTests):
                 "model_turns": 40,
                 "tool_calls": 40,
                 "observations": [{"name": "read_file"}],
+                "failure_streaks": {"feat_home": {"unchanged_source_count": 3}},
+                "repair_rounds": {"feat_home": 9},
                 "work_items": [],
                 "activity": [],
             }
@@ -528,4 +881,6 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertEqual(checkpoint["model_turns"], 0)
         self.assertEqual(checkpoint["tool_calls"], 0)
         self.assertEqual(checkpoint["observations"], [])
+        self.assertEqual(checkpoint["failure_streaks"], {})
+        self.assertEqual(checkpoint["repair_rounds"], {})
         self.assertTrue(checkpoint["migrated_from_controller"])

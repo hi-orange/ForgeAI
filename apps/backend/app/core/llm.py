@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from app.core.exceptions import BusinessException
+from app.core.llm_response import CompletionContentKind, normalize_completion_content
 from app.core.settings import settings
 from app.schemas.agent_action import ChatWithToolsResult, TokenUsage, ToolCall, ToolDefinition
 
@@ -84,8 +85,9 @@ def chat_completion(
     max_tokens: int = 4096,
     timeout: float = 120.0,
     json_output: bool = False,
+    content_kind: CompletionContentKind = "text",
 ) -> str:
-    """普通对话补全；json_output 时强制 JSON。始终关闭 thinking，避免推理占满输出预算。"""
+    """普通对话补全，并在 provider 边界规范化文本传输包装。"""
     body: dict[str, object] = {
         "model": settings.deepseek_model,
         "messages": messages,
@@ -146,7 +148,7 @@ def chat_completion(
         data.get("usage") if isinstance(data, dict) else None,
     )
 
-    return content.strip()
+    return normalize_completion_content(content, kind=content_kind)
 
 
 def _parse_arguments(raw: object) -> dict[str, Any]:

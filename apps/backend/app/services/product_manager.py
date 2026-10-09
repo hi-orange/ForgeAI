@@ -27,6 +27,7 @@ from app.schemas.configuration_item import ConfigurationItemRegistration
 from app.schemas.product_manager import (
     MAX_HISTORY_CHARS,
     MAX_HISTORY_MESSAGES,
+    PlatformCapabilities,
     ProductManagerInput,
     ProductManagerResult,
     RequirementMessage,
@@ -96,6 +97,7 @@ def _load_running_task(
 def _prepare_input(
     db: Session, task: Task, message: ProjectMessage, *, lock: bool = False
 ) -> ProductManagerInput:
+    capabilities = PlatformCapabilities(image_generation=settings.image_generation_enabled)
     previous = load_previous_app_spec(db, task, lock=lock)
     if previous is not None:
         # 补充任务只读准确的原文档和本次回答，不混入两者之间的其他对话。
@@ -104,6 +106,7 @@ def _prepare_input(
             source_message=RequirementMessage.model_validate(message),
             recent_messages=[],
             context_truncated=False,
+            platform_capabilities=capabilities,
             previous_app_spec=previous,
             previous_item_id=task.input_configuration_item_ids[0],
         )
@@ -133,6 +136,7 @@ def _prepare_input(
         source_message=RequirementMessage.model_validate(message),
         recent_messages=selected,
         context_truncated=len(selected) < len(candidates),
+        platform_capabilities=capabilities,
     )
 
 

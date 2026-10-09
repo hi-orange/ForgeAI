@@ -1,10 +1,11 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.app_spec import AppSpec, RequirementId, RequirementText
 from app.schemas.product_manager_workflow import ProductManagerWorkflowResult, WorkflowId
+from app.schemas.test_report import TestChallenge
 
 
 class RequirementsExecute(BaseModel):
@@ -51,6 +52,26 @@ class RequirementsApproval(BaseModel):
     selected: list[RequirementsApprovalSelection] = Field(min_length=1, max_length=50)
 
 
+class QualityChallengeResolution(BaseModel):
+    """One explicit user decision for a blocked frozen acceptance report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["repair_code", "revise_product"]
+    client_message_id: WorkflowId | None = None
+    content: str | None = Field(default=None, max_length=8000)
+
+    @model_validator(mode="after")
+    def validate_revision_message(self) -> "QualityChallengeResolution":
+        if self.action == "revise_product":
+            if not self.client_message_id or not self.content or not self.content.strip():
+                raise ValueError("修改需求时必须提供修订说明和 client_message_id")
+            self.content = self.content.strip()
+        elif self.client_message_id is not None or self.content is not None:
+            raise ValueError("继续修复代码时不能附带需求修订消息")
+        return self
+
+
 class EngineeringActivity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -90,11 +111,13 @@ class RequirementsStatus(BaseModel):
         "quality_pending",
         "quality_running",
         "completed",
+        "quality_challenge",
         "quality_failed",
     ] = "not_started"
     execution_id: str | None = None
     execution_expires_at: datetime | None = None
     error: str | None = None
+    retryable: bool = True
     result: ProductManagerWorkflowResult | None = None
     app_spec: AppSpec | None = None
     # The template is visible as soon as the isolated workspace exists; code_ready means a
@@ -103,5 +126,6 @@ class RequirementsStatus(BaseModel):
     code_ready: bool = False
     code_item_id: str | None = None
     test_report_item_id: str | None = None
+    test_challenges: list[TestChallenge] = Field(default_factory=list)
     workspace_path: str | None = None
     activities: list[EngineeringActivity] = Field(default_factory=list)

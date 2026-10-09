@@ -1,5 +1,6 @@
 """Check isolation, evidence and environment failures without running generated code on the host."""
 
+import base64
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ from app.tools.checks import (
     capture_screenshots,
     check_environment,
     docker_command,
+    load_smoke_contract,
     run_check,
     source_snapshot,
     visual_docker_command,
@@ -42,6 +44,30 @@ class EngineeringCheckTests(unittest.TestCase):
         (self.root / "build.config.json").write_text('{"target":"app"}', encoding="utf-8")
         self.assertIn("build.config.json", json.loads(source_snapshot(self.root)[0]))
         (self.root / "frontend/src/App.tsx").write_text("changed", encoding="utf-8")
+        self.assertNotEqual(source_snapshot(self.root)[1], before)
+
+    def test_smoke_contract_is_the_authoritative_action_protocol(self):
+        contract = load_smoke_contract()
+        browser = contract["browser"]
+        self.assertIn("navigate", browser["actions"])
+        self.assertEqual(browser["actions"]["expect_count"]["fields"]["count"]["type"], "integer")
+
+    def test_snapshot_includes_only_bounded_public_binary_images(self):
+        image = self.root / "frontend/public/images/hero.jpg"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"\xff\xd8\xffgenerated")
+        private = self.root / "backend/private.jpg"
+        private.write_bytes(b"\xff\xd8\xffprivate")
+
+        payload, before = source_snapshot(self.root)
+        files = json.loads(payload)
+
+        encoded = files["frontend/public/images/hero.jpg"]
+        self.assertEqual(encoded["encoding"], "base64")
+        self.assertEqual(base64.b64decode(encoded["content"]), image.read_bytes())
+        self.assertNotIn("backend/private.jpg", files)
+
+        image.write_bytes(b"\xff\xd8\xffchanged")
         self.assertNotEqual(source_snapshot(self.root)[1], before)
 
     def test_container_has_no_host_mount_and_bounded_resources(self):

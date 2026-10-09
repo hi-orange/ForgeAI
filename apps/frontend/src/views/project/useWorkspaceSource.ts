@@ -17,6 +17,8 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
   const files = ref<workspaceApi.WorkspaceFileEntry[]>([])
   const selectedPath = ref<string | null>(null)
   const fileContent = ref<string | null>(null)
+  const fileKind = ref<workspaceApi.WorkspaceFileKind>('text')
+  const fileMediaType = ref<string | null>(null)
   const loading = ref(false)
   const error = ref('')
   const fileLoading = ref(false)
@@ -30,7 +32,11 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
     if (manual) following.value = false
     const request = ++fileRequest
     const runId = input.runId
-    if (selectedPath.value !== path) fileContent.value = null
+    if (selectedPath.value !== path) {
+      fileContent.value = null
+      fileKind.value = 'text'
+      fileMediaType.value = null
+    }
     selectedPath.value = path
     fileLoading.value = fileContent.value === null
     fileError.value = ''
@@ -38,6 +44,8 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
       const file = await workspaceApi.getWorkspaceFile(input.projectId, path)
       if (request !== fileRequest || runId !== input.runId) return
       fileContent.value = file.content
+      fileKind.value = file.kind === 'image' ? 'image' : 'text'
+      fileMediaType.value = file.media_type ?? null
     } catch (err) {
       if (request === fileRequest)
         fileError.value = err instanceof Error ? err.message : '读取文件失败'
@@ -53,6 +61,8 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
       files.value = []
       selectedPath.value = null
       fileContent.value = null
+      fileKind.value = 'text'
+      fileMediaType.value = null
       following.value = true
       fileError.value = ''
       fileLoading.value = false
@@ -71,6 +81,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
       const path = [
         preferred,
         selectedPath.value,
+        'frontend/src/App.tsx',
         'frontend/src/App.vue',
         listing.files[0]?.path,
       ].find((path) => path && listing.files.some((file) => file.path === path))
@@ -79,6 +90,8 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
         ++fileRequest
         selectedPath.value = null
         fileContent.value = null
+        fileKind.value = 'text'
+        fileMediaType.value = null
         fileLoading.value = false
       }
     } catch (err) {
@@ -121,6 +134,8 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
     files,
     selectedPath,
     fileContent,
+    fileKind,
+    fileMediaType,
     loading,
     error,
     fileLoading,

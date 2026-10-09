@@ -11,7 +11,12 @@ from app.core.exceptions import BusinessException
 from app.models.configuration_item import ConfigurationItemType
 from app.models.project_message_classification import ProjectMessageCategory
 from app.models.task import TaskRecipient, TaskStatus
-from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
+from app.schemas.agent_action import (
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionResult,
+    inline_model_json_schema,
+)
 from app.schemas.leader import (
     LeaderContext,
     LeaderIntentDecision,
@@ -20,9 +25,9 @@ from app.schemas.leader import (
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
 
-_PLAN_SCHEMA = PlanCreate.model_json_schema()
-_INTENT_SCHEMA = LeaderIntentDecision.model_json_schema()
-_MESSAGE_CLASSIFICATION_SCHEMA = ProjectMessageClassificationDecision.model_json_schema()
+_PLAN_SCHEMA = inline_model_json_schema(PlanCreate)
+_INTENT_SCHEMA = inline_model_json_schema(LeaderIntentDecision)
+_MESSAGE_CLASSIFICATION_SCHEMA = inline_model_json_schema(ProjectMessageClassificationDecision)
 
 MESSAGE_CLASSIFICATION_TOOL = ToolDefinition(
     name="record_message_classification",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -93,11 +94,57 @@ class WorkspaceFilesTests(unittest.TestCase):
                 content = workspace_files_service.read_project_workspace_file(
                     db, self._owner(), self.project_id, "backend/app/api/health.py"
                 )
+                self.assertEqual(content.kind, "text")
                 self.assertIn("health", content.content)
                 with self.assertRaises(ConflictException):
                     workspace_files_service.read_project_workspace_file(
                         db, self._owner(), self.project_id, "../secret.txt"
                     )
+
+    def test_list_and_preview_generated_images(self) -> None:
+        prepare_engineering_workspace(
+            self.project_id,
+            self.run_id,
+            task_id="task_ws_image",
+            approved_item_id="ci_ws_image",
+            app_spec={"goal": "咖啡馆"},
+        )
+        root = Path(settings.runtime_data_root) / "work" / str(self.project_id) / self.run_id
+        image = root / "frontend/public/images/cafe-hero.jpg"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"\xff\xd8\xfffake-jpeg-bytes")
+        with self.session_factory() as db:
+            with patch("app.services.workspace_files.get_requirements_status") as status:
+                from app.schemas.requirements import RequirementsStatus
+
+                status.return_value = RequirementsStatus(
+                    project_id=self.project_id,
+                    run_id=self.run_id,
+                    state="engineering_generated",
+                    workspace_ready=True,
+                    code_ready=True,
+                )
+                listing = workspace_files_service.list_project_workspace(
+                    db, self._owner(), self.project_id
+                )
+                image_entry = next(
+                    item
+                    for item in listing.files
+                    if item.path == "frontend/public/images/cafe-hero.jpg"
+                )
+                self.assertEqual(image_entry.kind, "image")
+                preview = workspace_files_service.read_project_workspace_file(
+                    db,
+                    self._owner(),
+                    self.project_id,
+                    "frontend/public/images/cafe-hero.jpg",
+                )
+                self.assertEqual(preview.kind, "image")
+                self.assertEqual(preview.media_type, "image/jpeg")
+                self.assertEqual(
+                    preview.content,
+                    base64.b64encode(b"\xff\xd8\xfffake-jpeg-bytes").decode("ascii"),
+                )
 
     def test_list_exposes_template_as_soon_as_workspace_is_ready(self) -> None:
         prepare_engineering_workspace(

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from threading import Barrier, Event
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from alembic.autogenerate import compare_metadata
@@ -42,7 +43,11 @@ from app.models.task_result import TaskResult
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.schemas.product_manager import ProductManagerResult
 from app.schemas.project_message import ProjectMessageCreate
-from app.schemas.requirements import RequirementsApproval, RequirementsStatus
+from app.schemas.requirements import (
+    QualityChallengeResolution,
+    RequirementsApproval,
+    RequirementsStatus,
+)
 from app.schemas.system_design import SystemDesign
 from app.services import leader, product_manager, task, task_execution
 from app.services.app_spec import approve_requirements
@@ -50,10 +55,149 @@ from app.services.requirements import (
     continue_requirements,
     get_requirements_status,
     pause_active_execution,
+    resolve_quality_challenge,
 )
 
 
 class RequirementsLoopTests(ProductManagerWorkflowFixture):
+    def _quality_challenge_status(self) -> RequirementsStatus:
+        return RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="quality_challenge",
+            code_item_id="ci_code",
+            test_report_item_id="ci_report",
+        )
+
+    def test_quality_challenge_repair_request_replays_after_dispatch(self):
+        dispatched = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="engineering_pending",
+            task_id="task_repair",
+        )
+        repair_task = SimpleNamespace(
+            recipient="Code Engineer",
+            input_configuration_item_ids=["ci_design", "ci_tests", "ci_report"],
+        )
+        with (
+            self.session_factory() as db,
+            patch(
+                "app.services.requirements.get_requirements_status",
+                return_value=dispatched,
+            ),
+            patch(
+                "app.services.requirements.task_service.get_user_task",
+                return_value=repair_task,
+            ),
+        ):
+            result = resolve_quality_challenge(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                "ci_report",
+                QualityChallengeResolution(action="repair_code"),
+            )
+
+        self.assertIs(result, dispatched)
+
+    def test_quality_challenge_can_resume_code_repair_only_after_user_decision(self):
+        challenge = self._quality_challenge_status()
+        repaired = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="engineering_pending",
+        )
+        run = SimpleNamespace(status="failed", stage="qa", active_slot=None, error="blocked")
+        inputs = SimpleNamespace(code_item=SimpleNamespace(upstream_item_ids=["ci_design"]))
+        source = SimpleNamespace(app_spec_item=SimpleNamespace(item_id="ci_approved"))
+        repair_task = SimpleNamespace(task_id="task_repair")
+
+        with (
+            self.session_factory() as db,
+            patch(
+                "app.services.requirements.get_requirements_status",
+                side_effect=[challenge, repaired],
+            ),
+            patch("app.services.requirements.lock_run", return_value=run),
+            patch("app.services.requirements.load_test_inputs", return_value=inputs),
+            patch("app.services.requirements.load_engineering_source", return_value=source),
+            patch(
+                "app.services.requirements.leader_service.dispatch_quality_repair",
+                return_value=repair_task,
+            ) as dispatch,
+            patch("app.services.requirements.start_dispatched_delivery") as start,
+        ):
+            result = resolve_quality_challenge(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                "ci_report",
+                QualityChallengeResolution(action="repair_code"),
+            )
+
+        self.assertIs(result, repaired)
+        self.assertEqual(
+            (run.status, run.stage, run.active_slot, run.error), ("running", "qa", 1, None)
+        )
+        dispatch.assert_called_once_with(
+            db, self.owner, self.project.id, self.run.run_id, "ci_report"
+        )
+        start.assert_called_once_with(db, self.owner, self.project.id, self.run.run_id, repair_task)
+
+    def test_quality_challenge_product_revision_returns_to_pm_approval(self):
+        challenge = self._quality_challenge_status()
+        awaiting = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="awaiting_approval",
+        )
+        run = SimpleNamespace(status="failed", stage="qa", active_slot=None, error="blocked")
+        inputs = SimpleNamespace(code_item=SimpleNamespace(upstream_item_ids=["ci_design"]))
+        source = SimpleNamespace(app_spec_item=SimpleNamespace(item_id="ci_approved"))
+        plan = SimpleNamespace(cause_message_id=42)
+        resolution = QualityChallengeResolution(
+            action="revise_product",
+            content="访客查看菜单不需要登录",
+            client_message_id="challenge-revision-1",
+        )
+
+        with (
+            self.session_factory() as db,
+            patch(
+                "app.services.requirements.get_requirements_status",
+                side_effect=[challenge, awaiting],
+            ),
+            patch("app.services.requirements.lock_run", return_value=run),
+            patch("app.services.requirements.load_test_inputs", return_value=inputs),
+            patch("app.services.requirements.load_engineering_source", return_value=source),
+            patch(
+                "app.services.requirements.create_product_revision_plan",
+                return_value=plan,
+            ) as create_revision,
+            patch("app.services.requirements.run_product_manager_workflow") as run_pm,
+        ):
+            result = resolve_quality_challenge(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                "ci_report",
+                resolution,
+            )
+
+        self.assertIs(result, awaiting)
+        self.assertEqual(
+            (run.status, run.stage, run.active_slot, run.error), ("running", "pm", 1, None)
+        )
+        create_revision.assert_called_once()
+        revision_message = create_revision.call_args.args[-1]
+        self.assertEqual(revision_message.content, "访客查看菜单不需要登录")
+        self.assertEqual(revision_message.client_message_id, "challenge-revision-1")
+        run_pm.assert_called_once_with(db, self.owner, self.project.id, self.run.run_id, 42)
+
     def test_duplicate_continue_is_idempotent_while_quality_is_running(self):
         running = RequirementsStatus(
             project_id=self.project.id,
@@ -71,6 +215,76 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
 
         self.assertIs(result, running)
         get_task.assert_not_called()
+
+    def test_quality_infrastructure_block_can_retry_same_code_in_qa(self):
+        blocked = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="quality_failed",
+            task_id="task_quality_old",
+            code_item_id="ci_code",
+            test_report_item_id="ci_report",
+            retryable=True,
+        )
+        completed = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="completed",
+        )
+        retry_task = SimpleNamespace(task_id="task_quality_retry")
+        with (
+            self.session_factory() as db,
+            patch(
+                "app.services.requirements.get_requirements_status",
+                side_effect=[blocked, completed],
+            ),
+            patch(
+                "app.services.requirements.leader_service.retry_blocked_quality_validation",
+                return_value=retry_task,
+            ) as dispatch,
+            patch("app.services.requirements.run_test_engineer_task") as run_quality,
+        ):
+            result = continue_requirements(db, self.owner, self.project.id)
+
+        self.assertIs(result, completed)
+        dispatch.assert_called_once_with(
+            db,
+            self.owner,
+            self.project.id,
+            self.run.run_id,
+            "ci_report",
+        )
+        run_quality.assert_called_once_with(
+            db,
+            self.owner,
+            self.project.id,
+            self.run.run_id,
+            "task_quality_retry",
+        )
+
+    def test_retry_does_not_supersede_worker_that_is_still_finalizing(self):
+        paused = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="retry_available",
+            task_id="task_engineering",
+            execution_id="exec_engineering",
+        )
+        current_task = type("CurrentTask", (), {"recipient": "Code Engineer"})()
+        with (
+            self.session_factory() as db,
+            patch("app.services.requirements.get_requirements_status", return_value=paused),
+            patch(
+                "app.services.requirements.task_service.get_user_task",
+                return_value=current_task,
+            ),
+            patch("app.services.requirements.engineering.is_engineering_active", return_value=True),
+            patch("app.services.requirements.engineering.claim_code_engineer_task") as claim,
+        ):
+            result = continue_requirements(db, self.owner, self.project.id)
+
+        self.assertIs(result, paused)
+        claim.assert_not_called()
 
     def test_late_model_response_cannot_overwrite_recovered_execution(self):
         entered, release = Event(), Event()
@@ -664,6 +878,42 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         )
         self.assertIsNotNone(retry.json()["data"]["task_id"])
         self.chat.assert_called_once()
+
+    def test_http_rolls_back_failed_dispatch_transaction_before_returning_status(self):
+        first = self.client.post(self.execute, json={"message_id": self.message.id})
+        self.assertEqual(first.status_code, 200, first.text)
+        item_id = first.json()["data"]["configuration_item_id"]
+
+        def fail_with_database_error(db, *_args):
+            db.add(
+                Project(
+                    id=self.project.id,
+                    user_id=self.owner.id,
+                    name="duplicate project",
+                    status="draft",
+                )
+            )
+            db.flush()
+
+        with (
+            self.assertLogs("forgeai", level="ERROR"),
+            patch(
+                "app.services.requirements.leader_service.dispatch_approved_requirements",
+                side_effect=fail_with_database_error,
+            ),
+        ):
+            approval = self.client.post(
+                f"{self.execute}/{item_id}/approval",
+                json=approval_payload(client_message_id="database-failure-approval"),
+            )
+
+        self.assertEqual(approval.status_code, 200, approval.text)
+        saved = approval.json()["data"]
+        self.assertEqual(saved["state"], "ready_for_delivery")
+        self.assertIn("自动分派下一步失败", saved["error"] or "")
+        waiting = self.client.get(f"{self.base}/requirements")
+        self.assertEqual(waiting.status_code, 200, waiting.text)
+        self.assertEqual(waiting.json()["data"]["state"], "ready_for_delivery")
 
     def test_http_rejects_cross_owner_and_malformed_input(self):
         self.current_user = self.outsider

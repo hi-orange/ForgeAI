@@ -22,7 +22,6 @@ from app.schemas.configuration_item import ConfigurationItemRegistration
 
 _REQUIRED_UPSTREAM_TYPE = {
     ConfigurationItemType.SYSTEM_DESIGN: ConfigurationItemType.APP_SPEC,
-    ConfigurationItemType.TEST_REPORT: ConfigurationItemType.CODE,
 }
 
 _CODE_PRIMARY_UPSTREAM_TYPES = {
@@ -110,13 +109,44 @@ def _validate_upstream_types(
         # QA report as its optional second direct input for end-to-end traceability.
         if upstream_items[0].semantic_type not in _CODE_PRIMARY_UPSTREAM_TYPES:
             raise BusinessException("code 的直接上游只能是 app_spec 或 system_design")
-        if len(upstream_items) > 2:
-            raise BusinessException("code 最多引用一个工程来源和一个 test_report")
-        if (
-            len(upstream_items) == 2
-            and upstream_items[1].semantic_type != ConfigurationItemType.TEST_REPORT.value
+        # One-item chains remain readable for artifacts produced before schema v2.
+        if len(upstream_items) == 1:
+            return
+        if len(upstream_items) not in {2, 3}:
+            raise BusinessException("code 必须引用工程来源、冻结测试计划及可选 test_report")
+        if len(upstream_items) == 2 and upstream_items[1].semantic_type == (
+            ConfigurationItemType.TEST_REPORT.value
         ):
+            # Read-compatible with repair artifacts produced before frozen plans.
+            return
+        if upstream_items[1].semantic_type != ConfigurationItemType.ACCEPTANCE_TEST_PLAN.value:
             raise BusinessException("code 的可选第二上游必须是 test_report")
+        if (
+            len(upstream_items) == 3
+            and upstream_items[2].semantic_type != ConfigurationItemType.TEST_REPORT.value
+        ):
+            raise BusinessException("code 的可选第三上游必须是 test_report")
+        return
+
+    if semantic_type == ConfigurationItemType.ACCEPTANCE_TEST_PLAN:
+        if len(upstream_items) != 1 or upstream_items[0].semantic_type not in (
+            ConfigurationItemType.APP_SPEC.value,
+            ConfigurationItemType.SYSTEM_DESIGN.value,
+        ):
+            raise BusinessException("acceptance_test_plan 必须引用 app_spec 或 system_design")
+        return
+
+    if semantic_type == ConfigurationItemType.TEST_REPORT:
+        if len(upstream_items) == 1 and upstream_items[0].semantic_type == (
+            ConfigurationItemType.CODE.value
+        ):
+            return
+        if (
+            len(upstream_items) != 2
+            or upstream_items[0].semantic_type != ConfigurationItemType.CODE.value
+            or upstream_items[1].semantic_type != ConfigurationItemType.ACCEPTANCE_TEST_PLAN.value
+        ):
+            raise BusinessException("test_report 必须引用 code 和冻结 acceptance_test_plan")
         return
 
     required_type = _REQUIRED_UPSTREAM_TYPE[semantic_type]

@@ -300,6 +300,7 @@ const postApproval = computed(() =>
     'quality_pending',
     'quality_running',
     'completed',
+    'quality_challenge',
     'quality_failed',
   ].includes(props.status?.state ?? ''),
 )
@@ -310,6 +311,7 @@ const previewTitle = computed(() => {
   if (preview.value?.status === 'starting') return '正在启动预览'
   if (preview.value?.status === 'error') return '预览启动失败'
   if (props.status?.state === 'completed') return '应用已完成运行验证'
+  if (props.status?.state === 'quality_failed') return '质量验证未通过'
   if (props.status?.code_ready) return '应用代码已生成'
   if (postApproval.value) return '正在构建你的应用'
   if (props.canApprove) return '你的应用，即将从这里开始'
@@ -321,6 +323,10 @@ const previewDescription = computed(() => {
   if (preview.value?.status === 'error') return '可以重试启动预览；源码仍可在「编辑器」中查看。'
   if (props.status?.state === 'completed')
     return '准确代码版本已经通过独立验收。启动本机预览后，可在此直接操作应用。'
+  if (props.status?.state === 'quality_failed')
+    return props.canResume
+      ? '代码已保留。验收基础设施问题可以继续处理，不会重新生成业务代码。'
+      : '代码已保留，但当前版本未通过独立验收。请查看左侧失败证据。'
   if (props.status?.code_ready) return '工作区已有真实代码，正在等待验证与安全预览运行时。'
   if (props.status?.state === 'engineering_running')
     return '工程任务正在读写工作区，进度会同步到 Console。'

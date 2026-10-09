@@ -35,6 +35,9 @@ class FileTask(BaseModel):
     id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     path: str = Field(min_length=1, max_length=500)
     description: str = Field(min_length=1, max_length=2000)
+    kind: Literal["source", "image"] = "source"
+    image_size: Literal["1K", "2K", "4K"] = "2K"
+    image_watermark: bool = True
     context_paths: list[str] = Field(default_factory=list, max_length=12)
     status: Literal["pending", "completed"] = "pending"
     content_hash: str | None = None

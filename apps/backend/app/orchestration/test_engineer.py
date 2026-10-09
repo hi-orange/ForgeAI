@@ -131,6 +131,17 @@ def run_test_engineer_task(
             system_design=inputs.system_design,
             code_item_id=inputs.code_item.item_id,
             code_source_hash=inputs.code_artifact.source_hash,
+            acceptance_test_plan_item_id=(
+                inputs.acceptance_test_plan_item.item_id
+                if inputs.acceptance_test_plan_item is not None
+                else None
+            ),
+            acceptance_test_hash=(
+                inputs.acceptance_test_plan_item.content_hash
+                if inputs.acceptance_test_plan_item is not None
+                else None
+            ),
+            acceptance_test_plan=inputs.acceptance_test_plan,
             workspace_root=workspace_root,
             saved_progress=_saved_quality_progress(execution),
             heartbeat=heartbeat,

@@ -59,9 +59,13 @@
           跟随写入
         </button>
       </header>
-      <div class="code-scroll">
+      <div class="code-scroll" :class="{ 'image-scroll': fileKind === 'image' }">
         <p v-if="fileLoading" class="tree-empty">加载文件中…</p>
         <p v-else-if="fileError" class="tree-error">{{ fileError }}</p>
+        <figure v-else-if="selectedPath && fileKind === 'image' && imageSrc" class="image-preview">
+          <img :src="imageSrc" :alt="selectedName" />
+          <figcaption>{{ selectedPath }}</figcaption>
+        </figure>
         <template v-else-if="selectedPath && fileContent !== null">
           <div class="code-lines" aria-hidden="true">
             <span v-for="line in lineCount" :key="line">{{ line }}</span>
@@ -70,7 +74,9 @@
         </template>
         <p v-else class="tree-empty">选择文件后可在此查看源码。</p>
       </div>
-      <div class="upgrade-banner" role="note">要进行编辑，请升级到付费计划</div>
+      <div v-if="fileKind !== 'image'" class="upgrade-banner" role="note">
+        要进行编辑，请升级到付费计划
+      </div>
     </div>
   </section>
 </template>
@@ -97,7 +103,16 @@ const props = defineProps<{
 defineEmits<{ download: [] }>()
 
 const query = ref('')
-const expanded = ref(new Set<string>(['frontend', 'backend', 'frontend/src', 'backend/app']))
+const expanded = ref(
+  new Set<string>([
+    'frontend',
+    'backend',
+    'frontend/src',
+    'frontend/public',
+    'frontend/public/images',
+    'backend/app',
+  ]),
+)
 
 function expandAncestors(path: string) {
   const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
@@ -113,6 +128,8 @@ const {
   files,
   selectedPath,
   fileContent,
+  fileKind,
+  fileMediaType,
   loading,
   error,
   fileLoading,
@@ -132,6 +149,11 @@ watch(
 
 const selectedName = computed(() => selectedPath.value?.split('/').at(-1) ?? '')
 const lineCount = computed(() => Math.max(1, (fileContent.value ?? '').split('\n').length))
+const imageSrc = computed(() => {
+  if (fileKind.value !== 'image' || !fileContent.value) return null
+  const media = fileMediaType.value || 'image/jpeg'
+  return `data:${media};base64,${fileContent.value}`
+})
 
 const visibleTree = computed(() => {
   const q = query.value.trim().toLowerCase()
@@ -177,6 +199,7 @@ function badgeFor(name: string) {
   if (name.endsWith('.css') || name.endsWith('.scss')) return '#'
   if (name.endsWith('.html')) return '<>'
   if (name.endsWith('.md')) return 'MD'
+  if (/\.(png|jpe?g|webp|gif|svg)$/i.test(name)) return 'IMG'
   return '·'
 }
 
@@ -370,6 +393,42 @@ function toggleDir(path: string) {
   grid-template-columns: auto minmax(0, 1fr);
   overflow: auto;
   background: #fff;
+}
+
+.code-scroll.image-scroll {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+  background:
+    linear-gradient(45deg, #f4f4f5 25%, transparent 25%) 0 0 / 16px 16px,
+    linear-gradient(-45deg, #f4f4f5 25%, transparent 25%) 0 8px / 16px 16px,
+    linear-gradient(45deg, transparent 75%, #f4f4f5 75%) 8px -8px / 16px 16px,
+    linear-gradient(-45deg, transparent 75%, #f4f4f5 75%) -8px 0 / 16px 16px,
+    #fafafa;
+}
+
+.image-preview {
+  margin: 0;
+  max-width: min(100%, 720px);
+  text-align: center;
+}
+
+.image-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: min(70vh, 520px);
+  margin: 0 auto;
+  border-radius: 0.75rem;
+  box-shadow: 0 10px 30px rgba(24, 24, 27, 0.12);
+  background: #fff;
+}
+
+.image-preview figcaption {
+  margin-top: 0.75rem;
+  color: #71717a;
+  font-size: 0.75rem;
+  word-break: break-all;
 }
 
 .code-lines {

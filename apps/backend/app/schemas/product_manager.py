@@ -21,6 +21,18 @@ class RequirementMessage(BaseModel):
     content: Annotated[str, StringConstraints(min_length=1, max_length=MAX_REQUIREMENT_CHARS)]
 
 
+class PlatformCapabilities(BaseModel):
+    """Server-owned build capabilities exposed to Product Manager as facts."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    frontend: str = "React + TypeScript"
+    backend: str = "FastAPI"
+    database: str = "SQLite"
+    local_asset_storage: bool = True
+    image_generation: bool = False
+
+
 class ProductManagerInput(BaseModel):
     """一次模型调用的输入副本，不包含可变的项目名称、简介或最新消息。"""
 
@@ -32,6 +44,7 @@ class ProductManagerInput(BaseModel):
     source_message: RequirementMessage
     recent_messages: list[RequirementMessage] = Field(max_length=MAX_HISTORY_MESSAGES)
     context_truncated: bool
+    platform_capabilities: PlatformCapabilities = Field(default_factory=PlatformCapabilities)
     previous_app_spec: AppSpec | None = None
     previous_item_id: str | None = Field(default=None, min_length=1, max_length=40)
 

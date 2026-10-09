@@ -72,7 +72,10 @@
             v-if="status?.activities?.length"
             :activities="status.activities"
             :running="timelineRunning"
-            :failed="status.state === 'retry_available' && Boolean(status.error)"
+            :failed="
+              (status.state === 'retry_available' || status.state === 'quality_failed') &&
+              Boolean(status.error)
+            "
             @open-file="openWorkspaceFile"
           />
           <section v-if="status?.state === 'completed'" class="delivery-summary">
@@ -177,6 +180,47 @@
             {{ question }}
           </p>
         </div>
+        <section v-if="status?.state === 'quality_challenge'" class="challenge-card">
+          <strong>验收测试与已批准需求存在冲突</strong>
+          <p>Test Engineer 没有改写冻结测试。请选择按原验收继续修代码，或说明需求应怎样修改。</p>
+          <p v-if="status.retryable === false" class="challenge-limit">
+            自动修复轮次已用尽；仍可修改产品意图并重新批准。
+          </p>
+          <ul>
+            <li v-for="challenge in status.test_challenges" :key="challenge.challenge_id">
+              <strong>{{ challenge.reason }}</strong>
+              <span>{{ challenge.requested_resolution }}</span>
+            </li>
+          </ul>
+          <label>
+            若要修改需求，请写明新的产品行为、边界或验收标准
+            <textarea
+              v-model="challengeRevision"
+              rows="3"
+              maxlength="8000"
+              :disabled="busy"
+              placeholder="例如：访客无需登录即可查看菜单，但下单仍需登录。"
+            />
+          </label>
+          <div class="challenge-actions">
+            <button
+              type="button"
+              class="secondary"
+              :disabled="busy || status.retryable === false"
+              @click="resolveChallenge('repair_code')"
+            >
+              原验收正确，继续修代码
+            </button>
+            <button
+              type="button"
+              class="primary"
+              :disabled="busy || !challengeRevision.trim()"
+              @click="resolveChallenge('revise_product', challengeRevision)"
+            >
+              修改需求并重新批准
+            </button>
+          </div>
+        </section>
         <div v-if="canResume" class="resume-card">
           <p>
             {{
@@ -309,10 +353,12 @@ const {
   retryStart,
   pause,
   approve,
+  resolveChallenge,
 } = useRequirements(projectId)
 const chatCollapsed = ref(false)
 const editing = ref(false)
 const newRequirement = ref('')
+const challengeRevision = ref('')
 const historyOpen = ref(false)
 const approvalPanelOpen = ref(true)
 const workspaceView = ref<WorkspaceView>('design')
@@ -334,6 +380,7 @@ const showApprovedPlan = computed(
     status.value?.state === 'quality_pending' ||
     status.value?.state === 'quality_running' ||
     status.value?.state === 'completed' ||
+    status.value?.state === 'quality_challenge' ||
     status.value?.state === 'quality_failed',
 )
 const approvedPlanItems = computed(() => {
@@ -372,6 +419,7 @@ const labels = {
   quality_pending: '代码已生成，等待独立验证',
   quality_running: 'Test Engineer 正在独立验证',
   completed: '构建和质量验证已完成',
+  quality_challenge: '验收规则需要你确认',
   quality_failed: '质量验证未通过',
 }
 const postApproval = computed(
@@ -451,6 +499,9 @@ const agentText = computed(() => {
         status.value.error ||
         '业务代码已写入，但独立验收还没有完成。可继续处理，不会丢掉已生成的代码。'
       )
+    }
+    if (status.value?.state === 'quality_challenge') {
+      return '冻结验收规则与已批准需求出现冲突，需要你选择继续修代码还是修订产品意图。'
     }
     if (status.value?.state === 'quality_failed') {
       return status.value.error || '独立验收发现问题，当前版本未标记为可用。'
@@ -547,6 +598,7 @@ watch(
         state === 'quality_pending' ||
         state === 'quality_running' ||
         state === 'completed' ||
+        state === 'quality_challenge' ||
         state === 'quality_failed')
     ) {
       autoOpenedWorkspace = true
@@ -958,6 +1010,59 @@ summary:focus-visible {
 .secondary {
   background: transparent;
   color: var(--accent);
+}
+.challenge-card {
+  padding: 16px;
+  border: 1px solid #e0d6b7;
+  border-radius: 14px;
+  margin: 14px 0;
+  background: #fffaf0;
+  color: #4f4939;
+  line-height: 1.7;
+
+  > p {
+    margin: 6px 0 10px;
+  }
+
+  .challenge-limit {
+    color: #a15c22;
+    font-weight: 600;
+  }
+
+  ul {
+    margin: 0 0 12px;
+    padding-left: 18px;
+  }
+
+  li + li {
+    margin-top: 8px;
+  }
+
+  li span {
+    display: block;
+    color: #6c6657;
+  }
+
+  label {
+    display: grid;
+    gap: 6px;
+    font-size: 12px;
+  }
+
+  textarea {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 9px;
+    border: 1px solid #d8cfb6;
+    border-radius: 8px;
+    resize: vertical;
+    background: white;
+  }
+}
+.challenge-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
 }
 .resume-card,
 .clarification {

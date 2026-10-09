@@ -186,6 +186,14 @@ class PreviewServiceTests(unittest.TestCase):
             self.assertTrue((workspace / "forgeai/design/revisions/000002.json").is_file())
             self.assertTrue((workspace / "forgeai/design/current.json").is_file())
 
+    def test_design_selector_accepts_preview_bridge_child_combinators(self) -> None:
+        selector = "body > main:nth-of-type(1) > section:nth-of-type(1) > h1:nth-of-type(1)"
+        override = preview_design.PreviewElementOverride(selector=selector)
+
+        self.assertEqual(override.selector, selector)
+        with self.assertRaises(ValueError):
+            preview_design.PreviewElementOverride(selector="body > <script>")
+
     def test_design_rejects_unfinished_build(self) -> None:
         with (
             patch.object(preview_design.project_service, "get_user_project"),

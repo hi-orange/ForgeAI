@@ -22,7 +22,7 @@ from app.models.project_message import ProjectMessage
 from app.models.project_message_classification import ProjectMessageClassification
 from app.models.task import Task, TaskRecipient
 from app.models.user import User
-from app.schemas.agent_action import ChatWithToolsResult, ToolCall
+from app.schemas.agent_action import ChatWithToolsResult, ToolCall, inline_model_json_schema
 from app.schemas.app_spec import APP_SPEC_SCHEMA_VERSION, AppSpec
 from app.schemas.product_manager import (
     MAX_HISTORY_CHARS,
@@ -107,7 +107,10 @@ class ProductManagerAgentTests(unittest.TestCase):
             product_manager_agent.PRODUCT_MANAGER_PROFILE.allowed_tools,
         )
         write_prd = next(tool for tool in request["tools"] if tool.name == "write_prd")
-        self.assertEqual(write_prd.parameters["properties"]["prd"], AppSpec.model_json_schema())
+        self.assertEqual(
+            write_prd.parameters["properties"]["prd"],
+            inline_model_json_schema(AppSpec),
+        )
         self.assertIn("不自动等于用户确认", request["messages"][0]["content"])
 
     def test_research_editor_and_write_prd_use_bounded_role_tools(self):

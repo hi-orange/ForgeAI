@@ -158,7 +158,14 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
                 self.run.run_id,
                 approved_id,
             )
-            self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
+            self.assertEqual(delivery.input_configuration_item_ids[0], approved_id)
+            frozen_tests = db.scalar(
+                select(ConfigurationItem).where(
+                    ConfigurationItem.item_id == delivery.input_configuration_item_ids[1]
+                )
+            )
+            assert frozen_tests is not None
+            self.assertEqual(frozen_tests.semantic_type, "acceptance_test_plan")
             self.leader.assert_called_once()
 
     def test_migration_repairs_plan_when_all_tasks_already_succeeded(self):
@@ -216,7 +223,13 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
                 db, self.owner, self.project.id, self.run.run_id, approved_id
             )
             self.assertEqual(delivery.recipient, "Code Engineer")
-            self.assertEqual(delivery.input_configuration_item_ids, [approved_id])
+            self.assertEqual(delivery.input_configuration_item_ids[0], approved_id)
+            frozen_test_item_id = delivery.input_configuration_item_ids[1]
+            frozen_tests = db.scalar(
+                select(ConfigurationItem).where(ConfigurationItem.item_id == frozen_test_item_id)
+            )
+            assert frozen_tests is not None
+            self.assertEqual(frozen_tests.semantic_type, "acceptance_test_plan")
             _, execution = claim_code_engineer_task(
                 db,
                 self.owner,
@@ -226,6 +239,8 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
             )
             snapshot = read_frozen_input_snapshot(execution)
             assert snapshot is not None
+            self.assertEqual(snapshot["acceptance_test_plan_item_id"], frozen_test_item_id)
+            self.assertEqual(snapshot["acceptance_test_hash"], frozen_tests.content_hash)
             self.assertEqual(snapshot["delivery_path"], "direct")
             self.assertIsNone(snapshot["design_item_id"])
             self.assertIsNone(snapshot["system_design"])

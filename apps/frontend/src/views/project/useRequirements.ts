@@ -22,6 +22,7 @@ export function useRequirements(projectId: number) {
   const planItems = ref<RequirementPlanItem[]>([])
   let draftItemId: string | null = null
   let lastApproval: { signature: string; key: string } | null = null
+  let lastChallengeRevision: { reportId: string; content: string; key: string } | null = null
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let inFlight: Promise<void> | null = null
@@ -76,20 +77,38 @@ export function useRequirements(projectId: number) {
   function needsAcceptance(item: RequirementPlanItem) {
     if (item.kind !== 'feature' || !item.checked) return false
     const spec = status.value?.app_spec
-    // PM already attached acceptance — do not open a per-row "怎样算完成" editor.
-    if (spec?.acceptance_criteria.some((criterion) => criterion.source_ids.includes(item.id))) {
-      return false
-    }
-    const original = spec?.features.find((feature) => feature.id === item.id)
-    // Unchanged PM suggestion: keep checklist clean even if AC was omitted.
-    if (original && original.text === item.label.trim()) return false
-    return !item.acceptance?.trim()
+    if (!spec) return true
+    const original = spec.features.find((feature) => feature.id === item.id)
+    // A new or edited feature changes product intent, so its previous acceptance text cannot be
+    // silently reused. Keep this true after the user fills the field so approve() includes it.
+    if (!original || original.text !== item.label.trim()) return true
+
+    const matching = spec.acceptance_criteria.filter((criterion) =>
+      criterion.source_ids.includes(item.id),
+    )
+    // Preserve an unchanged PM suggestion even for legacy drafts that omitted an AC.
+    if (!matching.length) return false
+
+    // A joint criterion is only reusable while every feature source remains selected and unchanged.
+    // Removing or editing one source changes the meaning of the criterion for the remaining rows.
+    const hasCompatibleCriterion = matching.some((criterion) =>
+      criterion.source_ids.every((sourceId) => {
+        const source = planItems.value.find((candidate) => candidate.id === sourceId)
+        if (!source) return true
+        const sourceOriginal = spec.features.find((feature) => feature.id === sourceId)
+        return Boolean(
+          source.checked && sourceOriginal && source.label.trim() === sourceOriginal.text,
+        )
+      }),
+    )
+    return !hasCompatibleCriterion
   }
 
   const canResume = computed(
     () =>
       status.value?.state === 'pending' ||
-      status.value?.state === 'retry_available' ||
+      (status.value?.state === 'retry_available' && status.value.retryable !== false) ||
+      (status.value?.state === 'quality_failed' && status.value.retryable !== false) ||
       (status.value?.state === 'ready_for_delivery' && !busy.value) ||
       (['design_pending', 'engineering_pending', 'quality_pending'].includes(
         status.value?.state ?? '',
@@ -151,6 +170,7 @@ export function useRequirements(projectId: number) {
           'engineering_running',
           'quality_running',
           'completed',
+          'quality_challenge',
           'quality_failed',
         ].includes(current.state)
       ) {
@@ -245,6 +265,24 @@ export function useRequirements(projectId: number) {
     loadPlan(status.value)
   }
 
+  async function advanceSavedDelivery() {
+    const advanceable = new Set([
+      'ready_for_delivery',
+      'design_pending',
+      'engineering_pending',
+      'quality_pending',
+    ])
+    let previous = ''
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const current = status.value
+      if (!current?.run_id || !advanceable.has(current.state)) return
+      const identity = [current.state, current.plan_id, current.task_id].join(':')
+      if (identity === previous) return
+      previous = identity
+      await continueOnce()
+    }
+  }
+
   async function pause() {
     const current = status.value
     if (!current?.run_id || !canPause.value || pausing.value || disposed) return
@@ -298,6 +336,49 @@ export function useRequirements(projectId: number) {
     })
   }
 
+  async function resolveChallenge(action: 'repair_code' | 'revise_product', content = '') {
+    const current = status.value
+    const reportId = current?.test_report_item_id
+    if (current?.state !== 'quality_challenge' || !current.run_id || !reportId || busy.value) return
+
+    let payload: api.QualityChallengeResolution
+    if (action === 'revise_product') {
+      const revision = content.trim()
+      if (!revision) {
+        error.value = '请先说明需要修改的产品行为、边界或验收标准'
+        return
+      }
+      if (
+        !lastChallengeRevision ||
+        lastChallengeRevision.reportId !== reportId ||
+        lastChallengeRevision.content !== revision
+      ) {
+        lastChallengeRevision = {
+          reportId,
+          content: revision,
+          key: crypto.randomUUID(),
+        }
+      }
+      payload = {
+        action,
+        content: revision,
+        client_message_id: lastChallengeRevision.key,
+      }
+    } else {
+      payload = { action }
+    }
+
+    await perform(async () => {
+      status.value = await api.resolveQualityChallenge(
+        projectId,
+        current.run_id!,
+        reportId,
+        payload,
+      )
+      loadPlan(status.value)
+      lastChallengeRevision = null
+    })
+  }
   onMounted(async () => {
     try {
       const project = await api.getRequirementsProject(projectId)
@@ -305,6 +386,15 @@ export function useRequirements(projectId: number) {
       name.value = project.name
       await refresh()
       if (disposed) return
+      if (
+        status.value &&
+        ['ready_for_delivery', 'design_pending', 'engineering_pending', 'quality_pending'].includes(
+          status.value.state,
+        )
+      ) {
+        await perform(advanceSavedDelivery)
+        return
+      }
       if (status.value?.state !== 'not_started') return
       if (!messages.value.some((message) => message.sender === 'user') && !project.prompt?.trim()) {
         return
@@ -336,6 +426,7 @@ export function useRequirements(projectId: number) {
     addPlanItem,
     needsAcceptance,
     approve,
+    resolveChallenge,
     canWrite,
     canResume,
     canRetryStart,

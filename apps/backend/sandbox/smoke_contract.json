@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "top_level_fields": [
+    "version",
+    "visual_contract",
+    "api_checks",
+    "browser_checks"
+  ],
+  "browser": {
+    "default_viewport": {
+      "width": 1440,
+      "height": 900
+    },
+    "viewport": {
+      "width": {
+        "type": "integer",
+        "minimum": 240,
+        "maximum": 2560
+      },
+      "height": {
+        "type": "integer",
+        "minimum": 320,
+        "maximum": 2160
+      }
+    },
+    "actions": {
+      "click": {
+        "fields": {
+          "selector": {
+            "type": "string",
+            "min_length": 1
+          }
+        }
+      },
+      "fill": {
+        "fields": {
+          "selector": {
+            "type": "string",
+            "min_length": 1
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "select": {
+        "fields": {
+          "selector": {
+            "type": "string",
+            "min_length": 1
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "navigate": {
+        "fields": {
+          "url": {
+            "type": "local_path"
+          }
+        }
+      },
+      "wait_for_selector": {
+        "fields": {
+          "selector": {
+            "type": "string",
+            "min_length": 1
+          }
+        }
+      },
+      "expect_text": {
+        "fields": {
+          "text": {
+            "type": "string",
+            "min_length": 1
+          }
+        }
+      },
+      "expect_any_text": {
+        "fields": {
+          "texts": {
+            "type": "string_array",
+            "min_items": 2,
+            "max_items": 10,
+            "item_min_length": 1
+          }
+        }
+      },
+      "expect_path": {
+        "fields": {
+          "path": {
+            "type": "local_path"
+          }
+        }
+      },
+      "expect_count": {
+        "fields": {
+          "selector": {
+            "type": "string",
+            "min_length": 1
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          }
+        }
+      },
+      "expect_no_horizontal_scroll": {
+        "fields": {}
+      },
+      "screenshot": {
+        "fields": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          }
+        }
+      }
+    }
+  }
+}

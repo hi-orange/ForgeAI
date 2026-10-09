@@ -1,5 +1,7 @@
 """Trusted check controller, baked into the image; never copied from generated source."""
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -19,11 +21,16 @@ TEMPLATE_FRONTEND_MODULES = Path("/opt/frontend/node_modules")
 TEMPLATE_THEME_FILE = Path("/opt/frontend/index.css")
 TEMPLATE_BACKEND_PYPROJECT = Path("/opt/backend/pyproject.toml")
 SMOKE_MANIFEST = ROOT / "forgeai.smoke.json"
+SMOKE_CONTRACT_PATH = Path(__file__).with_name("smoke_contract.json")
 SMOKE_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
-SMOKE_ACTIONS = {"click", "fill", "select", "expect_text", "expect_path"}
+SMOKE_CONTRACT = json.loads(SMOKE_CONTRACT_PATH.read_text(encoding="utf-8"))
+BROWSER_CONTRACT = SMOKE_CONTRACT["browser"]
+SMOKE_ACTIONS = BROWSER_CONTRACT["actions"]
 VARIABLE_PATTERN = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_]*)\}")
 CSS_VARIABLE_PATTERN = re.compile(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;]+);")
 REQUIRED_THEME_TOKENS = {"--color-primary", "--color-accent", "--color-muted"}
+BINARY_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 
 
 def command(argv, cwd, timeout=90):
@@ -32,12 +39,35 @@ def command(argv, cwd, timeout=90):
 
 
 def materialize(files):
+    if not isinstance(files, dict):
+        raise ValueError("Invalid source payload")
     for name, content in files.items():
+        if not isinstance(name, str):
+            raise ValueError("Invalid source path")
         path = ROOT / name
         if path.is_absolute() and not path.resolve().is_relative_to(ROOT):
             raise ValueError("Invalid source path")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        if isinstance(content, str):
+            path.write_text(content, encoding="utf-8")
+            continue
+        relative = path.resolve().relative_to(ROOT)
+        if (
+            not isinstance(content, dict)
+            or content.get("encoding") != "base64"
+            or not isinstance(content.get("content"), str)
+            or len(relative.parts) < 3
+            or relative.parts[:2] != ("frontend", "public")
+            or path.suffix.lower() not in BINARY_ASSET_SUFFIXES
+        ):
+            raise ValueError("Invalid binary source")
+        try:
+            payload = base64.b64decode(content["content"], validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Invalid binary source") from exc
+        if not payload or len(payload) > MAX_BINARY_ASSET_BYTES:
+            raise ValueError("Invalid binary source")
+        path.write_bytes(payload)
     os.environ["DATABASE_URL"] = f"sqlite:///{DATABASE}"
     os.environ["DEBUG"] = "false"
 
@@ -212,6 +242,48 @@ def _source_path(value):
     return candidate
 
 
+def _validate_contract_object(value, fields, label, *, extra_fields=()):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须是对象")
+    allowed = {*fields, *extra_fields}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"{label} 包含契约外字段：{', '.join(unknown)}")
+    for name, rule in fields.items():
+        if name not in value:
+            raise ValueError(f"{label} 缺少字段：{name}")
+        item = value[name]
+        kind = rule.get("type")
+        if kind == "string":
+            if not isinstance(item, str) or len(item) < int(rule.get("min_length", 0)):
+                raise ValueError(f"{label}.{name} 必须是有效字符串")
+            pattern = rule.get("pattern")
+            if pattern and re.fullmatch(pattern, item) is None:
+                raise ValueError(f"{label}.{name} 格式无效")
+        elif kind == "string_array":
+            minimum = int(rule.get("min_items", 0))
+            maximum = int(rule.get("max_items", len(item) if isinstance(item, list) else 0))
+            item_minimum = int(rule.get("item_min_length", 0))
+            if (
+                not isinstance(item, list)
+                or not minimum <= len(item) <= maximum
+                or not all(
+                    isinstance(candidate, str) and len(candidate) >= item_minimum
+                    for candidate in item
+                )
+            ):
+                raise ValueError(f"{label}.{name} 必须是有效字符串数组")
+        elif kind == "local_path":
+            _validate_local_path(item)
+        elif kind == "integer":
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError(f"{label}.{name} 必须是整数")
+            if item < int(rule.get("minimum", item)) or item > int(rule.get("maximum", item)):
+                raise ValueError(f"{label}.{name} 超出允许范围")
+        else:
+            raise ValueError(f"平台检查契约字段类型无效：{kind}")
+
+
 def _css_variables(content):
     return {
         name: re.sub(r"\s+", " ", value.strip()).lower()
@@ -227,6 +299,9 @@ def load_smoke_manifest():
     manifest = json.loads(SMOKE_MANIFEST.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or manifest.get("version") != 1:
         raise ValueError("forgeai.smoke.json 必须是 version=1 的对象")
+    unknown_top_level = sorted(set(manifest) - set(SMOKE_CONTRACT["top_level_fields"]))
+    if unknown_top_level:
+        raise ValueError("forgeai.smoke.json 包含未授权顶层字段：" + ", ".join(unknown_top_level))
     api_checks = manifest.get("api_checks")
     browser_checks = manifest.get("browser_checks")
     if not isinstance(api_checks, list) or not 1 <= len(api_checks) <= 50:
@@ -306,6 +381,9 @@ def load_smoke_manifest():
             raise ValueError(f"联调项 id 重复：{check['id']}")
         seen.add(check["id"])
         _validate_local_path(check.get("route"))
+        viewport = check.get("viewport")
+        if viewport is not None:
+            _validate_contract_object(viewport, BROWSER_CONTRACT["viewport"], "browser viewport")
         expect_api = check.get("expect_api", [])
         if not isinstance(expect_api, list) or not expect_api:
             raise ValueError(f"浏览器联调项 {check['id']} 必须声明 expect_api")
@@ -323,19 +401,12 @@ def load_smoke_manifest():
             if not isinstance(action, dict) or action.get("type") not in SMOKE_ACTIONS:
                 raise ValueError(f"浏览器动作无效：{action!r}")
             action_type = action["type"]
-            required = {
-                "click": ("selector",),
-                "fill": ("selector", "value"),
-                "select": ("selector", "value"),
-                "expect_text": ("text",),
-                "expect_path": ("path",),
-            }[action_type]
-            if any(
-                not isinstance(action.get(field), str) or not action[field] for field in required
-            ):
-                raise ValueError(f"浏览器动作 {action_type} 缺少字符串字段：{required}")
-            if action_type == "expect_path":
-                _validate_local_path(action["path"])
+            _validate_contract_object(
+                action,
+                SMOKE_ACTIONS[action_type]["fields"],
+                f"浏览器动作 {action_type}",
+                extra_fields=("type",),
+            )
     return manifest
 
 
@@ -362,7 +433,10 @@ def validate_visual_contract(manifest):
         return
     theme_mode = contract["theme_mode"]
     if theme_mode == "template":
-        raise ValueError("业务应用必须选择 custom 主题或按已批准视觉意图 preserve 当前主题")
+        raise ValueError(
+            "forgeai.smoke.json 的 visual_contract.theme_mode 不能为 template："
+            "新视觉使用 custom；用户明确要求保留已批准配色时使用 preserve"
+        )
     if theme_mode == "preserve":
         return
     baseline_variables = _css_variables(TEMPLATE_THEME_FILE.read_text(encoding="utf-8"))
@@ -391,9 +465,25 @@ def _render_variables(value, variables):
     return value
 
 
+def _json_path_parts(path):
+    value = str(path).strip()
+    if not value:
+        raise ValueError("JSON 路径不能为空")
+    if value == "$":
+        return []
+    if value.startswith("$"):
+        value = value[1:]
+    value = re.sub(r"\[(\d+)\]", r".\1", value)
+    value = value.removeprefix(".")
+    parts = value.split(".") if value else []
+    if any(not part for part in parts) or any("[" in part or "]" in part for part in parts):
+        raise ValueError(f"JSON 路径格式无效：{path}")
+    return parts
+
+
 def _json_path(document, path):
     current = document
-    for part in path.split("."):
+    for part in _json_path_parts(path):
         if isinstance(current, dict) and part in current:
             current = current[part]
         elif isinstance(current, list) and part.isdigit() and int(part) < len(current):

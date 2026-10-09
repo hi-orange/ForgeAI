@@ -10,7 +10,7 @@ router = APIRouter(prefix="/projects/{project_id}/workspace", tags=["workspace"]
 
 @router.get("", response_model=ApiResponse[WorkspaceListing])
 def get_workspace(project_id: int, db: DbSession, current_user: CurrentUser) -> dict:
-    """List text files in the materialized engineering workspace for this project."""
+    """List text and image files in the materialized engineering workspace."""
     return success(workspace_files_service.list_project_workspace(db, current_user, project_id))
 
 
@@ -21,7 +21,7 @@ def get_workspace_file(
     current_user: CurrentUser,
     path: str = Query(min_length=1, max_length=512),
 ) -> dict:
-    """Read one text file from the engineering workspace (path-safe, size-capped)."""
+    """Read one workspace file (UTF-8 text or base64 image; path-safe, size-capped)."""
     return success(
         workspace_files_service.read_project_workspace_file(db, current_user, project_id, path)
     )

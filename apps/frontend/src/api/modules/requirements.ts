@@ -45,6 +45,17 @@ export type EngineeringActivity = {
   work_item_title?: string
 }
 
+export type TestChallenge = {
+  challenge_id: string
+  test_ids: string[]
+  reason: string
+  requested_resolution: string
+}
+
+export type QualityChallengeResolution =
+  | { action: 'repair_code' }
+  | { action: 'revise_product'; content: string; client_message_id: string }
+
 export type RequirementsStatus = {
   project_id: number
   run_id: string | null
@@ -68,16 +79,19 @@ export type RequirementsStatus = {
     | 'quality_pending'
     | 'quality_running'
     | 'completed'
+    | 'quality_challenge'
     | 'quality_failed'
   execution_id: string | null
   execution_expires_at: string | null
   error: string | null
+  retryable?: boolean
   result: RequirementsResult | null
   app_spec: AppSpec | null
   workspace_ready?: boolean
   code_ready?: boolean
   code_item_id?: string | null
   test_report_item_id?: string | null
+  test_challenges?: TestChallenge[]
   workspace_path?: string | null
   activities?: EngineeringActivity[]
 }
@@ -146,6 +160,22 @@ export function pauseBuildRun(id: number, runId: string) {
   })
 }
 
+export function resolveQualityChallenge(
+  id: number,
+  runId: string,
+  reportItemId: string,
+  payload: QualityChallengeResolution,
+) {
+  const path =
+    '/api/v1/projects/' +
+    id +
+    '/build-runs/' +
+    runId +
+    '/quality-reports/' +
+    reportItemId +
+    '/challenge-resolution'
+  return apiRequest<RequirementsStatus>(path, { method: 'POST', body: payload })
+}
 export function approveRequirements(
   id: number,
   runId: string,

@@ -87,7 +87,13 @@ class PreviewElementOverride(BaseModel):
     @classmethod
     def validate_selector(cls, value: str) -> str:
         normalized = value.strip()
-        if any(token in normalized for token in ("<", ">", "{", "}")):
+        # The preview bridge generates paths with the standard CSS child
+        # combinator (for example, body > main > h1). The greater-than sign is
+        # therefore expected input, not markup. Keep breakout characters and
+        # unsupported control characters rejected.
+        if any(token in normalized for token in ("<", "{", "}")) or any(
+            ord(character) < 32 and character not in {"\t", "\n", "\r"} for character in normalized
+        ):
             raise ValueError("invalid selector")
         return normalized
 

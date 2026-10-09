@@ -19,6 +19,8 @@ cd apps/backend && uv sync
 pnpm dev
 ```
 
+The backend development task applies pending Alembic migrations before starting Uvicorn.
+
 - Frontend: http://localhost:5173
 - Backend: http://localhost:8000
 

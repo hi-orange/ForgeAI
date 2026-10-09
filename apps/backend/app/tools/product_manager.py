@@ -8,12 +8,17 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.core.exceptions import BusinessException
-from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
+from app.schemas.agent_action import (
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionResult,
+    inline_model_json_schema,
+)
 from app.schemas.app_spec import AppSpec
 from app.schemas.product_manager import ProductManagerInput
 from app.tools import web_research
 
-_PRD_SCHEMA = AppSpec.model_json_schema()
+_PRD_SCHEMA = inline_model_json_schema(AppSpec)
 
 PRODUCT_MANAGER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(

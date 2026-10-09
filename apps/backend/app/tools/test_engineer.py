@@ -9,19 +9,26 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.core.exceptions import BusinessException, ConflictException
-from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
+from app.schemas.acceptance_test_plan import AcceptanceTestPlan
+from app.schemas.agent_action import (
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionResult,
+    inline_model_json_schema,
+)
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import (
     DefectRecord,
     TestReport,
+    TestVerification,
     VerificationStatus,
 )
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
 
-_DEFECT_SCHEMA = DefectRecord.model_json_schema()
-_TEST_REPORT_SCHEMA = TestReport.model_json_schema()
+_DEFECT_SCHEMA = inline_model_json_schema(DefectRecord)
+_TEST_REPORT_SCHEMA = inline_model_json_schema(TestReport)
 QUALITY_PROGRESS_SCHEMA_VERSION = 1
 MAX_CHECKPOINT_OUTPUT_CHARS = 8_000
 _NON_REUSABLE_CHECK_ERRORS = frozenset(
@@ -42,7 +49,7 @@ TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
             "properties": {
                 "artifact": {
                     "type": "string",
-                    "enum": ["app_spec", "system_design", "code"],
+                    "enum": ["app_spec", "system_design", "acceptance_test_plan", "code"],
                 }
             },
             "required": ["artifact"],
@@ -149,6 +156,9 @@ class TestEngineerToolState:
     code_source_hash: str
     workspace_root: Path
     system_design: SystemDesign | None = None
+    acceptance_test_plan_item_id: str | None = None
+    acceptance_test_hash: str | None = None
+    acceptance_test_plan: AcceptanceTestPlan | None = None
     checks: dict[str, ToolExecutionResult] = field(default_factory=dict)
     defects: dict[str, DefectRecord] = field(default_factory=dict)
     explore_before_check: int = 0
@@ -179,6 +189,8 @@ def export_test_engineer_progress(state: TestEngineerToolState) -> dict[str, Any
         "schema_version": QUALITY_PROGRESS_SCHEMA_VERSION,
         "code_item_id": state.code_item_id,
         "source_hash": state.code_source_hash,
+        "test_plan_item_id": state.acceptance_test_plan_item_id,
+        "test_hash": state.acceptance_test_hash,
         "checks": checks,
         "defects": [defect.model_dump(mode="json") for defect in state.defects.values()],
         "explore_before_check": state.explore_before_check,
@@ -195,6 +207,8 @@ def restore_test_engineer_progress(
         progress.get("schema_version") != QUALITY_PROGRESS_SCHEMA_VERSION
         or progress.get("code_item_id") != state.code_item_id
         or progress.get("source_hash") != state.code_source_hash
+        or progress.get("test_plan_item_id") != state.acceptance_test_plan_item_id
+        or progress.get("test_hash") != state.acceptance_test_hash
     ):
         return
     raw_checks = progress.get("checks")
@@ -255,6 +269,59 @@ def _validated_report(call: ToolCall, state: TestEngineerToolState) -> TestRepor
         state.code_source_hash,
     ):
         raise BusinessException("测试报告引用的不是本轮准确代码结果")
+    if state.acceptance_test_plan is not None:
+        if not report.test_results:
+            requirement_results = {item.requirement_id: item for item in report.requirement_results}
+            all_check = state.checks.get("all")
+            synthesized: list[TestVerification] = []
+            for test in state.acceptance_test_plan.tests:
+                try:
+                    linked = [requirement_results[item_id] for item_id in test.acceptance_ids]
+                except KeyError as exc:
+                    raise BusinessException("测试报告必须逐条覆盖 PRD 验收条件") from exc
+                statuses = {item.status for item in linked}
+                if VerificationStatus.FAILED in statuses:
+                    status = VerificationStatus.FAILED
+                elif statuses & {VerificationStatus.BLOCKED, VerificationStatus.NOT_RUN}:
+                    status = VerificationStatus.BLOCKED
+                else:
+                    status = VerificationStatus.PASSED
+                synthesized.append(
+                    TestVerification(
+                        test_id=test.test_id,
+                        acceptance_ids=list(test.acceptance_ids),
+                        check_id="all",
+                        status=status,
+                        command=test.command,
+                        evidence=(
+                            "; ".join(item.evidence for item in linked)
+                            + f"；runner={all_check.summary if all_check else 'missing'}"
+                        ),
+                    )
+                )
+            payload = report.model_dump(mode="json")
+            payload.update(
+                test_plan_item_id=state.acceptance_test_plan_item_id,
+                test_hash=state.acceptance_test_hash,
+                test_results=[item.model_dump(mode="json") for item in synthesized],
+                regression_test_ids=[item.test_id for item in synthesized],
+            )
+            report = TestReport.model_validate(payload)
+        if (report.test_plan_item_id, report.test_hash) != (
+            state.acceptance_test_plan_item_id,
+            state.acceptance_test_hash,
+        ):
+            raise BusinessException("测试报告引用的不是本轮冻结测试计划")
+        planned = {item.test_id: item for item in state.acceptance_test_plan.tests}
+        reported = {item.test_id: item for item in report.test_results}
+        if set(reported) != set(planned):
+            raise BusinessException("测试报告必须逐条覆盖冻结验收测试")
+        for test_id, planned_test in planned.items():
+            evidence = reported[test_id]
+            if evidence.acceptance_ids != planned_test.acceptance_ids:
+                raise BusinessException(f"测试 {test_id} 的验收映射与冻结计划不一致")
+            if evidence.command != planned_test.command:
+                raise BusinessException(f"测试 {test_id} 的执行命令与冻结计划不一致")
     acceptance_ids = {item.id for item in state.app_spec.acceptance_criteria}
     reported_ids = {item.requirement_id for item in report.requirement_results}
     if reported_ids != acceptance_ids:
@@ -346,6 +413,14 @@ def execute_test_engineer_tool(
                 data = {
                     "code_item_id": state.code_item_id,
                     "source_hash": state.code_source_hash,
+                }
+            elif artifact == "acceptance_test_plan":
+                if state.acceptance_test_plan is None:
+                    raise BusinessException("本轮没有冻结 acceptance_test_plan 输入")
+                data = {
+                    "test_plan_item_id": state.acceptance_test_plan_item_id,
+                    "test_hash": state.acceptance_test_hash,
+                    "acceptance_test_plan": state.acceptance_test_plan.model_dump(mode="json"),
                 }
             else:
                 raise BusinessException("未知成果类型")

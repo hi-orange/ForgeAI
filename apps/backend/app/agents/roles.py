@@ -18,7 +18,9 @@ class AgentRoleProfile:
 ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
     TaskRecipient.PRODUCT_MANAGER: AgentRoleProfile(
         display_name=TaskRecipient.PRODUCT_MANAGER.value,
-        goal=("重述需求并产出短功能勾选清单与可观察验收；条数与条目随产品而定，不做市场调研专章。"),
+        goal=(
+            "重述需求并产出完整能力勾选清单与可观察验收；条数与条目随产品而定，不做市场调研专章。"
+        ),
         deliverables=("app_spec",),
         allowed_tools=frozenset(
             {
@@ -58,6 +60,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
                 "write_new_code",
                 "edit_file_by_replace",
                 "record_engineering_memory",
+                "generate_image",
                 "install_project_dependency",
                 "run_check",
                 "complete_work_item",

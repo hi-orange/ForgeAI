@@ -35,14 +35,24 @@ from app.services.engineering.handoff import load_approved_app_spec
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
+from app.tools import images as image_tools
 from app.tools import project_deps as project_deps_tools
-from app.tools.paths import is_text_file, safe_path_under_root
+from app.tools.check_diagnostics import analyze_check_failure
+from app.tools.paths import is_text_file, safe_path_under_root, sha256_bytes
 
 CHECKPOINT_KIND = "engineering_checkpoint"
-CHECKPOINT_SCHEMA_VERSION = 4
-EXECUTION_MODE = "planned_files_v1"
+CHECKPOINT_SCHEMA_VERSION = 7
+EXECUTION_MODE = "planned_files_v4"
 MAX_CONTEXT_FILES = 160
 MAX_PLAN_HISTORY = 24
+MAX_IDENTICAL_CHECK_FAILURES = 3
+MAX_UNCHANGED_SOURCE_FAILURES = 3
+PROTECTED_ACCEPTANCE_PATHS = (
+    "backend/tests/acceptance/",
+    "frontend/src/acceptance/",
+    "frontend/e2e/",
+    "forgeai.acceptance.json",
+)
 
 SessionFactory = Callable[[], Session]
 
@@ -126,6 +136,7 @@ def _new_checkpoint() -> dict[str, Any]:
         "deferred_file_plan": [],
         "plan_history": [],
         "repair_rounds": {},
+        "failure_streaks": {},
         "repair_context": None,
         "model_turns": 0,
         "writer_model_calls": 0,
@@ -154,6 +165,7 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
         ("deferred_file_plan", []),
         ("plan_history", []),
         ("repair_rounds", {}),
+        ("failure_streaks", {}),
         ("repair_context", None),
         ("model_turns", 0),
         ("writer_model_calls", 0),
@@ -172,6 +184,8 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
             observations=[],
             active_file_plan=None,
             active_plan_kind=None,
+            failure_streaks={},
+            repair_rounds={},
             repair_context=None,
             migrated_from_controller=True,
         )
@@ -188,35 +202,34 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
-    """Make an explicit recovery attempt runnable from its last real evidence."""
+    """Make an explicit user recovery attempt runnable from its last real evidence."""
 
     if checkpoint.get("outcome") != "blocked":
         return False
     reason = str(checkpoint.get("blocked_reason") or "")
+    reason_code = str(checkpoint.get("blocked_reason_code") or "")
+    terminal_check_failure = reason_code in {
+        "REPEATED_CHECK_FAILURE",
+        "REPAIR_BUDGET_EXHAUSTED",
+        "NO_SOURCE_PROGRESS",
+    } or ("自动修复轮次已用尽" in reason)
+    if terminal_check_failure:
+        # Do not let a button click erase identical-failure memory forever. A newer
+        # executor version may recover an old checkpoint once; after that the user
+        # must change the input/source instead of paying for the same loop again.
+        if checkpoint.get("blocked_executor_runtime_version") == EXECUTION_MODE:
+            return False
+        current_item_id = str(checkpoint.get("current_work_item_id") or "")
+        for key in ("failure_streaks", "repair_rounds"):
+            values = checkpoint.get(key)
+            if isinstance(values, dict):
+                values.pop(current_item_id, None)
     checkpoint["outcome"] = "running"
     checkpoint["blocked_reason"] = None
     checkpoint.pop("blocked_reason_code", None)
+    checkpoint.pop("blocked_check_runtime_version", None)
     checkpoint.pop("last_error", None)
 
-    if "自动修复轮次已用尽" in reason:
-        current = _current_item(checkpoint.get("work_items") or [])
-        history = checkpoint.get("plan_history")
-        latest = history[-1] if isinstance(history, list) and history else None
-        failed_check = latest.get("check") if isinstance(latest, dict) else None
-        previous_plan = latest.get("plan") if isinstance(latest, dict) else None
-        if current is not None and isinstance(failed_check, dict):
-            rounds = checkpoint.get("repair_rounds")
-            rounds = rounds if isinstance(rounds, dict) else {}
-            rounds[str(current.get("id") or "")] = 1
-            checkpoint["repair_rounds"] = rounds
-            checkpoint["repair_context"] = {
-                "round": 1,
-                "failed_check": failed_check,
-                "previous_plan": previous_plan,
-                "modified_files": list(checkpoint.get("modified_files") or []),
-            }
-            checkpoint["active_file_plan"] = None
-            checkpoint["active_plan_kind"] = None
     return True
 
 
@@ -284,12 +297,21 @@ def _append_activity(
 
 
 def _block_checkpoint(
-    checkpoint: dict[str, Any], reason: str, *, reason_code: str | None = None
+    checkpoint: dict[str, Any],
+    reason: str,
+    *,
+    reason_code: str | None = None,
+    check_runtime_version: str | None = None,
 ) -> None:
     checkpoint["outcome"] = "blocked"
     checkpoint["blocked_reason"] = reason[:500]
     if reason_code:
         checkpoint["blocked_reason_code"] = reason_code
+    checkpoint["blocked_executor_runtime_version"] = EXECUTION_MODE
+    if check_runtime_version:
+        checkpoint["blocked_check_runtime_version"] = check_runtime_version
+    else:
+        checkpoint.pop("blocked_check_runtime_version", None)
     _append_activity(checkpoint, name="error", label="Blocked", detail=reason, ok=False)
 
 
@@ -311,8 +333,22 @@ def _normalize_plan(root: Path, plan: ImplementationPlan) -> ImplementationPlan:
             raise BusinessException(f"实施计划包含重复任务 id：{task.id}")
         seen_ids.add(task.id)
         path = task.path.replace("\\", "/").strip()
+        if any(path == prefix or path.startswith(prefix) for prefix in PROTECTED_ACCEPTANCE_PATHS):
+            raise BusinessException(f"Code Engineer 不能修改平台冻结的验收测试资产：{path}")
         target = safe_path_under_root(root, path, allow_create=True)
-        if not is_text_file(target if target.exists() else Path(path)):
+        if Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            task = task.model_copy(update={"kind": "image"})
+        if task.kind == "image":
+            if not settings.image_generation_enabled:
+                raise BusinessException("实施计划请求生成图片，但平台未配置 ARK_API_KEY")
+            if not path.startswith("frontend/public/") or Path(path).suffix.lower() not in {
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+            }:
+                raise BusinessException(f"图片任务必须使用 frontend/public/ 下的图片路径：{path}")
+        elif not is_text_file(target if target.exists() else Path(path)):
             raise BusinessException(f"实施计划包含不可编辑文件：{path}")
         if path in seen:
             raise BusinessException(f"实施计划包含重复目标文件：{path}")
@@ -373,6 +409,9 @@ def _promote_deferred_batch(
     return plan, remaining
 
 
+_IMAGE_CONTEXT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
+
+
 def _platform_file_context(root: Path, task: FileTask) -> tuple[dict[str, Any], str | None, int]:
     """Read the target and direct contracts without spending controller turns."""
 
@@ -386,6 +425,25 @@ def _platform_file_context(root: Path, task: FileTask) -> tuple[dict[str, Any], 
         if not target.exists():
             files.append({"path": path, "role": role, "exists": False})
             continue
+        # Image/binary deps are path references only. Reading them as UTF-8 text
+        # used to raise "该文件不是可编辑的文本文件" and block the whole write step.
+        if role == "dependency" and (
+            not is_text_file(target) or Path(path).suffix.lower() in _IMAGE_CONTEXT_SUFFIXES
+        ):
+            raw = target.read_bytes()
+            files.append(
+                {
+                    "path": path,
+                    "role": role,
+                    "exists": True,
+                    "binary": True,
+                    "content_hash": sha256_bytes(raw),
+                    "bytes": len(raw),
+                }
+            )
+            continue
+        if role == "target" and not is_text_file(target):
+            raise BusinessException(f"目标文件不是可编辑的文本文件：{path}")
         result = file_tools.read_workspace_source(
             root,
             path=path,
@@ -815,6 +873,8 @@ class _EngineeringNodes:
         raw_task = _next_file(checkpoint["active_file_plan"])
         assert raw_task is not None
         task = FileTask.model_validate(raw_task)
+        if task.kind == "image":
+            return self._image_step(state, work_item=work_item, task=task, root=root)
         maximum_context_reads = len(dict.fromkeys([task.path, *task.context_paths]))
         if int(checkpoint.get("tool_calls") or 0) + maximum_context_reads + 1 > _call_budget(
             snapshot, "max_tool_calls"
@@ -838,6 +898,10 @@ class _EngineeringNodes:
             "files_modified_in_this_run": list(checkpoint.get("modified_files") or []),
             "implementation_plan": plan.model_dump(mode="json"),
             "platform_file_context": platform_context,
+            "smoke_contract": check_tools.load_smoke_contract(),
+            "acceptance_test_plan": snapshot.get("acceptance_test_plan"),
+            "acceptance_test_hash": snapshot.get("acceptance_test_hash"),
+            "protected_acceptance_paths": list(PROTECTED_ACCEPTANCE_PATHS),
             "repair_context": checkpoint.get("repair_context"),
             "quality_report": snapshot.get("quality_report"),
         }
@@ -877,18 +941,33 @@ class _EngineeringNodes:
             current_task = next((item for item in current_plan.files if item.id == task.id), None)
             if current_task is None or current_task.status != "pending":
                 raise ConflictException("文件计划已变化，请重新继续工程执行")
-            written = file_tools.apply_patch(
-                root,
-                path=current_task.path,
-                content=content,
-                expected_hash=expected_hash,
-                tool_call_id=f"write_{work_item.id}_{current_task.id}",
-            )
+            try:
+                file_tools.snapshot_workspace_source(
+                    root,
+                    revision_id=execution.execution_id,
+                    path=current_task.path,
+                )
+                written = file_tools.apply_patch(
+                    root,
+                    path=current_task.path,
+                    content=content,
+                    expected_hash=expected_hash,
+                    tool_call_id=f"write_{work_item.id}_{current_task.id}",
+                )
+            except (BusinessException, ConflictException) as exc:
+                _block_checkpoint(
+                    current,
+                    f"写入前修订快照失败：{exc}",
+                    reason_code="SNAPSHOT_FAILED",
+                )
+                written = None
             current["model_turns"] = int(current.get("model_turns") or 0) + writer_calls
             writer_total = int(current.get("writer_model_calls") or 0) + writer_calls
             current["writer_model_calls"] = writer_total
             current["tool_calls"] = int(current.get("tool_calls") or 0) + read_count + 1
-            if not written.ok:
+            if written is None:
+                pass
+            elif not written.ok:
                 _block_checkpoint(current, written.summary, reason_code=written.error_code)
             else:
                 current_task.status = "completed"
@@ -899,6 +978,7 @@ class _EngineeringNodes:
                 if current_task.path not in modified:
                     modified.append(current_task.path)
                 current["modified_files"] = modified[-80:]
+                current["revision_id"] = execution.execution_id
                 _update_file_index(current, current_task.path)
                 _append_activity(
                     current,
@@ -925,6 +1005,72 @@ class _EngineeringNodes:
                     # install from the generated manifest. Real install failures block.
                     if not sync.ok and sync.error_code == "DEPENDENCY_INSTALL_FAILED":
                         _block_checkpoint(current, sync.summary, reason_code=sync.error_code)
+            current_snapshot["checkpoint"] = current
+            _save_snapshot(db, execution.execution_id, current_snapshot)
+            renew_execution_lease(db, state["task_id"], execution.execution_id)
+            return self._result(current)
+
+    def _image_step(
+        self,
+        state: _WorkflowState,
+        *,
+        work_item: WorkItem,
+        task: FileTask,
+        root: Path,
+    ) -> _WorkflowUpdate:
+        self._persist_waiting(
+            state,
+            name="generate_image",
+            label="Generate image",
+            detail=task.path,
+        )
+
+        def snapshot_before_write(actual_path: str) -> None:
+            file_tools.snapshot_workspace_source(
+                root,
+                revision_id=state["execution_id"],
+                path=actual_path,
+            )
+
+        try:
+            generated = image_tools.generate_project_image(
+                root,
+                path=task.path,
+                prompt=task.description,
+                size=task.image_size,
+                watermark=task.image_watermark,
+                tool_call_id=f"image_{work_item.id}_{task.id}",
+                before_write=snapshot_before_write,
+            )
+        except (BusinessException, ConflictException) as exc:
+            return self._persist_failure(state, str(exc), tool_calls=1)
+
+        with self._session_factory() as db:
+            execution, current_snapshot, current = _locked_current(db, state)
+            current_plan = ImplementationPlan.model_validate(current["active_file_plan"])
+            current_task = next((item for item in current_plan.files if item.id == task.id), None)
+            if current_task is None or current_task.status != "pending":
+                raise ConflictException("图片计划已变化，请重新继续工程执行")
+            current_task.status = "completed"
+            value = generated.data.get("content_hash")
+            current_task.content_hash = str(value) if isinstance(value, str) else None
+            actual_path = generated.data.get("path")
+            if isinstance(actual_path, str) and actual_path:
+                current_task.path = actual_path
+            current["active_file_plan"] = current_plan.model_dump(mode="json")
+            current["tool_calls"] = int(current.get("tool_calls") or 0) + 1
+            modified = list(current.get("modified_files") or [])
+            if current_task.path not in modified:
+                modified.append(current_task.path)
+            current["modified_files"] = modified[-80:]
+            _update_file_index(current, current_task.path)
+            _append_activity(
+                current,
+                name="image_generated",
+                label="Image generated",
+                detail=generated.summary,
+                ok=True,
+            )
             current_snapshot["checkpoint"] = current
             _save_snapshot(db, execution.execution_id, current_snapshot)
             renew_execution_lease(db, state["task_id"], execution.execution_id)
@@ -959,15 +1105,19 @@ class _EngineeringNodes:
                 }
             )
             current["plan_history"] = history[-MAX_PLAN_HISTORY:]
-            output = str(result.data.get("output") or "")
+            failure = None if result.ok else analyze_check_failure(result)
+            excerpt = "" if failure is None else failure.excerpt
             _append_activity(
                 current,
                 name="check_result",
                 label="Checks passed" if result.ok else "Checks failed",
-                detail=result.summary if result.ok else f"{result.summary}：{output[-140:]}",
+                detail=(result.summary if result.ok else f"{result.summary}：{excerpt}"),
                 ok=result.ok,
             )
             if result.ok:
+                streaks = current.get("failure_streaks")
+                if isinstance(streaks, dict):
+                    streaks.pop(work_item.id, None)
                 current_raw = _current_item(current["work_items"])
                 if current_raw is None or current_raw.get("id") != work_item.id:
                     raise ConflictException("当前工作单元已变化")
@@ -1014,17 +1164,67 @@ class _EngineeringNodes:
             elif result.error_code == "CHECK_ENVIRONMENT_UNAVAILABLE":
                 _block_checkpoint(current, result.summary, reason_code=result.error_code)
             else:
+                assert failure is not None
+                fingerprint = failure.fingerprint
+                excerpt = failure.excerpt
+                streaks = current.get("failure_streaks")
+                streaks = streaks if isinstance(streaks, dict) else {}
+                previous = streaks.get(work_item.id)
+                previous = previous if isinstance(previous, dict) else {}
+                repeated = (
+                    int(previous.get("count") or 0) + 1
+                    if previous.get("fingerprint") == fingerprint
+                    else 1
+                )
+                source_hash = result.data.get("source_hash")
+                stable_source_hash = source_hash if isinstance(source_hash, str) else None
+                unchanged_source = (
+                    int(previous.get("unchanged_source_count") or 0) + 1
+                    if stable_source_hash is not None
+                    and previous.get("source_hash") == stable_source_hash
+                    else 1
+                )
+                streaks[work_item.id] = {
+                    "fingerprint": fingerprint,
+                    "count": repeated,
+                    "excerpt": excerpt,
+                    "source_hash": stable_source_hash,
+                    "unchanged_source_count": unchanged_source,
+                }
+                current["failure_streaks"] = streaks
                 rounds = current.get("repair_rounds")
                 rounds = rounds if isinstance(rounds, dict) else {}
                 round_number = int(rounds.get(work_item.id) or 0) + 1
                 rounds[work_item.id] = round_number
                 current["repair_rounds"] = rounds
-                if round_number > _call_budget(current_snapshot, "max_repair_rounds"):
-                    _block_checkpoint(current, "自动修复轮次已用尽，完整检查仍未通过")
+                if repeated >= MAX_IDENTICAL_CHECK_FAILURES:
+                    _block_checkpoint(
+                        current,
+                        f"相同检查错误已连续出现 {repeated} 次，停止重复修改：{excerpt}",
+                        reason_code="REPEATED_CHECK_FAILURE",
+                        check_runtime_version=check_tools.CHECK_RUNTIME_VERSION,
+                    )
+                elif unchanged_source >= MAX_UNCHANGED_SOURCE_FAILURES:
+                    _block_checkpoint(
+                        current,
+                        (f"源码连续 {unchanged_source} 次未发生变化，停止无进展修复：{excerpt}"),
+                        reason_code="NO_SOURCE_PROGRESS",
+                        check_runtime_version=check_tools.CHECK_RUNTIME_VERSION,
+                    )
+                elif round_number > _call_budget(current_snapshot, "max_repair_rounds"):
+                    _block_checkpoint(
+                        current,
+                        "自动修复轮次已用尽，完整检查仍未通过",
+                        reason_code="REPAIR_BUDGET_EXHAUSTED",
+                        check_runtime_version=check_tools.CHECK_RUNTIME_VERSION,
+                    )
                 else:
                     current["repair_context"] = {
                         "round": round_number,
                         "failed_check": result.model_dump(mode="json"),
+                        "diagnostics": [
+                            diagnostic.to_payload() for diagnostic in failure.diagnostics
+                        ],
                         "previous_plan": plan.model_dump(mode="json"),
                         "modified_files": list(current.get("modified_files") or []),
                     }

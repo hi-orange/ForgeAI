@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from pathlib import Path
 
 from app.core.exceptions import ConflictException
@@ -18,6 +21,100 @@ from app.tools.paths import (
     safe_path_under_root,
     sha256_bytes,
 )
+
+_REVISION_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+_REVISION_MANIFEST = "manifest.json"
+
+
+def _revision_root(root: Path, revision_id: str) -> Path:
+    if not _REVISION_ID.fullmatch(revision_id):
+        raise ConflictException("修订编号格式无效")
+    # This is platform-owned metadata. Model-facing safe_path_under_root correctly
+    # rejects forgeai/, so the trusted helper builds the path from a validated id.
+    return root.resolve() / "forgeai" / "revisions" / revision_id
+
+
+def _load_revision_manifest(revision_root: Path) -> dict[str, dict[str, object]]:
+    manifest_path = revision_root / _REVISION_MANIFEST
+    if not manifest_path.exists():
+        return {}
+    try:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConflictException("工作区修订清单损坏") from exc
+    if not isinstance(value, dict) or not all(
+        isinstance(path, str) and isinstance(entry, dict) for path, entry in value.items()
+    ):
+        raise ConflictException("工作区修订清单格式无效")
+    return value
+
+
+def snapshot_workspace_source(root: Path, *, revision_id: str, path: str) -> dict[str, object]:
+    """Save one path's pre-write bytes once for a recoverable engineering revision."""
+
+    normalized = path.replace("\\", "/").strip()
+    if not normalized or normalized == "forgeai" or normalized.startswith("forgeai/"):
+        raise ConflictException("不能为平台内部路径创建源码修订")
+    target = safe_path_under_root(root, normalized, allow_create=True)
+    revision_root = _revision_root(root, revision_id)
+    revision_root.mkdir(parents=True, exist_ok=True)
+    manifest = _load_revision_manifest(revision_root)
+    saved = manifest.get(normalized)
+    if saved is not None:
+        return saved
+
+    entry: dict[str, object] = {"exists": target.exists()}
+    if target.exists():
+        if not target.is_file():
+            raise ConflictException(f"{normalized} 不是可修订的文件")
+        raw = target.read_bytes()
+        backup_name = f"{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}.bin"
+        (revision_root / backup_name).write_bytes(raw)
+        entry.update(
+            backup=backup_name,
+            content_hash=sha256_bytes(raw),
+            size_bytes=len(raw),
+        )
+    manifest[normalized] = entry
+    manifest_path = revision_root / _REVISION_MANIFEST
+    temporary = revision_root / f"{_REVISION_MANIFEST}.tmp"
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(manifest_path)
+    return entry
+
+
+def restore_workspace_revision(root: Path, *, revision_id: str) -> list[str]:
+    """Restore every path captured for one engineering execution revision."""
+
+    revision_root = _revision_root(root, revision_id)
+    manifest = _load_revision_manifest(revision_root)
+    if not manifest:
+        raise ConflictException("工作区修订不存在或没有文件")
+    restored: list[str] = []
+    for path, entry in manifest.items():
+        target = safe_path_under_root(root, path, allow_create=True)
+        if entry.get("exists") is False:
+            if target.exists():
+                if not target.is_file():
+                    raise ConflictException(f"{path} 不是可恢复的文件")
+                target.unlink()
+            restored.append(path)
+            continue
+        backup_name = entry.get("backup")
+        expected_hash = entry.get("content_hash")
+        if not isinstance(backup_name, str) or not isinstance(expected_hash, str):
+            raise ConflictException(f"{path} 的修订记录不完整")
+        backup = safe_path_under_root(revision_root, backup_name)
+        raw = backup.read_bytes()
+        if sha256_bytes(raw) != expected_hash:
+            raise ConflictException(f"{path} 的修订内容校验失败")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        restored.append(path)
+    return restored
 
 
 def list_files(
@@ -82,7 +179,7 @@ def read_file(
     """Bounded read for agent tools. Prefer ranges for large files."""
     target = safe_path_under_root(root, path)
     if not is_text_file(target):
-        raise ConflictException("该文件不是可编辑的文本文件")
+        raise ConflictException(f"{path} 不是可编辑的文本文件")
     raw = target.read_bytes()
     try:
         text = raw.decode("utf-8")
@@ -210,7 +307,7 @@ def read_workspace_source(
 
     target = safe_path_under_root(root, path)
     if not is_text_file(target):
-        raise ConflictException("该文件不是可编辑的文本文件")
+        raise ConflictException(f"{path} 不是可编辑的文本文件")
     raw = target.read_bytes()
     try:
         text = raw.decode("utf-8")
@@ -349,7 +446,7 @@ def apply_patch(
             summary=f"{path} 不存在，无法按旧 hash 写入",
         )
     if target.exists() and not is_text_file(target):
-        raise ConflictException("该文件不是可编辑的文本文件")
+        raise ConflictException(f"{path} 不是可编辑的文本文件")
     if not is_text_file(target if target.exists() else Path(path)):
         suffix = Path(path).suffix.lower()
         if suffix not in {".py", ".ts", ".vue", ".json", ".md", ".html", ".css", ".scss", ".toml"}:
@@ -378,7 +475,7 @@ def edit_file_by_replace(
 
     target = safe_path_under_root(root, path)
     if not is_text_file(target):
-        raise ConflictException("该文件不是可编辑的文本文件")
+        raise ConflictException(f"{path} 不是可编辑的文本文件")
     raw = target.read_bytes()
     current_hash = sha256_bytes(raw)
     if not expected_hash:

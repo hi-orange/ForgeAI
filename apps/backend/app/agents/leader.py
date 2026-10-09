@@ -23,7 +23,9 @@ from app.tools.leader import (
     execute_message_classification_tool,
 )
 
+# Leader 管理一轮最多能调用多少次工具，防止模型一直转圈。
 MAX_LEADER_TOOL_TURNS = 12
+# 只保留角色白名单里允许的工具定义，避免多给模型权限。
 ALLOWED_LEADER_TOOLS = [tool for tool in LEADER_TOOLS if tool.name in LEADER_PROFILE.allowed_tools]
 
 
@@ -55,6 +57,7 @@ def classify_message(
             "content": message_content,
         },
     }
+    # 只允许 1 轮、1 个分类工具；模型必须调用工具提交结果，不能只写普通回复。
     return run_bounded_tool_loop(
         messages=[
             {"role": "system", "content": MESSAGE_CLASSIFICATION_SYSTEM_PROMPT},
@@ -77,6 +80,8 @@ def classify_message(
 
 
 def _leadership_messages(context: LeaderContext, instruction: str) -> list[dict[str, Any]]:
+    """组装管理轮对话：系统角色说明 + 本轮任务单（只含 id，详情靠工具读取）。"""
+
     return [
         {
             "role": "system",
@@ -84,6 +89,7 @@ def _leadership_messages(context: LeaderContext, instruction: str) -> list[dict[
         },
         {
             "role": "user",
+            # 不把完整历史塞进首条消息；模型要通过 read_project_context 等工具按需读取。
             "content": json.dumps(
                 {
                     "project_id": context.project_id,
@@ -102,12 +108,14 @@ def lead_project_turn(
     *,
     instruction: str = "先读取冻结上下文，再管理本轮计划和分派。",
 ) -> LeaderOutcome:
-    """Run one bounded management turn; callers persist validated plan/outcome separately."""
+    """跑一轮有上限的管理流程；调用方负责把校验后的计划/结果另行落库。"""
 
+    # 再次校验冻结上下文，不合格直接失败，不进模型。
     try:
         context = LeaderContext.model_validate(context.model_dump())
     except ValidationError as exc:
         raise BusinessException("Leader 项目上下文不符合要求") from exc
+    # 本轮工具共享的内存状态（草稿计划、已分派任务、最终结果等）。
     state = LeaderToolState(context=context)
     return run_bounded_tool_loop(
         messages=_leadership_messages(context, instruction),
@@ -119,6 +127,7 @@ def lead_project_turn(
         max_tokens=8192,
         missing_message="Leader 未调用工具更新计划或结束本轮",
         exhausted_message="Leader 工具调用预算已用尽，尚未结束本轮管理",
+        # 每次模型点工具，都带着同一份 state 去执行。
         execute_tool=lambda call: execute_leader_tool(call, state),
         model_call=chat_with_tools,
     )

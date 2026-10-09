@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, ConflictException
@@ -18,6 +18,7 @@ from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
+from app.orchestration.code_engineer import EXECUTION_MODE
 from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.orchestration.test_engineer import run_test_engineer_task
@@ -26,7 +27,12 @@ from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowResult,
 )
 from app.schemas.project_message import ProjectMessageCreate
-from app.schemas.requirements import EngineeringActivity, RequirementsApproval, RequirementsStatus
+from app.schemas.requirements import (
+    EngineeringActivity,
+    QualityChallengeResolution,
+    RequirementsApproval,
+    RequirementsStatus,
+)
 from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import build_run as build_run_service
 from app.services import engineering
@@ -49,7 +55,7 @@ from app.services.engineering import (
     mark_engineering_inactive,
     read_frozen_input_snapshot,
 )
-from app.services.leader import create_clarification_plan
+from app.services.leader import create_clarification_plan, create_product_revision_plan
 from app.services.task_execution import fail_execution, latest_execution, lock_run, utc_now
 from app.services.test_engineer import load_test_inputs
 
@@ -150,18 +156,119 @@ def start_from_message(
     return get_requirements_status(db, user, project_id)
 
 
+def resolve_quality_challenge(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    report_item_id: str,
+    resolution: QualityChallengeResolution,
+) -> RequirementsStatus:
+    """Resolve one exact blocked report through an explicit user-owned branch."""
+
+    resolution = QualityChallengeResolution.model_validate(resolution.model_dump())
+    status = get_requirements_status(db, user, project_id)
+    if status.run_id != run_id:
+        raise ConflictException("构建任务不匹配")
+    if status.state != "quality_challenge":
+        if resolution.action == "revise_product":
+            assert resolution.client_message_id is not None
+            assert resolution.content is not None
+            replay = project_message_service.find_idempotent_user_message(
+                db,
+                user,
+                project_id,
+                ProjectMessageCreate(
+                    content=resolution.content,
+                    client_message_id=resolution.client_message_id,
+                ),
+            )
+            if replay is not None:
+                return status
+        elif status.task_id is not None:
+            current_task = task_service.get_user_task(db, user, project_id, status.task_id)
+            if (
+                current_task.recipient == "Code Engineer"
+                and report_item_id in current_task.input_configuration_item_ids
+            ):
+                return status
+        raise ConflictException("当前没有待仲裁的测试质疑")
+    if status.test_report_item_id != report_item_id or not status.code_item_id:
+        raise ConflictException("测试质疑报告已变化，请刷新后重试")
+
+    run = lock_run(db, user, project_id, run_id)
+    if (run.status, run.stage, run.active_slot) != ("failed", "qa", None):
+        raise ConflictException("测试质疑已经被处理，请刷新进度")
+    inputs = load_test_inputs(db, project_id, run_id, status.code_item_id, lock=True)
+    source = load_engineering_source(
+        db,
+        project_id,
+        run_id,
+        inputs.code_item.upstream_item_ids[0],
+        lock=True,
+    )
+
+    if resolution.action == "repair_code":
+        if not status.retryable:
+            raise ConflictException("代码自动修复轮次已用尽，请修改产品意图或重新开始构建")
+        run.status = "running"
+        run.stage = "qa"
+        run.active_slot = 1
+        run.error = None
+        db.flush()
+        task = leader_service.dispatch_quality_repair(db, user, project_id, run_id, report_item_id)
+        if task is not None:
+            start_dispatched_delivery(db, user, project_id, run_id, task)
+        return get_requirements_status(db, user, project_id)
+
+    assert resolution.client_message_id is not None
+    assert resolution.content is not None
+    run.status = "running"
+    run.stage = "pm"
+    run.active_slot = 1
+    run.error = None
+    db.flush()
+    plan = create_product_revision_plan(
+        db,
+        user,
+        project_id,
+        run_id,
+        source.app_spec_item.item_id,
+        report_item_id,
+        ProjectMessageCreate(
+            content=resolution.content,
+            client_message_id=resolution.client_message_id,
+        ),
+    )
+    run_product_manager_workflow(db, user, project_id, run_id, plan.cause_message_id)
+    return get_requirements_status(db, user, project_id)
+
+
 def continue_requirements(db: Session, user: User, project_id: int) -> RequirementsStatus:
     """Resume whichever saved PM or engineering step currently owns the BuildRun."""
 
     status = get_requirements_status(db, user, project_id)
     if not status.run_id:
         raise BusinessException("当前没有可继续的构建")
+    if status.state == "retry_available" and not status.retryable:
+        raise ConflictException(status.error or "相同错误已达到自动修复上限")
 
     # Continue is a coarse, user-facing action and can race with automatic dispatch or
     # polling. Once Architect / QA already owns an active execution, a duplicate request
     # is successful and idempotent rather than an invalid transition.
     if status.state in {"design_running", "quality_running"}:
         return status
+
+    if status.state == "quality_failed" and status.retryable and status.test_report_item_id:
+        task = leader_service.retry_blocked_quality_validation(
+            db,
+            user,
+            project_id,
+            status.run_id,
+            status.test_report_item_id,
+        )
+        run_test_engineer_task(db, user, project_id, status.run_id, task.task_id)
+        return get_requirements_status(db, user, project_id)
 
     current_task = (
         task_service.get_user_task(db, user, project_id, status.task_id) if status.task_id else None
@@ -226,6 +333,10 @@ def approve_requirement_plan(
         # Approval is already committed. Keep the approved checkpoint recoverable so the
         # client can continue/dispatch without treating the whole approve call as lost.
         logger.exception("dispatch after approval failed project=%s run=%s", project_id, run_id)
+        # A failed flush/commit leaves SQLAlchemy's Session unusable until it is rolled back.
+        # The approval checkpoint was committed before dispatch, so rolling back here only
+        # discards the incomplete dispatch attempt and lets us return a recoverable status.
+        db.rollback()
         status = get_requirements_status(db, user, project_id)
         if status.state in {
             "ready_for_delivery",
@@ -345,6 +456,10 @@ def _resume_engineering_from_retry(
     task_id = status.task_id
     if not task_id or not status.execution_id:
         raise BusinessException("当前没有可继续的工程任务")
+    # A worker can publish its blocked checkpoint just before releasing the
+    # in-process marker. Do not supersede it during that finalization window.
+    if engineering.is_engineering_active(status.execution_id):
+        return status
     task, execution = engineering.claim_code_engineer_task(
         db,
         user,
@@ -542,6 +657,7 @@ def _attach_workspace_status(db: Session, result: RequirementsStatus) -> Require
         "quality_pending",
         "quality_running",
         "completed",
+        "quality_challenge",
         "quality_failed",
         # Budget / check pauses keep the same run workspace; still expose files.
         "retry_available",
@@ -648,7 +764,15 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             if (
                 report_item is None
                 or report_item.semantic_type != "test_report"
-                or report_item.upstream_item_ids != [inputs.code_item.item_id]
+                or report_item.upstream_item_ids
+                != [
+                    inputs.code_item.item_id,
+                    *(
+                        [inputs.acceptance_test_plan_item.item_id]
+                        if inputs.acceptance_test_plan_item is not None
+                        else []
+                    ),
+                ]
             ):
                 raise ConflictException("质量报告成果关联不完整")
             try:
@@ -656,13 +780,44 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             except ValidationError as exc:
                 raise ConflictException("质量报告正文不符合要求") from exc
             result.test_report_item_id = report_item.item_id
+            result.test_challenges = report.test_challenges
             result.error = run.error
-            result.state = (
-                "completed"
-                if report.quality_conclusion == QualityConclusion.PASSED
-                and run.status == "succeeded"
-                else "quality_failed"
-            )
+            if report.quality_conclusion == QualityConclusion.PASSED and run.status == "succeeded":
+                result.state = "completed"
+            elif report.quality_conclusion == QualityConclusion.BLOCKED and report.test_challenges:
+                result.state = "quality_challenge"
+                quality_cycles = db.scalar(
+                    select(func.count())
+                    .select_from(Task)
+                    .join(Plan, Task.plan_id == Plan.plan_id)
+                    .where(
+                        Plan.project_id == project_id,
+                        Plan.build_run_id == run.run_id,
+                        Task.task_key == QUALITY_TASK_KEY,
+                        Task.recipient == "Test Engineer",
+                    )
+                )
+                result.retryable = int(quality_cycles or 0) < leader_service.MAX_QUALITY_CYCLES
+            else:
+                result.state = "quality_failed"
+                if report.quality_conclusion == QualityConclusion.BLOCKED:
+                    quality_cycles = db.scalar(
+                        select(func.count())
+                        .select_from(Task)
+                        .join(Plan, Task.plan_id == Plan.plan_id)
+                        .where(
+                            Plan.project_id == project_id,
+                            Plan.build_run_id == run.run_id,
+                            Task.task_key == QUALITY_TASK_KEY,
+                            Task.recipient == "Test Engineer",
+                        )
+                    )
+                    result.retryable = (
+                        not report.test_challenges
+                        and int(quality_cycles or 0) < leader_service.MAX_QUALITY_CYCLES
+                    )
+                else:
+                    result.retryable = False
             return _attach_workspace_status(db, result)
         result.state = "stopped"
         return _attach_workspace_status(db, result)
@@ -682,7 +837,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 delivery_task.expected_output_type,
             ) != (ENGINEERING_TASK_KEY, "code"):
                 raise ConflictException("工程交付任务定义不符合约定")
-            if len(delivery_task.input_configuration_item_ids) not in {1, 2}:
+            if len(delivery_task.input_configuration_item_ids) not in {1, 2, 3}:
                 raise ConflictException("工程交付任务缺少工程来源或包含多余输入")
         elif (
             delivery_task.task_key,
@@ -729,26 +884,38 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             open_questions=[],
         )
         if plan.status == "pending" and delivery_task.status == "pending":
-            if (
-                delivery_task.recipient == "Code Engineer"
-                and len(delivery_task.input_configuration_item_ids) == 2
-            ):
-                report_item = db.scalar(
-                    select(ConfigurationItem).where(
-                        ConfigurationItem.item_id == delivery_task.input_configuration_item_ids[1],
-                        ConfigurationItem.project_id == project_id,
-                        ConfigurationItem.producer_run_id == run.run_id,
-                        ConfigurationItem.semantic_type == "test_report",
-                        ConfigurationItem.state == "usable",
+            verified: Task | None
+            if delivery_task.recipient == "Code Engineer":
+                extra_items = list(
+                    db.scalars(
+                        select(ConfigurationItem).where(
+                            ConfigurationItem.item_id.in_(
+                                delivery_task.input_configuration_item_ids[1:]
+                            ),
+                            ConfigurationItem.project_id == project_id,
+                            ConfigurationItem.producer_run_id == run.run_id,
+                            ConfigurationItem.state == "usable",
+                        )
+                    ).all()
+                )
+                items_by_type = {item.semantic_type: item for item in extra_items}
+                report_item = items_by_type.get("test_report")
+                acceptance_plan_item = items_by_type.get("acceptance_test_plan")
+                if report_item is not None:
+                    verified = delivery_task
+                else:
+                    verified = find_pending_engineering_task(
+                        db,
+                        task_source_plan,
+                        input_item_id,
+                        (
+                            acceptance_plan_item.item_id
+                            if acceptance_plan_item is not None
+                            else None
+                        ),
                     )
-                )
-                verified = delivery_task if report_item is not None else None
             else:
-                verified = (
-                    find_architecture_task(db, task_source_plan, input_item_id)
-                    if delivery_task.recipient == "Architect"
-                    else find_pending_engineering_task(db, task_source_plan, input_item_id)
-                )
+                verified = find_architecture_task(db, task_source_plan, input_item_id)
             if verified is None or verified.task_id != delivery_task.task_id:
                 raise ConflictException("工程交付任务与需求来源不一致")
             result.state = (
@@ -831,6 +998,11 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                     or checkpoint.get("last_error")
                     or result.error
                     or "构建已暂停，可继续处理。"
+                )
+                reason_code = str(checkpoint.get("blocked_reason_code") or "")
+                result.retryable = not (
+                    reason_code in {"REPEATED_CHECK_FAILURE", "REPAIR_BUDGET_EXHAUSTED"}
+                    and checkpoint.get("blocked_executor_runtime_version") == EXECUTION_MODE
                 )
                 result.code_ready = _checkpoint_has_written_code(checkpoint)
             elif isinstance(checkpoint, dict) and checkpoint.get("blocked_reason"):

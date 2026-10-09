@@ -12,7 +12,6 @@ from app.core.exceptions import ConflictException
 from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.user import User
-from app.orchestration.code_engineer import run_engineering_workflow
 from app.services.engineering.claim import read_frozen_input_snapshot
 from app.services.engineering.completion import complete_code_engineer_task
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
@@ -96,6 +95,10 @@ def _run_and_publish(
     *,
     session_factory: Any | None = None,
 ) -> dict:
+    # Lazy import: orchestration.code_engineer imports engineering.claim, and
+    # engineering.__init__ imports this module — avoid a circular import at load time.
+    from app.orchestration.code_engineer import run_engineering_workflow
+
     result = dict(
         run_engineering_workflow(
             db,

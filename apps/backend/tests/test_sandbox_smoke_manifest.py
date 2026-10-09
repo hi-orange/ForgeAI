@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import unittest
@@ -17,6 +18,41 @@ SPEC.loader.exec_module(sandbox_check)
 
 
 class SmokeManifestTests(unittest.TestCase):
+    def test_materialize_restores_public_binary_image(self):
+        image = b"\xff\xd8\xffgenerated"
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(sandbox_check, "ROOT", Path(directory)),
+        ):
+            sandbox_check.materialize(
+                {
+                    "frontend/public/images/hero.jpg": {
+                        "encoding": "base64",
+                        "content": base64.b64encode(image).decode("ascii"),
+                    }
+                }
+            )
+
+            self.assertEqual(
+                (Path(directory) / "frontend/public/images/hero.jpg").read_bytes(),
+                image,
+            )
+
+    def test_materialize_rejects_binary_outside_public_directory(self):
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(sandbox_check, "ROOT", Path(directory)),
+            self.assertRaisesRegex(ValueError, "Invalid binary source"),
+        ):
+            sandbox_check.materialize(
+                {
+                    "backend/private.jpg": {
+                        "encoding": "base64",
+                        "content": base64.b64encode(b"private").decode("ascii"),
+                    }
+                }
+            )
+
     def write_manifest(self, root: Path, manifest: dict) -> Path:
         template = root / "template.json"
         if not template.exists():
@@ -98,6 +134,13 @@ class SmokeManifestTests(unittest.TestCase):
         rendered = sandbox_check._render_variables(manifest, {"item_id": 42})
         self.assertEqual(rendered["api_checks"][1]["path"], "/api/v1/items/42")
 
+    def test_json_path_supports_root_and_array_notation(self) -> None:
+        document = [{"name": "手冲咖啡", "details": {"price": 32}}]
+        self.assertEqual(sandbox_check._json_path(document, "$[0].name"), "手冲咖啡")
+        self.assertEqual(sandbox_check._json_path(document, "[0].details.price"), 32)
+        self.assertEqual(sandbox_check._json_path({"data": document}, "$.data[0].name"), "手冲咖啡")
+        self.assertEqual(sandbox_check._json_path({"data": {"id": 7}}, "data.id"), 7)
+
     def test_rejects_external_api_and_browser_routes(self) -> None:
         manifest = self.baseline()
         manifest.pop("visual_contract")
@@ -136,7 +179,73 @@ class SmokeManifestTests(unittest.TestCase):
             with (
                 patch.object(sandbox_check, "ROOT", root),
                 patch.object(sandbox_check, "SMOKE_MANIFEST", path),
-                self.assertRaisesRegex(ValueError, "缺少字符串字段"),
+                self.assertRaisesRegex(ValueError, "缺少字段"),
+            ):
+                sandbox_check.load_smoke_manifest()
+
+    def test_extended_safe_browser_actions_and_viewport_are_accepted(self) -> None:
+        manifest = self.baseline()
+        manifest.pop("visual_contract")
+        manifest["browser_checks"][0]["viewport"] = {"width": 375, "height": 812}
+        manifest["browser_checks"][0]["actions"] = [
+            {"type": "navigate", "url": "/items"},
+            {"type": "wait_for_selector", "selector": "#items"},
+            {"type": "expect_any_text", "texts": ["营业中", "已打烊"]},
+            {"type": "expect_count", "selector": "#items li", "count": 4},
+            {"type": "expect_no_horizontal_scroll"},
+            {"type": "screenshot", "name": "items-mobile"},
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self.write_manifest(root, manifest)
+            with (
+                patch.object(sandbox_check, "ROOT", root),
+                patch.object(sandbox_check, "SMOKE_MANIFEST", path),
+            ):
+                loaded = sandbox_check.load_smoke_manifest()
+
+        self.assertEqual(loaded["browser_checks"][0]["viewport"]["width"], 375)
+
+    def test_navigate_rejects_external_url_and_count_requires_integer(self) -> None:
+        manifest = self.baseline()
+        manifest.pop("visual_contract")
+        manifest["browser_checks"][0]["actions"] = [
+            {"type": "navigate", "url": "https://example.com"}
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self.write_manifest(root, manifest)
+            with (
+                patch.object(sandbox_check, "ROOT", root),
+                patch.object(sandbox_check, "SMOKE_MANIFEST", path),
+                self.assertRaisesRegex(ValueError, "站内绝对路径"),
+            ):
+                sandbox_check.load_smoke_manifest()
+
+        manifest["browser_checks"][0]["actions"] = [
+            {"type": "expect_count", "selector": "#items li", "count": "4"}
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self.write_manifest(root, manifest)
+            with (
+                patch.object(sandbox_check, "ROOT", root),
+                patch.object(sandbox_check, "SMOKE_MANIFEST", path),
+                self.assertRaisesRegex(ValueError, "count 必须是整数"),
+            ):
+                sandbox_check.load_smoke_manifest()
+
+    def test_contract_rejects_unapproved_top_level_commands(self) -> None:
+        manifest = self.baseline()
+        manifest.pop("visual_contract")
+        manifest["seed_checks"] = [{"command": "python -m app.db.seed"}]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self.write_manifest(root, manifest)
+            with (
+                patch.object(sandbox_check, "ROOT", root),
+                patch.object(sandbox_check, "SMOKE_MANIFEST", path),
+                self.assertRaisesRegex(ValueError, "未授权顶层字段：seed_checks"),
             ):
                 sandbox_check.load_smoke_manifest()
 

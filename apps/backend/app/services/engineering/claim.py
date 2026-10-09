@@ -20,18 +20,20 @@ from app.models.project import Project
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_execution import TaskExecution
 from app.models.user import User
+from app.schemas.acceptance_test_plan import AcceptanceTestPlan
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import build_run as build_run_service
 from app.services import plan as plan_service
 from app.services import task as task_service
+from app.services.acceptance_testing import load_acceptance_test_plan
 from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_engineering_source
 from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_now
 
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
-INPUT_SNAPSHOT_SCHEMA_VERSION = 3
-SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+INPUT_SNAPSHOT_SCHEMA_VERSION = 4
+SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 TOOL_STRATEGY_VERSION = "planned_files_v1"
 
 DEFAULT_CALL_BUDGET: dict[str, int] = {
@@ -65,6 +67,9 @@ def build_frozen_input_snapshot(
     spec: AppSpec,
     design_item_id: str | None,
     system_design: SystemDesign | None,
+    acceptance_test_plan_item_id: str | None = None,
+    acceptance_test_hash: str | None = None,
+    acceptance_test_plan: AcceptanceTestPlan | None = None,
     quality_report_item_id: str | None = None,
     quality_report: TestReport | None = None,
     template_version: str = DEFAULT_TEMPLATE_VERSION,
@@ -87,6 +92,13 @@ def build_frozen_input_snapshot(
         "design_item_id": design_item_id,
         "system_design": (
             system_design.model_dump(mode="json") if system_design is not None else None
+        ),
+        "acceptance_test_plan_item_id": acceptance_test_plan_item_id,
+        "acceptance_test_hash": acceptance_test_hash,
+        "acceptance_test_plan": (
+            acceptance_test_plan.model_dump(mode="json")
+            if acceptance_test_plan is not None
+            else None
         ),
         "quality_report_item_id": quality_report_item_id,
         "quality_report": (
@@ -182,8 +194,8 @@ def claim_code_engineer_task(
             raise BusinessException("只能领取工程交付任务")
         if task.expected_output_type != ConfigurationItemType.CODE.value:
             raise BusinessException("工程交付任务的预期成果必须是 code")
-        if len(task.input_configuration_item_ids) not in {1, 2}:
-            raise ConflictException("工程交付任务必须包含工程来源及可选的质量报告")
+        if len(task.input_configuration_item_ids) not in {1, 2, 3}:
+            raise ConflictException("工程交付任务输入数量无效")
         if task.depends_on_task_ids:
             raise ConflictException("工程交付任务不能带依赖链")
 
@@ -192,10 +204,37 @@ def claim_code_engineer_task(
         approved_item_id = source.app_spec_item.item_id
         design_item_id = source.input_item.item_id if source.system_design is not None else None
         spec = source.app_spec
+        acceptance_test_plan_item_id: str | None = None
+        acceptance_test_hash: str | None = None
+        acceptance_test_plan: AcceptanceTestPlan | None = None
         quality_report_item_id: str | None = None
         quality_report: TestReport | None = None
-        if len(task.input_configuration_item_ids) == 2:
-            quality_report_item_id = task.input_configuration_item_ids[1]
+        remaining_item_ids = list(task.input_configuration_item_ids[1:])
+        if remaining_item_ids:
+            candidate = db.scalar(
+                select(ConfigurationItem).where(
+                    ConfigurationItem.item_id == remaining_item_ids[0],
+                    ConfigurationItem.project_id == project_id,
+                )
+            )
+            if (
+                candidate is not None
+                and candidate.semantic_type == ConfigurationItemType.ACCEPTANCE_TEST_PLAN.value
+            ):
+                acceptance_test_plan_item_id = remaining_item_ids.pop(0)
+                plan_item, acceptance_test_plan = load_acceptance_test_plan(
+                    db,
+                    project_id=project_id,
+                    run_id=run_id,
+                    item_id=acceptance_test_plan_item_id,
+                    source_item_id=input_item_id,
+                    lock=True,
+                )
+                acceptance_test_hash = plan_item.content_hash
+        if remaining_item_ids:
+            if len(remaining_item_ids) != 1:
+                raise ConflictException("质量修复任务包含多余输入")
+            quality_report_item_id = remaining_item_ids[0]
             report_item = db.scalar(
                 select(ConfigurationItem)
                 .where(
@@ -209,7 +248,7 @@ def claim_code_engineer_task(
             if (
                 report_item is None
                 or (report_item.semantic_type, report_item.state) != ("test_report", "usable")
-                or len(report_item.upstream_item_ids) != 1
+                or len(report_item.upstream_item_ids) not in {1, 2}
             ):
                 raise ConflictException("质量修复任务引用了无效的 test_report")
             try:
@@ -241,6 +280,10 @@ def claim_code_engineer_task(
                     raise ConflictException("获批需求已被替换，不能沿用旧执行")
                 if snapshot.get("design_item_id") != design_item_id:
                     raise ConflictException("冻结系统设计与任务定义不一致")
+                if snapshot.get("acceptance_test_plan_item_id") != acceptance_test_plan_item_id:
+                    raise ConflictException("冻结验收测试计划与任务定义不一致")
+                if snapshot.get("acceptance_test_hash") != acceptance_test_hash:
+                    raise ConflictException("冻结验收测试哈希与任务定义不一致")
                 if snapshot.get("quality_report_item_id") != quality_report_item_id:
                     raise ConflictException("冻结质量报告与任务定义不一致")
                 db.commit()
@@ -264,6 +307,10 @@ def claim_code_engineer_task(
                 raise ConflictException("获批需求已被替换，不能沿用旧执行")
             if snapshot.get("design_item_id") != design_item_id:
                 raise ConflictException("冻结系统设计与任务定义不一致")
+            if snapshot.get("acceptance_test_plan_item_id") != acceptance_test_plan_item_id:
+                raise ConflictException("冻结验收测试计划与任务定义不一致")
+            if snapshot.get("acceptance_test_hash") != acceptance_test_hash:
+                raise ConflictException("冻结验收测试哈希与任务定义不一致")
             if snapshot.get("quality_report_item_id") != quality_report_item_id:
                 raise ConflictException("冻结质量报告与任务定义不一致")
             if current.status == "running":
@@ -316,6 +363,9 @@ def claim_code_engineer_task(
             spec=spec,
             design_item_id=design_item_id,
             system_design=source.system_design,
+            acceptance_test_plan_item_id=acceptance_test_plan_item_id,
+            acceptance_test_hash=acceptance_test_hash,
+            acceptance_test_plan=acceptance_test_plan,
             quality_report_item_id=quality_report_item_id,
             quality_report=quality_report,
             template_version=template_version,

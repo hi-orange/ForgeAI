@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -10,6 +10,7 @@ from app.agents.prompts.leader import (
     CLARIFICATION_TASK_INSTRUCTIONS,
     ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
     INITIAL_REQUIREMENTS_TASK_INSTRUCTIONS,
+    PRODUCT_REVISION_TASK_INSTRUCTIONS,
     QUALITY_VALIDATION_TASK_INSTRUCTIONS,
 )
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
@@ -37,6 +38,7 @@ from app.schemas.task import TaskCreate
 from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import plan as plan_service
 from app.services import project as project_service
+from app.services.acceptance_testing import get_or_create_acceptance_test_plan
 from app.services.app_spec import read_app_spec
 from app.services.engineering import (
     APPROVAL_VERSION,
@@ -324,6 +326,12 @@ def create_engineering_delivery_task(
         if run.status != "running" or run.active_slot != 1:
             raise ConflictException("当前构建不能进行需求到工程交付的交接")
         source = load_engineering_source(db, project_id, run_id, item_id, lock=True)
+        acceptance_plan = get_or_create_acceptance_test_plan(
+            db,
+            project_id=project_id,
+            run_id=run_id,
+            source=source,
+        )
         direct = source.system_design is None
         if direct and not allow_direct:
             raise ConflictException("只有 Leader 可以把简单需求直接交给 Code Engineer")
@@ -332,7 +340,9 @@ def create_engineering_delivery_task(
             raise ConflictException("当前构建不能进行需求到工程交付的交接")
         source_plan = source.source_plan
         approved_payload = source.app_spec.model_dump(mode="json")
-        claimed = find_claimed_engineering_task(db, source_plan, item_id, lock=True)
+        claimed = find_claimed_engineering_task(
+            db, source_plan, item_id, acceptance_plan.item_id, lock=True
+        )
         if claimed is not None:
             db.commit()
             db.refresh(claimed)
@@ -351,7 +361,9 @@ def create_engineering_delivery_task(
             )
             if latest is None or latest.version < source_plan.version:
                 raise ConflictException("需求已进入其他后续计划，请刷新进度")
-            existing = find_pending_engineering_task(db, source_plan, item_id, lock=True)
+            existing = find_pending_engineering_task(
+                db, source_plan, item_id, acceptance_plan.item_id, lock=True
+            )
             if existing is not None:
                 if existing.task_key == ENGINEERING_TASK_KEY:
                     engineering_plan = db.scalar(
@@ -415,7 +427,7 @@ def create_engineering_delivery_task(
                                 ),
                                 instructions=ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
                                 expected_output_type=ConfigurationItemType.CODE,
-                                input_configuration_item_ids=[item_id],
+                                input_configuration_item_ids=[item_id, acceptance_plan.item_id],
                             )
                         ],
                     ),
@@ -639,6 +651,138 @@ def create_clarification_plan(
         raise
 
 
+def create_product_revision_plan(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    approved_item_id: str,
+    report_item_id: str,
+    revision: ProjectMessageCreate,
+) -> Plan:
+    """Create a new PM revision from one exact blocked report without mutating frozen inputs."""
+
+    revision = ProjectMessageCreate.model_validate(revision.model_dump())
+    try:
+        run = lock_run(db, user, project_id, run_id)
+        if (run.status, run.stage, run.active_slot) != ("running", "pm", 1):
+            raise ConflictException("当前构建不能修订产品意图")
+        approved_item, approved_task, _, _ = load_approved_app_spec(
+            db, project_id, run_id, approved_item_id, lock=True
+        )
+        approved_result = db.get(TaskResult, approved_task.task_id)
+        if approved_result is None or approved_result.prompt_version != APPROVAL_VERSION:
+            raise ConflictException("产品修订必须基于准确的已批准需求")
+
+        report_row = db.execute(
+            select(ConfigurationItem, Task, Plan)
+            .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+            .join(Task, Task.task_id == TaskResult.task_id)
+            .join(Plan, Plan.plan_id == Task.plan_id)
+            .where(
+                ConfigurationItem.item_id == report_item_id,
+                ConfigurationItem.project_id == project_id,
+                ConfigurationItem.producer_run_id == run_id,
+                Plan.project_id == project_id,
+                Plan.build_run_id == run_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).one_or_none()
+        if report_row is None:
+            raise NotFoundException("测试质疑报告不存在或不属于当前构建")
+        report_item, report_task, report_plan = report_row
+        if (
+            (report_item.semantic_type, report_item.state) != ("test_report", "usable")
+            or report_task.task_key != QUALITY_TASK_KEY
+            or report_task.recipient != TaskRecipient.TEST_ENGINEER.value
+            or report_task.status != "succeeded"
+            or report_plan.status != "succeeded"
+            or len(report_item.upstream_item_ids) not in {1, 2}
+        ):
+            raise ConflictException("只有已完成的测试质疑报告可以触发产品修订")
+        report = TestReport.model_validate(report_item.payload)
+        if report.quality_conclusion != QualityConclusion.BLOCKED or not report.test_challenges:
+            raise ConflictException("该质量报告没有待仲裁的测试质疑")
+
+        inputs = load_test_inputs(
+            db, project_id, run_id, report_item.upstream_item_ids[0], lock=True
+        )
+        source = load_engineering_source(
+            db, project_id, run_id, inputs.code_item.upstream_item_ids[0], lock=True
+        )
+        if source.app_spec_item.item_id != approved_item.item_id:
+            raise ConflictException("测试质疑与待修订的已批准需求身份不一致")
+        latest = db.scalar(
+            select(Plan)
+            .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
+            .order_by(Plan.version.desc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if latest is None or latest.plan_id != report_plan.plan_id:
+            raise ConflictException("测试质疑已经进入其他后续计划")
+
+        clarification = db.scalar(
+            select(RequirementClarification)
+            .where(RequirementClarification.configuration_item_id == approved_item_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if clarification is not None and clarification.answer_message_id is not None:
+            previous = db.get(ProjectMessage, clarification.answer_message_id)
+            if previous is None or (
+                previous.client_message_id != revision.client_message_id
+                or previous.content != revision.content
+            ):
+                raise ConflictException("这版测试质疑已经收到另一项仲裁决定")
+            replay = db.get(Plan, clarification.followup_plan_id)
+            if replay is None:
+                raise ConflictException("产品修订计划关联异常")
+            db.commit()
+            return replay
+
+        message = stage_user_project_message(db, user, project_id, revision)
+        plan = plan_service.stage_plan(
+            db,
+            user,
+            project_id,
+            run_id,
+            PlanCreate(
+                version=latest.version + 1,
+                cause_message_id=message.id,
+                tasks=[
+                    TaskCreate(
+                        task_key="requirements",
+                        recipient=TaskRecipient.PRODUCT_MANAGER,
+                        title="根据测试质疑修订产品意图",
+                        instructions=PRODUCT_REVISION_TASK_INSTRUCTIONS,
+                        expected_output_type=ConfigurationItemType.APP_SPEC,
+                        input_configuration_item_ids=[approved_item_id],
+                    )
+                ],
+            ),
+        )
+        if clarification is None:
+            clarification = RequirementClarification(
+                configuration_item_id=approved_item_id,
+                task_id=approved_task.task_id,
+            )
+            db.add(clarification)
+        clarification.answer_message_id = message.id
+        clarification.followup_plan_id = plan.plan_id
+        db.commit()
+        db.refresh(plan)
+        return plan
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictException("产品修订计划保存冲突，请使用相同请求重试") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
 def dispatch_approved_requirements(
     db: Session,
     user: User,
@@ -659,9 +803,11 @@ def dispatch_approved_requirements(
     outcome = leader_agent.lead_project_turn(
         context,
         instruction=(
-            "本轮只决定已批准 app_spec 的下一个角色。创建且分派一个任务："
-            "简单、固定栈且无关键架构决策时交给 Code Engineer；涉及权限安全、外部系统、"
-            "复杂数据关系、并发或跨模块契约时交给 Architect。任务必须只引用准确成果 "
+            "本轮只决定已批准 app_spec 的下一个角色。创建且分派一个任务。若命中 "
+            "external_integration、auth_or_permission、concurrency、persisted_contract_migration、"
+            "breaking_public_contract 任一标志，或新增超过 1 个相互关联业务实体，交给 Architect；"
+            "仅当这些标志全为 false、最多影响 2 个既有业务模块且契约已明确时，才交给 "
+            "Code Engineer。任务 instructions 首句必须记录命中的 reason code。任务只引用准确成果 "
             f"{approved_item_id}，不得安排 Product Manager、Test Engineer 或未来任务。"
         ),
     )
@@ -774,6 +920,135 @@ def dispatch_completed_code(
         raise
 
 
+def retry_blocked_quality_validation(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    report_item_id: str,
+) -> Task:
+    """Retry QA for unchanged code after a recoverable platform-evidence block.
+
+    A blocked report without a test challenge is not a code defect. Re-running
+    Code Engineer cannot repair missing or temporarily unavailable platform
+    evidence, so recovery creates another read-only Test Engineer assignment for
+    the exact same code identity and remains bounded by MAX_QUALITY_CYCLES.
+    """
+
+    try:
+        run = lock_run(db, user, project_id, run_id)
+        if (run.status, run.stage, run.active_slot) != ("failed", "qa", None):
+            raise ConflictException("当前构建不处于可恢复的质量阻塞状态")
+        row = db.execute(
+            select(ConfigurationItem, Task, Plan)
+            .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+            .join(Task, Task.task_id == TaskResult.task_id)
+            .join(Plan, Plan.plan_id == Task.plan_id)
+            .where(
+                ConfigurationItem.item_id == report_item_id,
+                ConfigurationItem.project_id == project_id,
+                ConfigurationItem.producer_run_id == run_id,
+                Plan.project_id == project_id,
+                Plan.build_run_id == run_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).one_or_none()
+        if row is None:
+            raise NotFoundException("质量报告不存在或不属于当前构建")
+        report_item, quality_task, quality_plan = row
+        report = TestReport.model_validate(report_item.payload)
+        if (
+            report_item.semantic_type != ConfigurationItemType.TEST_REPORT.value
+            or report_item.state != "usable"
+            or quality_task.task_key != QUALITY_TASK_KEY
+            or quality_task.recipient != TaskRecipient.TEST_ENGINEER.value
+            or quality_task.status != "succeeded"
+            or quality_plan.status != "succeeded"
+            or report.quality_conclusion != QualityConclusion.BLOCKED
+            or report.test_challenges
+        ):
+            raise ConflictException("只有无验收冲突的基础设施阻塞可以重试独立验证")
+        inputs = load_test_inputs(
+            db,
+            project_id,
+            run_id,
+            report.code_item_id,
+            lock=True,
+        )
+        if inputs.acceptance_test_plan_item is not None and (
+            report.test_plan_item_id != inputs.acceptance_test_plan_item.item_id
+            or report.test_hash != inputs.acceptance_test_plan_item.content_hash
+        ):
+            raise ConflictException("质量报告与冻结验收测试计划身份不一致")
+        latest = db.scalar(
+            select(Plan)
+            .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
+            .order_by(Plan.version.desc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if latest is None or latest.plan_id != quality_plan.plan_id:
+            raise ConflictException("质量报告已进入其他后续计划")
+        quality_cycles = db.scalar(
+            select(func.count())
+            .select_from(Task)
+            .join(Plan, Task.plan_id == Plan.plan_id)
+            .where(
+                Plan.project_id == project_id,
+                Plan.build_run_id == run_id,
+                Task.task_key == QUALITY_TASK_KEY,
+                Task.recipient == TaskRecipient.TEST_ENGINEER.value,
+            )
+        )
+        if int(quality_cycles or 0) >= MAX_QUALITY_CYCLES:
+            raise ConflictException("独立验收重试轮次已用尽")
+        # Plan validation only accepts active BuildRuns. Reactivate the locked run
+        # inside this transaction before staging the retry plan, and flush so the
+        # validator's SELECT ... FOR UPDATE observes the new state. Any later
+        # failure rolls both the run transition and the plan back together.
+        run.status = BuildRunStatus.RUNNING.value
+        run.stage = "qa"
+        run.active_slot = 1
+        run.error = None
+        db.flush()
+        plan = plan_service.stage_plan(
+            db,
+            user,
+            project_id,
+            run_id,
+            PlanCreate(
+                version=latest.version + 1,
+                cause_message_id=latest.cause_message_id,
+                tasks=[
+                    TaskCreate(
+                        task_key=QUALITY_TASK_KEY,
+                        recipient=TaskRecipient.TEST_ENGINEER,
+                        title="恢复独立验证",
+                        instructions=(
+                            "对同一准确代码结果重新收集平台验收证据；"
+                            "不得把平台验收基础设施问题转交 Code Engineer。"
+                        ),
+                        expected_output_type=ConfigurationItemType.TEST_REPORT,
+                        input_configuration_item_ids=[inputs.code_item.item_id],
+                    )
+                ],
+            ),
+        )
+        task = db.scalar(select(Task).where(Task.plan_id == plan.plan_id))
+        assert task is not None
+        db.commit()
+        db.refresh(task)
+        return task
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictException("质量验证恢复派工保存冲突，请重试") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
 def dispatch_quality_repair(
     db: Session,
     user: User,
@@ -812,7 +1087,7 @@ def dispatch_quality_repair(
             or quality_task.recipient != TaskRecipient.TEST_ENGINEER.value
             or quality_task.status != "succeeded"
             or quality_plan.status != "succeeded"
-            or len(report_item.upstream_item_ids) != 1
+            or len(report_item.upstream_item_ids) not in {1, 2}
         ):
             raise ConflictException("只有已完成的独立验收报告可以触发修复")
         report = TestReport.model_validate(report_item.payload)
@@ -827,6 +1102,11 @@ def dispatch_quality_repair(
         )
         if report.code_item_id != inputs.code_item.item_id:
             raise ConflictException("质量报告与被验证代码身份不一致")
+        if inputs.acceptance_test_plan_item is not None and (
+            report.test_plan_item_id != inputs.acceptance_test_plan_item.item_id
+            or report.test_hash != inputs.acceptance_test_plan_item.content_hash
+        ):
+            raise ConflictException("质量报告与冻结验收测试计划身份不一致")
         latest = db.scalar(
             select(Plan)
             .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
@@ -857,6 +1137,10 @@ def dispatch_quality_repair(
             return None
 
         source_item_id = inputs.code_item.upstream_item_ids[0]
+        repair_inputs = [source_item_id]
+        if inputs.acceptance_test_plan_item is not None:
+            repair_inputs.append(inputs.acceptance_test_plan_item.item_id)
+        repair_inputs.append(report_item_id)
         plan = plan_service.stage_plan(
             db,
             user,
@@ -875,7 +1159,7 @@ def dispatch_quality_repair(
                             "完成平台检查后重新交给独立 Test Engineer 验收。"
                         ),
                         expected_output_type=ConfigurationItemType.CODE,
-                        input_configuration_item_ids=[source_item_id, report_item_id],
+                        input_configuration_item_ids=repair_inputs,
                     )
                 ],
             ),

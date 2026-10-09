@@ -8,8 +8,54 @@ if (!baseUrl || !manifestPath) {
 }
 
 const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+const contract = JSON.parse(
+  await fs.readFile(new URL("./smoke_contract.json", import.meta.url), "utf8"),
+);
 const checks = Array.isArray(manifest.browser_checks) ? manifest.browser_checks : [];
 if (!checks.length) throw new Error("forgeai.smoke.json must define browser_checks");
+
+const actionHandlers = {
+  click: async (page, action) => page.locator(action.selector).first().click(),
+  fill: async (page, action) => page.locator(action.selector).first().fill(action.value),
+  select: async (page, action) =>
+    page.locator(action.selector).first().selectOption(action.value),
+  navigate: async (page, action) =>
+    page.goto(new URL(action.url, baseUrl).toString(), { waitUntil: "domcontentloaded" }),
+  wait_for_selector: async (page, action) =>
+    page.locator(action.selector).first().waitFor({ state: "visible" }),
+  expect_text: async (page, action) =>
+    page.getByText(action.text, { exact: false }).first().waitFor({ state: "visible" }),
+  expect_any_text: async (page, action) =>
+    page.waitForFunction(
+      (texts) => texts.some((text) => document.body?.innerText.includes(text)),
+      action.texts,
+    ),
+  expect_path: async (page, action) =>
+    page.waitForURL((url) => url.pathname === action.path),
+  expect_count: async (page, action) => {
+    const locator = page.locator(action.selector);
+    if (action.count > 0) await locator.first().waitFor({ state: "attached" });
+    const actual = await locator.count();
+    if (actual !== action.count) {
+      throw new Error(
+        "expected " + action.count + " elements for " + action.selector + ", found " + actual,
+      );
+    }
+  },
+  expect_no_horizontal_scroll: async (page) => {
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth + 1,
+    );
+    if (overflow) throw new Error("horizontal viewport overflow");
+  },
+  screenshot: async (page, action) =>
+    page.screenshot({ path: "/tmp/" + action.name + ".png", fullPage: true }),
+};
+const contractActions = Object.keys(contract.browser.actions).sort();
+const implementedActions = Object.keys(actionHandlers).sort();
+if (JSON.stringify(contractActions) !== JSON.stringify(implementedActions)) {
+  throw new Error("smoke contract and browser action handlers are out of sync");
+}
 
 const browser = await chromium.launch({
   executablePath: "/usr/bin/chromium",
@@ -23,7 +69,7 @@ let failed = false;
 try {
   for (const check of checks) {
     const context = await browser.newContext({
-      viewport: { width: 1440, height: 900 },
+      viewport: check.viewport || contract.browser.default_viewport,
       locale: "zh-CN",
     });
     const page = await context.newPage();
@@ -66,19 +112,9 @@ try {
         await page.getByText(text, { exact: false }).first().waitFor({ state: "visible" });
       }
       for (const action of check.actions || []) {
-        if (action.type === "click") {
-          await page.locator(action.selector).first().click();
-        } else if (action.type === "fill") {
-          await page.locator(action.selector).first().fill(action.value);
-        } else if (action.type === "select") {
-          await page.locator(action.selector).first().selectOption(action.value);
-        } else if (action.type === "expect_text") {
-          await page.getByText(action.text, { exact: false }).first().waitFor({ state: "visible" });
-        } else if (action.type === "expect_path") {
-          await page.waitForURL((url) => url.pathname === action.path);
-        } else {
-          throw new Error(`unsupported browser action: ${action.type}`);
-        }
+        const handler = actionHandlers[action.type];
+        if (!handler) throw new Error("unsupported browser action: " + action.type);
+        await handler(page, action);
         await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
       }
       for (const expected of check.expect_api || []) {
@@ -111,5 +147,11 @@ try {
   await browser.close();
 }
 
+for (const check of results.filter((item) => !item.ok)) {
+  for (const error of check.errors) {
+    const detail = String(error).replace(/\s+/g, " ").slice(0, 500);
+    console.error(`BROWSER_CHECK_FAILED ${check.id} ${check.route}: ${detail}`);
+  }
+}
 console.log(JSON.stringify({ browser: "chromium", checks: results }, null, 2));
 if (failed) process.exitCode = 1;

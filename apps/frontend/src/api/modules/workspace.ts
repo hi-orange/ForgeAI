@@ -1,8 +1,11 @@
 import { apiRequest } from '../request'
 
+export type WorkspaceFileKind = 'text' | 'image'
+
 export type WorkspaceFileEntry = {
   path: string
   size_bytes: number
+  kind?: WorkspaceFileKind
 }
 
 export type WorkspaceListing = {
@@ -14,7 +17,9 @@ export type WorkspaceListing = {
 
 export type WorkspaceFileContent = {
   path: string
+  kind?: WorkspaceFileKind
   content: string
+  media_type?: string | null
   truncated: boolean
   size_bytes: number
 }

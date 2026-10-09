@@ -10,6 +10,7 @@ from app.core.exceptions import BusinessException, ConflictException
 from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
+from app.tools import images as image_tools
 from app.tools import project_deps
 
 CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
@@ -117,6 +118,24 @@ CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
                 },
             },
             "required": ["subject", "fact", "evidence_paths"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
+        name="generate_image",
+        description=(
+            "通过已配置的 Ark Seedream 模型生成图片并保存为 frontend/public/ 下的本地资产；"
+            "未配置 ARK_API_KEY 时不可用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "prompt": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "size": {"type": "string", "enum": ["1K", "2K", "4K"]},
+                "watermark": {"type": "boolean"},
+            },
+            "required": ["path", "prompt"],
             "additionalProperties": False,
         },
     ),
@@ -258,6 +277,15 @@ def execute_tool_call(
             if record_engineering_memory is None:
                 raise BusinessException("当前阶段不能记录工程记忆")
             return record_engineering_memory(args)
+        if call.name == "generate_image":
+            return image_tools.generate_project_image(
+                workspace_root,
+                path=str(args.get("path") or ""),
+                prompt=str(args.get("prompt") or ""),
+                size=str(args.get("size") or "2K"),
+                watermark=bool(args.get("watermark", True)),
+                tool_call_id=call.id,
+            )
         if call.name == "install_project_dependency":
             return project_deps.install_project_dependency(
                 workspace_root,

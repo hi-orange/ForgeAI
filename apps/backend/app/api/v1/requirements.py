@@ -5,6 +5,7 @@ from app.orchestration.product_manager import run_product_manager_workflow
 from app.schemas.product_manager_workflow import ProductManagerWorkflowResult
 from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.requirements import (
+    QualityChallengeResolution,
     RequirementsApproval,
     RequirementsExecute,
     RequirementsStart,
@@ -20,6 +21,7 @@ from app.services.requirements import (
     ensure_engineering_running,
     get_requirements_status,
     pause_active_execution,
+    resolve_quality_challenge,
     start_requirements,
     submit_requirements,
 )
@@ -94,6 +96,30 @@ def approve_requirement_plan_route(
     current_user: CurrentUser,
 ) -> dict:
     return success(approve_requirement_plan(db, current_user, project_id, run_id, item_id, payload))
+
+
+@router.post(
+    "/build-runs/{run_id}/quality-reports/{report_item_id}/challenge-resolution",
+    response_model=ApiResponse[RequirementsStatus],
+)
+def resolve_quality_challenge_route(
+    project_id: int,
+    run_id: str,
+    report_item_id: str,
+    payload: QualityChallengeResolution,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    return success(
+        resolve_quality_challenge(
+            db,
+            current_user,
+            project_id,
+            run_id,
+            report_item_id,
+            payload,
+        )
+    )
 
 
 @router.post(

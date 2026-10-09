@@ -22,6 +22,7 @@ from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
+from app.schemas.acceptance_test_plan import AcceptanceTestPlan
 from app.schemas.app_spec import AppSpec
 from app.schemas.code_artifact import CodeArtifact
 from app.schemas.configuration_item import ConfigurationItemRegistration
@@ -31,13 +32,14 @@ from app.services import build_run as build_run_service
 from app.services import configuration_manager, task_execution
 from app.services import plan as plan_service
 from app.services import task as task_service
+from app.services.acceptance_testing import load_acceptance_test_plan
 from app.services.engineering.handoff import (
     ENGINEERING_TASK_KEY,
     QUALITY_TASK_KEY,
     load_engineering_source,
 )
 
-TEST_REPORT_SCHEMA_VERSION = 1
+TEST_REPORT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +50,8 @@ class TestInputs:
     code_plan: Plan
     app_spec: AppSpec
     system_design: SystemDesign | None
+    acceptance_test_plan_item: ConfigurationItem | None
+    acceptance_test_plan: AcceptanceTestPlan | None
 
 
 def _load_task(
@@ -121,7 +125,7 @@ def load_test_inputs(
         or code_task.expected_output_type != ConfigurationItemType.CODE.value
         or code_task.status != TaskStatus.SUCCEEDED.value
         or code_plan.status != PlanStatus.SUCCEEDED.value
-        or len(code_item.upstream_item_ids) not in {1, 2}
+        or len(code_item.upstream_item_ids) not in {1, 2, 3}
     ):
         raise ConflictException("只能验证已完成且可用的准确 code 成果")
     try:
@@ -135,6 +139,27 @@ def load_test_inputs(
         code_item.upstream_item_ids[0],
         lock=lock,
     )
+    acceptance_test_plan_item: ConfigurationItem | None = None
+    acceptance_test_plan: AcceptanceTestPlan | None = None
+    if len(code_item.upstream_item_ids) >= 2:
+        candidate = db.scalar(
+            select(ConfigurationItem).where(
+                ConfigurationItem.item_id == code_item.upstream_item_ids[1],
+                ConfigurationItem.project_id == project_id,
+            )
+        )
+        if (
+            candidate is not None
+            and candidate.semantic_type == ConfigurationItemType.ACCEPTANCE_TEST_PLAN.value
+        ):
+            acceptance_test_plan_item, acceptance_test_plan = load_acceptance_test_plan(
+                db,
+                project_id=project_id,
+                run_id=run_id,
+                item_id=candidate.item_id,
+                source_item_id=code_item.upstream_item_ids[0],
+                lock=lock,
+            )
     return TestInputs(
         code_item=code_item,
         code_artifact=artifact,
@@ -142,6 +167,8 @@ def load_test_inputs(
         code_plan=code_plan,
         app_spec=source.app_spec,
         system_design=source.system_design,
+        acceptance_test_plan_item=acceptance_test_plan_item,
+        acceptance_test_plan=acceptance_test_plan,
     )
 
 
@@ -224,6 +251,14 @@ def complete_test_engineer_task(
             inputs.code_artifact.source_hash,
         ):
             raise BusinessException("测试报告引用的不是任务指定的准确代码结果")
+        if inputs.acceptance_test_plan_item is not None and (
+            report.test_plan_item_id,
+            report.test_hash,
+        ) != (
+            inputs.acceptance_test_plan_item.item_id,
+            inputs.acceptance_test_plan_item.content_hash,
+        ):
+            raise BusinessException("测试报告没有绑定任务指定的冻结测试计划")
         saved = db.get(TaskResult, task_id)
         if saved is not None:
             if saved.result_hash != result_hash:
@@ -249,7 +284,14 @@ def complete_test_engineer_task(
                 semantic_type=ConfigurationItemType.TEST_REPORT,
                 schema_version=TEST_REPORT_SCHEMA_VERSION,
                 payload=payload,
-                upstream_item_ids=[code_item_id],
+                upstream_item_ids=[
+                    code_item_id,
+                    *(
+                        [inputs.acceptance_test_plan_item.item_id]
+                        if inputs.acceptance_test_plan_item is not None
+                        else []
+                    ),
+                ],
             ),
         )
         db.add(

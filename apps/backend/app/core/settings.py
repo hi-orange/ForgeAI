@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
 
+    # Optional Volcengine Ark / Seedream image generation. The capability stays
+    # disabled until a dedicated key is configured; it never reuses the chat key.
+    ark_api_key: str | None = None
+    ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    ark_image_model: str = "doubao-seedream-5-0-pro-260628"
+    image_generation_timeout_seconds: float = 180.0
+    image_generation_max_bytes: int = 15 * 1024 * 1024
+
     tavily_api_key: str | None = None
     tavily_base_url: str = "https://api.tavily.com"
 
@@ -75,6 +83,10 @@ class Settings(BaseSettings):
             f"{self.mysql_database}"
             f"?charset=utf8mb4"
         )
+
+    @property
+    def image_generation_enabled(self) -> bool:
+        return bool(self.ark_api_key and self.ark_image_model)
 
 
 settings = Settings()

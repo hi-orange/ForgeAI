@@ -15,6 +15,7 @@ from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_with_tools
 from app.models.task import TaskRecipient
+from app.schemas.acceptance_test_plan import AcceptanceTestPlan
 from app.schemas.agent_action import ToolCall
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
@@ -49,6 +50,9 @@ def verify_code(
     code_source_hash: str,
     workspace_root: Path,
     system_design: SystemDesign | None,
+    acceptance_test_plan_item_id: str | None = None,
+    acceptance_test_hash: str | None = None,
+    acceptance_test_plan: AcceptanceTestPlan | None = None,
     saved_progress: object = None,
     heartbeat: Callable[[], None] | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
@@ -74,12 +78,16 @@ def verify_code(
         code_item_id=code_item_id,
         code_source_hash=code_source_hash,
         workspace_root=root,
+        acceptance_test_plan_item_id=acceptance_test_plan_item_id,
+        acceptance_test_hash=acceptance_test_hash,
+        acceptance_test_plan=acceptance_test_plan,
     )
     restore_test_engineer_progress(state, saved_progress)
     resumed_progress = export_test_engineer_progress(state)
     if "all" not in state.checks:
         preferred_next_tools = [
             "read_artifact(app_spec)",
+            "read_artifact(acceptance_test_plan)",
             'run_check(check_id="all")',
             'capture_screenshots(route="/")',
             "write_test_report",
@@ -101,6 +109,19 @@ def verify_code(
                     "source_hash": code_source_hash,
                     "acceptance_ids": [item.id for item in spec.acceptance_criteria],
                     "has_system_design": system_design is not None,
+                    "test_plan_item_id": acceptance_test_plan_item_id,
+                    "test_hash": acceptance_test_hash,
+                    "acceptance_test_plan": (
+                        acceptance_test_plan.model_dump(mode="json")
+                        if acceptance_test_plan is not None
+                        else None
+                    ),
+                    "acceptance_execution_contract": {
+                        "available_runtime_tool": 'run_check(check_id="all")',
+                        "available_browser_tool": 'capture_screenshots(route="/")',
+                        "target_paths_are_logical": True,
+                        "missing_logical_target_is_not_a_code_defect": True,
+                    },
                     "tool_budget": MAX_TEST_ENGINEER_TOOL_TURNS,
                     "preferred_next_tools": preferred_next_tools,
                     "resumed_progress": resumed_progress,

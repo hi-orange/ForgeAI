@@ -149,24 +149,37 @@ def load_engineering_source(
     )
 
 
-def _is_engineering_delivery_task(task: Task, item_id: str) -> bool:
+def _matches_engineering_inputs(
+    task: Task, item_id: str, acceptance_test_plan_item_id: str | None
+) -> bool:
+    expected = [item_id]
+    if acceptance_test_plan_item_id is not None:
+        expected.append(acceptance_test_plan_item_id)
+    return task.input_configuration_item_ids == expected
+
+
+def _is_engineering_delivery_task(
+    task: Task, item_id: str, acceptance_test_plan_item_id: str | None = None
+) -> bool:
     return (
         task.task_key == ENGINEERING_TASK_KEY
         and task.recipient == TaskRecipient.CODE_ENGINEER.value
         and task.expected_output_type == "code"
         and task.status == TaskStatus.PENDING.value
-        and task.input_configuration_item_ids == [item_id]
+        and _matches_engineering_inputs(task, item_id, acceptance_test_plan_item_id)
         and not task.depends_on_task_ids
     )
 
 
-def _is_claimed_engineering_delivery_task(task: Task, item_id: str) -> bool:
+def _is_claimed_engineering_delivery_task(
+    task: Task, item_id: str, acceptance_test_plan_item_id: str | None = None
+) -> bool:
     return (
         task.task_key == ENGINEERING_TASK_KEY
         and task.recipient == TaskRecipient.CODE_ENGINEER.value
         and task.expected_output_type == "code"
         and task.status == TaskStatus.RUNNING.value
-        and task.input_configuration_item_ids == [item_id]
+        and _matches_engineering_inputs(task, item_id, acceptance_test_plan_item_id)
         and not task.depends_on_task_ids
     )
 
@@ -214,7 +227,12 @@ def find_architecture_task(
 
 
 def find_pending_engineering_task(
-    db: Session, source_plan: Plan, item_id: str, *, lock: bool = False
+    db: Session,
+    source_plan: Plan,
+    item_id: str,
+    acceptance_test_plan_item_id: str | None = None,
+    *,
+    lock: bool = False,
 ) -> Task | None:
     """Find a replayable pending engineering delivery for this completed design.
 
@@ -243,10 +261,14 @@ def find_pending_engineering_task(
                 raise ConflictException("已有其他后续计划，不能重复派工")
             continue
         task = tasks[0]
-        if plan.status == "pending" and _is_engineering_delivery_task(task, item_id):
+        if plan.status == "pending" and _is_engineering_delivery_task(
+            task, item_id, acceptance_test_plan_item_id
+        ):
             engineering = task
             break
-        if plan.status == "running" and _is_claimed_engineering_delivery_task(task, item_id):
+        if plan.status == "running" and _is_claimed_engineering_delivery_task(
+            task, item_id, acceptance_test_plan_item_id
+        ):
             # Already claimed; create_engineering_delivery_task uses find_claimed separately.
             continue
         if plan.status == "pending":
@@ -257,7 +279,12 @@ def find_pending_engineering_task(
 
 
 def find_claimed_engineering_task(
-    db: Session, source_plan: Plan, item_id: str, *, lock: bool = False
+    db: Session,
+    source_plan: Plan,
+    item_id: str,
+    acceptance_test_plan_item_id: str | None = None,
+    *,
+    lock: bool = False,
 ) -> Task | None:
     """Return the running engineering delivery for this approval, if already claimed."""
     statement = (
@@ -281,7 +308,7 @@ def find_claimed_engineering_task(
         if len(tasks) != 1:
             continue
         task = tasks[0]
-        if _is_claimed_engineering_delivery_task(task, item_id):
+        if _is_claimed_engineering_delivery_task(task, item_id, acceptance_test_plan_item_id):
             return task
     return None
 
