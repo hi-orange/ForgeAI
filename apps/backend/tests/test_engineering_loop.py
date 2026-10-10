@@ -111,14 +111,14 @@ class EngineeringLoopTests(EngineeringClaimTests):
         messages = build_code_engineer_messages(
             spec=spec,
             work_item=plan_delivery(spec)[0],
-            engineering_context={"workspace_file_index": {"paths": ["frontend/src/App.vue"]}},
+            engineering_context={"workspace_file_index": {"paths": ["frontend/src/App.tsx"]}},
             observations=[
                 ToolExecutionResult(
                     tool_call_id="call_read",
                     name="read_file",
                     ok=True,
                     summary="ok",
-                    arguments={"path": "frontend/src/App.vue"},
+                    arguments={"path": "frontend/src/App.tsx"},
                 )
             ],
             system_design=SystemDesign.model_validate(valid_design()),
@@ -191,9 +191,9 @@ class EngineeringLoopTests(EngineeringClaimTests):
             "files": [
                 {
                     "id": "job_list",
-                    "path": "frontend/src/views/Jobs.vue",
+                    "path": "frontend/src/views/Jobs.tsx",
                     "description": "展示已发布职位",
-                    "context_paths": ["frontend/src/App.vue"],
+                    "context_paths": ["frontend/src/App.tsx"],
                 }
             ],
         }
@@ -209,10 +209,10 @@ class EngineeringLoopTests(EngineeringClaimTests):
             batch = plan_work_item_files(
                 spec=spec,
                 work_item=work_item,
-                workspace_file_index={"paths": ["frontend/src/App.vue"]},
+                workspace_file_index={"paths": ["frontend/src/App.tsx"]},
                 system_design=None,
             )
-        self.assertEqual(batch.plan.files[0].path, "frontend/src/views/Jobs.vue")
+        self.assertEqual(batch.plan.files[0].path, "frontend/src/views/Jobs.tsx")
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(call["json_output"] is True for call in calls))
         self.assertIn("只重新输出完整 JSON", calls[1]["messages"][-1]["content"])
@@ -226,7 +226,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
             "files": [
                 {
                     "id": "job_list",
-                    "path": "frontend/src/views/Jobs.vue",
+                    "path": "frontend/src/views/Jobs.tsx",
                     "description": "展示已发布职位",
                     "context_paths": [],
                 }

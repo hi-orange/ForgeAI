@@ -22,7 +22,7 @@ from app.models.task_result import TaskResult
 from app.models.user import User
 from app.orchestration import product_manager as product_manager_workflow
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall
-from app.schemas.leader import LeaderIntentDecision, LeaderOutcome
+from app.schemas.leader import LeaderIntentDecision, LeaderNextAction, LeaderOutcome
 from app.schemas.plan import PlanCreate
 from app.schemas.product_manager_workflow import ProductManagerWorkflowOutcome
 from app.schemas.task import TaskCreate
@@ -167,6 +167,14 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
                     tasks=[task],
                 ),
                 dispatched_task_keys=[task.task_key],
+                next_action=LeaderNextAction(
+                    task_key=task.task_key,
+                    recipient=task.recipient,
+                    reason_code="DIRECT_ENGINEERING",
+                    source_configuration_item_ids=[approved_id],
+                    risk_flags=[],
+                    approval_required=False,
+                ),
             )
 
         self.leader = self.enterContext(

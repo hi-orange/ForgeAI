@@ -23,7 +23,7 @@ from app.tools.paths import MAX_FILE_BYTES, SKIP_DIRS, is_text_file, safe_path_u
 
 CHECK_IDS = {"database", "backend", "frontend", "all"}
 CHECK_RUNTIME_LABEL = "org.forgeai.check-runtime-version"
-CHECK_RUNTIME_VERSION = "13"
+CHECK_RUNTIME_VERSION = "14"
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 MAX_BINARY_ASSETS_BYTES = 32 * 1024 * 1024

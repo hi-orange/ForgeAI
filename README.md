@@ -1,14 +1,14 @@
 # ForgeAI
 
-**Conversational full-stack app builder** — describe an app in natural language, get a runnable FastAPI + Vue + SQLite application, refine it through chat.
+**Conversational full-stack app builder** — describe an app in natural language, get a runnable React + FastAPI application, refine it through chat, and deploy it with SQLite for local previews or PostgreSQL in production.
 
 Monorepo: Vue frontend + FastAPI backend (pnpm + Turborepo).
 
 ## Docs
 
-| Doc | Purpose |
-|-----|---------|
-| [AGENTS.md](AGENTS.md) | AI/human project guide |
+| Doc                                          | Purpose                         |
+| -------------------------------------------- | ------------------------------- |
+| [AGENTS.md](AGENTS.md)                       | AI/human project guide          |
 | [docs/architecture.md](docs/architecture.md) | System design (source of truth) |
 
 ## Setup

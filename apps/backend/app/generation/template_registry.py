@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-FULLSTACK_V1 = "fullstack-v1"
 FULLSTACK_REACT_V1 = "fullstack-react-v1"
 DEFAULT_TEMPLATE_VERSION = FULLSTACK_REACT_V1
 
@@ -28,14 +27,25 @@ def get_template_root(template_version: str = DEFAULT_TEMPLATE_VERSION) -> Path:
         root / "template.json",
         root / "README.template.md",
         root / "forgeai.smoke.json",
+        root / "compose.yml",
         root / "frontend" / "package.json",
+        root / "frontend" / "package-lock.json",
+        root / "frontend" / "Dockerfile",
         root / "backend" / "app" / "main.py",
+        root / "backend" / "uv.lock",
+        root / "backend" / "Dockerfile",
         root / "backend" / "alembic" / "versions" / "0001_create_app_meta.py",
     )
     missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
     if missing:
         raise TemplateNotFoundError(
             f"template {template_version} is incomplete; missing: {', '.join(missing)}"
+        )
+    assets_dir = root / "frontend" / "public" / "assets" / "images"
+    if not assets_dir.is_dir():
+        raise TemplateNotFoundError(
+            f"template {template_version} is incomplete; missing directory: "
+            "frontend/public/assets/images"
         )
     return root
 

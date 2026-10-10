@@ -21,6 +21,10 @@ turned into an isolated, traceable and recoverable generated application.
    confirms the test and repairs code, or creates a new approved product version and a new test hash.
 8. Cross-role policy has one source of truth. Runtime schemas and validators define exact fields;
    `app.agents.prompts.contracts` defines compact policy fragments injected into role prompts.
+9. Generated applications use React, TypeScript and FastAPI. Isolated previews default to SQLite;
+   deployment uses the same SQLAlchemy/Alembic contract and may switch to PostgreSQL through
+   `DATABASE_URL`. Authentication, email and external services are added only when approved intent
+   requires them, rather than being hidden baseline behavior.
 
 ## Rule priority
 

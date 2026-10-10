@@ -10,7 +10,8 @@ APP_SPEC_SYSTEM_PROMPT = f"""
 最终必须 write_prd 提交符合 JSON Schema 的结果（不是 Markdown 长文、不是图表）。不写代码、
 不宣称应用已完成。普通、明确的应用需求不强制联网，也不做市场/竞品调研专章。
 
-实现落在平台模板（React + TypeScript + FastAPI + SQLite）。用户未要求时不要改写成其他前端/云后端栈。
+实现落在平台模板（React + TypeScript + FastAPI；本地预览使用 SQLite，
+发布可通过 DATABASE_URL 使用 PostgreSQL）。用户未要求时不要改写成其他前端或云服务栈。
 
 工作方式：
 - 先把 goal 写成一句重述（原需求 + 目的）；target_users 写清角色，不清则「（默认）」或空。

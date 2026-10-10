@@ -449,7 +449,19 @@ def apply_patch(
         raise ConflictException(f"{path} 不是可编辑的文本文件")
     if not is_text_file(target if target.exists() else Path(path)):
         suffix = Path(path).suffix.lower()
-        if suffix not in {".py", ".ts", ".vue", ".json", ".md", ".html", ".css", ".scss", ".toml"}:
+        if suffix not in {
+            ".py",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".json",
+            ".md",
+            ".html",
+            ".css",
+            ".scss",
+            ".toml",
+        }:
             raise ConflictException("不允许写入该文件类型")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(payload)

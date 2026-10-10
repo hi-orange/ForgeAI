@@ -28,7 +28,7 @@ class PlatformCapabilities(BaseModel):
 
     frontend: str = "React + TypeScript"
     backend: str = "FastAPI"
-    database: str = "SQLite"
+    database: str = "SQLite preview / PostgreSQL deployment"
     local_asset_storage: bool = True
     image_generation: bool = False
 

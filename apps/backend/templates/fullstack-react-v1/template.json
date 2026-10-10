@@ -3,12 +3,14 @@
   "stack": {
     "frontend": "react",
     "backend": "fastapi",
-    "database": "sqlite"
+    "database": "sqlite-preview/postgresql-production"
   },
   "reference": {
     "repository": "https://github.com/fastapi/full-stack-fastapi-template",
     "license": "MIT",
-    "adaptation": "ForgeAI preview profile using SQLite and a single /api/v1 contract"
+    "upstream_commit": "7257e606cb94eada1dca40173e2b7f99dd549bc6",
+    "upstream_fetched_at": "2026-10-10",
+    "adaptation": "ForgeAI profile using SQLite for isolated previews, PostgreSQL for deployment, and a single /api/v1 contract"
   },
   "description": "Modern React and FastAPI skeleton for generated websites. Business features are added from approved requirements."
 }

@@ -56,7 +56,7 @@ class SmokeManifestTests(unittest.TestCase):
     def write_manifest(self, root: Path, manifest: dict) -> Path:
         template = root / "template.json"
         if not template.exists():
-            template.write_text('{"template_version":"fullstack-v1"}', encoding="utf-8")
+            template.write_text('{"template_version":"test-fixture"}', encoding="utf-8")
         path = root / "forgeai.smoke.json"
         path.write_text(json.dumps(manifest), encoding="utf-8")
         return path

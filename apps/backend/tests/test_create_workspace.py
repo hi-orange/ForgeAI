@@ -10,7 +10,6 @@ from pathlib import Path
 from app.generation import (
     DEFAULT_TEMPLATE_VERSION,
     FULLSTACK_REACT_V1,
-    FULLSTACK_V1,
     TemplateNotFoundError,
     WorkspaceExistsError,
     create_workspace,
@@ -28,10 +27,14 @@ class CreateWorkspaceTests(unittest.TestCase):
         self.assertEqual(meta["stack"]["frontend"], "react")
         root = get_template_root()
         self.assertTrue((root / "frontend" / "package.json").is_file())
+        self.assertTrue((root / "frontend" / "package-lock.json").is_file())
         self.assertTrue((root / "frontend" / "src" / "App.tsx").is_file())
         self.assertTrue((root / "frontend" / "src" / "router.tsx").is_file())
+        self.assertTrue((root / "frontend" / "public" / "assets" / "images").is_dir())
         self.assertTrue((root / "forgeai.smoke.json").is_file())
         self.assertTrue((root / "backend" / "app" / "main.py").is_file())
+        self.assertTrue((root / "backend" / "uv.lock").is_file())
+        self.assertTrue((root / "compose.yml").is_file())
         self.assertTrue(
             (root / "backend" / "alembic" / "versions" / "0001_create_app_meta.py").is_file()
         )
@@ -59,18 +62,18 @@ class CreateWorkspaceTests(unittest.TestCase):
             workspace = create_workspace(dest)
             self.assertEqual(workspace, dest.resolve())
             self.assertTrue((workspace / "README.md").is_file())
+            self.assertTrue((workspace / ".gitignore").is_file())
+            self.assertTrue((workspace / "compose.yml").is_file())
             self.assertTrue((workspace / "frontend" / "src" / "App.tsx").is_file())
+            self.assertTrue(
+                (workspace / "frontend" / "public" / "assets" / "images" / "favicon.png").is_file()
+            )
             self.assertTrue((workspace / "backend" / "app" / "api" / "health.py").is_file())
             self.assertTrue((workspace / "manifest.schema.json").is_file())
             smoke = json.loads((workspace / "forgeai.smoke.json").read_text(encoding="utf-8"))
             self.assertEqual(smoke["version"], 1)
             self.assertTrue(smoke["api_checks"])
             self.assertTrue(smoke["browser_checks"])
-
-    def test_legacy_vue_template_remains_available_for_frozen_runs(self) -> None:
-        meta = load_template_metadata(FULLSTACK_V1)
-        self.assertEqual(meta["stack"]["frontend"], "vue")
-        self.assertTrue((get_template_root(FULLSTACK_V1) / "frontend/src/App.vue").is_file())
 
     def test_create_workspace_refuses_existing_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

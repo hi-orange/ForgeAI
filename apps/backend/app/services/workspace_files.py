@@ -31,7 +31,6 @@ _TEXT_SUFFIXES = {
     ".tsx",
     ".js",
     ".jsx",
-    ".vue",
     ".json",
     ".md",
     ".toml",

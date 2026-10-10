@@ -524,7 +524,9 @@ class TestEngineerTests(unittest.TestCase):
         with TemporaryDirectory(prefix="forgeai-test-engineer-cap-") as directory:
             root = Path(directory)
             (root / "frontend").mkdir()
-            (root / "frontend" / "a.vue").write_text("<template></template>\n", encoding="utf-8")
+            (root / "frontend" / "a.tsx").write_text(
+                "export const A = () => null\n", encoding="utf-8"
+            )
             state = EngineerToolState(
                 app_spec=valid_spec(),
                 code_item_id="ci_code",
@@ -536,13 +538,13 @@ class TestEngineerTests(unittest.TestCase):
                     ToolCall(
                         id=f"read_{index}",
                         name="read_file",
-                        arguments={"path": "frontend/a.vue"},
+                        arguments={"path": "frontend/a.tsx"},
                     ),
                     state,
                 )
                 self.assertTrue(result.ok, result.summary)
             blocked, _ = execute_test_engineer_tool(
-                ToolCall(id="read_blocked", name="read_file", arguments={"path": "frontend/a.vue"}),
+                ToolCall(id="read_blocked", name="read_file", arguments={"path": "frontend/a.tsx"}),
                 state,
             )
         self.assertFalse(blocked.ok)

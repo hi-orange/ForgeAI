@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import socket
@@ -30,6 +32,16 @@ from app.services.requirements import get_requirements_status
 logger = logging.getLogger("forgeai.preview")
 
 PreviewState = Literal["idle", "starting", "ready", "error", "disabled"]
+_MAX_RUNTIME_DIAGNOSTIC_CHARS = 4_000
+_FRONTEND_BUILD_MARKER_VERSION = 1
+_FRONTEND_BUILD_SKIP_DIRS = {
+    ".git",
+    ".cache",
+    ".vite",
+    "coverage",
+    "dist",
+    "node_modules",
+}
 
 
 class PreviewStatus(BaseModel):
@@ -52,6 +64,8 @@ class _PreviewSession:
     backend_port: int | None = None
     preview_port: int | None = None
     backend_proc: subprocess.Popen[bytes] | None = None
+    backend_log_path: Path | None = None
+    backend_error_path: str | None = None
     proxy_server: ThreadingHTTPServer | None = None
     proxy_thread: threading.Thread | None = None
     last_access: float = field(default_factory=time.monotonic)
@@ -266,9 +280,56 @@ def _backend_env(workspace: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["DATABASE_URL"] = f"sqlite:///{db_path.as_posix()}"
     env["DEBUG"] = "false"
+    env["PYTHONUNBUFFERED"] = "1"
     # Allow embedding from the ForgeAI workbench origin.
     env["CORS_ORIGINS"] = settings.cors_origins
     return env
+
+
+def _backend_log_path(workspace: Path) -> Path:
+    path = workspace / "forgeai" / "logs" / "preview-backend.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _backend_log_tail(session: _PreviewSession) -> str:
+    path = session.backend_log_path
+    if path is None or not path.is_file():
+        return ""
+    try:
+        raw = path.read_bytes()[-(_MAX_RUNTIME_DIAGNOSTIC_CHARS * 4) :]
+        text = raw.decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    workspace = str(session.workspace.resolve())
+    return text.replace(workspace, "<workspace>")[-_MAX_RUNTIME_DIAGNOSTIC_CHARS:]
+
+
+def _with_backend_diagnostic(summary: str, detail: str) -> str:
+    if not detail:
+        return summary[:_MAX_RUNTIME_DIAGNOSTIC_CHARS]
+    separator = "。后端日志："
+    if len(summary) + len(separator) >= _MAX_RUNTIME_DIAGNOSTIC_CHARS:
+        return summary[:_MAX_RUNTIME_DIAGNOSTIC_CHARS]
+    remaining = max(0, _MAX_RUNTIME_DIAGNOSTIC_CHARS - len(summary) - len(separator))
+    return f"{summary}{separator}{detail[-remaining:]}"
+
+
+def _record_backend_failure(session: _PreviewSession, request_path: str, status: int) -> None:
+    detail = _backend_log_tail(session)
+    message = _with_backend_diagnostic(f"预览 API {request_path} 返回 HTTP {status}", detail)
+    with session.lock:
+        session.message = message
+        session.backend_error_path = request_path
+        _touch(session)
+
+
+def _clear_backend_failure(session: _PreviewSession, request_path: str) -> None:
+    with session.lock:
+        if session.backend_error_path == request_path:
+            session.message = None
+            session.backend_error_path = None
+        _touch(session)
 
 
 def _run_checked(
@@ -286,6 +347,8 @@ def _run_checked(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         check=False,
     )
@@ -295,37 +358,115 @@ def _run_checked(
     raise BusinessException(f"{label}失败" + (f"：{tail}" if tail else ""))
 
 
+def _frontend_source_hash(frontend: Path) -> str:
+    digest = hashlib.sha256()
+    for current, directories, files in os.walk(frontend, followlinks=False):
+        directories[:] = sorted(
+            name for name in directories if name not in _FRONTEND_BUILD_SKIP_DIRS
+        )
+        current_path = Path(current)
+        for name in sorted(files):
+            path = current_path / name
+            if path.is_symlink():
+                raise BusinessException("前端源码包含符号链接，无法建立可信预览产物")
+            relative = path.relative_to(frontend).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            try:
+                with path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+            except OSError as exc:
+                raise BusinessException(f"无法读取前端源码：{relative}") from exc
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _frontend_build_marker(workspace: Path) -> Path:
+    return workspace / "forgeai" / "preview" / "frontend-build.json"
+
+
+def _frontend_dist_matches(workspace: Path, source_hash: str) -> bool:
+    marker = _frontend_build_marker(workspace)
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return (
+        payload.get("version") == _FRONTEND_BUILD_MARKER_VERSION
+        and payload.get("source_hash") == source_hash
+    )
+
+
+def _write_frontend_build_marker(workspace: Path, source_hash: str) -> None:
+    marker = _frontend_build_marker(workspace)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"version": _FRONTEND_BUILD_MARKER_VERSION, "source_hash": source_hash},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(marker)
+
+
+def _frontend_build_env(frontend: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    # Node's compile cache can leave native SWC bindings unusable across interrupted
+    # Windows preview runs. Vite is short-lived here, so disabling it is deterministic.
+    env["NODE_DISABLE_COMPILE_CACHE"] = "1"
+    if os.name == "nt":
+        for package, binary in (
+            ("core-win32-x64-msvc", "swc.win32-x64-msvc.node"),
+            ("core-win32-arm64-msvc", "swc.win32-arm64-msvc.node"),
+            ("core-win32-ia32-msvc", "swc.win32-ia32-msvc.node"),
+        ):
+            candidate = frontend / "node_modules" / "@swc" / package / binary
+            if candidate.is_file():
+                # Bypass @swc/core's package auto-loader. It can retain a failed
+                # native package cache across interrupted Windows builds.
+                env["SWC_BINARY_PATH"] = str(candidate.resolve())
+                break
+    return env
+
+
 def _ensure_frontend_dist(workspace: Path) -> None:
-    dist_index = workspace / "frontend" / "dist" / "index.html"
-    if dist_index.is_file():
+    frontend = workspace / "frontend"
+    dist_index = frontend / "dist" / "index.html"
+    source_hash = _frontend_source_hash(frontend)
+    if dist_index.is_file() and _frontend_dist_matches(workspace, source_hash):
         return
-    vite_entry = workspace / "frontend" / "node_modules" / "vite" / "bin" / "vite.js"
+    vite_entry = frontend / "node_modules" / "vite" / "bin" / "vite.js"
     if not vite_entry.is_file():
         raise BusinessException("前端依赖未安装，无法构建预览（缺少 vite）")
     _run_checked(
         ["node", str(vite_entry), "build"],
-        cwd=workspace / "frontend",
-        env=dict(os.environ),
+        cwd=frontend,
+        env=_frontend_build_env(frontend),
         timeout=int(settings.preview_build_timeout_seconds),
         label="前端构建",
     )
     if not dist_index.is_file():
         raise BusinessException("前端构建未生成 dist/index.html")
+    _write_frontend_build_marker(workspace, source_hash)
 
 
 def _ensure_backend_ready(workspace: Path, env: dict[str, str]) -> None:
     backend = workspace / "backend"
     if not (backend / "pyproject.toml").is_file():
         raise BusinessException("工作区缺少后端工程")
-    # Sync deps when the app venv is missing; reuse when present.
-    if not (backend / ".venv").is_dir():
-        _run_checked(
-            ["uv", "sync"],
-            cwd=backend,
-            env=env,
-            timeout=int(settings.preview_build_timeout_seconds),
-            label="后端依赖同步",
-        )
+    # Always reconcile the environment with the current manifest. Reusing an old
+    # .venv after pyproject.toml changed is a common source of preview-only failures.
+    _run_checked(
+        ["uv", "sync"],
+        cwd=backend,
+        env=env,
+        timeout=int(settings.preview_build_timeout_seconds),
+        label="后端依赖同步",
+    )
     _run_checked(
         ["uv", "run", "alembic", "upgrade", "head"],
         cwd=backend,
@@ -333,6 +474,15 @@ def _ensure_backend_ready(workspace: Path, env: dict[str, str]) -> None:
         timeout=60,
         label="数据库迁移",
     )
+
+
+def _backend_python(workspace: Path) -> Path:
+    backend = workspace / "backend"
+    for relative in (Path(".venv/Scripts/python.exe"), Path(".venv/bin/python")):
+        candidate = backend / relative
+        if candidate.is_file():
+            return candidate
+    raise BusinessException("后端虚拟环境不完整，无法启动预览（缺少 Python）")
 
 
 def _wait_http(url: str, *, timeout: float, label: str) -> None:
@@ -350,7 +500,13 @@ def _wait_http(url: str, *, timeout: float, label: str) -> None:
     raise BusinessException(f"{label}未在时限内就绪" + (f"：{last_error}" if last_error else ""))
 
 
-def _make_proxy_handler(dist_root: Path, backend_port: int, bind_host: str, workspace: Path):
+def _make_proxy_handler(
+    dist_root: Path,
+    backend_port: int,
+    bind_host: str,
+    workspace: Path,
+    session: _PreviewSession,
+):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -380,6 +536,7 @@ def _make_proxy_handler(dist_root: Path, backend_port: int, bind_host: str, work
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     payload = response.read()
+                    _clear_backend_failure(session, split.path)
                     self.send_response(response.status)
                     for key, value in response.headers.items():
                         if key.lower() in {"transfer-encoding", "connection", "content-encoding"}:
@@ -390,6 +547,8 @@ def _make_proxy_handler(dist_root: Path, backend_port: int, bind_host: str, work
                     self.wfile.write(payload)
             except urllib.error.HTTPError as exc:
                 payload = exc.read()
+                if exc.code >= 500:
+                    _record_backend_failure(session, split.path, exc.code)
                 self.send_response(exc.code)
                 self.send_header("Content-Type", exc.headers.get("Content-Type", "text/plain"))
                 self.send_header("Content-Length", str(len(payload)))
@@ -486,8 +645,9 @@ def _start_proxy(
     preview_port: int,
     backend_port: int,
     workspace: Path,
+    session: _PreviewSession,
 ) -> ThreadingHTTPServer:
-    handler = _make_proxy_handler(dist_root, backend_port, bind_host, workspace)
+    handler = _make_proxy_handler(dist_root, backend_port, bind_host, workspace, session)
     server = ThreadingHTTPServer((bind_host, preview_port), handler)
     thread = threading.Thread(
         target=server.serve_forever,
@@ -518,22 +678,26 @@ def _boot_session(session: _PreviewSession) -> None:
             session.preview_port = preview_port
             session.message = "正在启动应用…"
             _touch(session)
-        backend_proc = subprocess.Popen(
-            [
-                "uv",
-                "run",
-                "uvicorn",
-                "app.main:app",
-                "--host",
-                bind_host,
-                "--port",
-                str(backend_port),
-            ],
-            cwd=session.workspace / "backend",
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        log_path = _backend_log_path(session.workspace)
+        with session.lock:
+            session.backend_log_path = log_path
+        with log_path.open("wb") as backend_log:
+            backend_proc = subprocess.Popen(
+                [
+                    str(_backend_python(session.workspace)),
+                    "-m",
+                    "uvicorn",
+                    "app.main:app",
+                    "--host",
+                    bind_host,
+                    "--port",
+                    str(backend_port),
+                ],
+                cwd=session.workspace / "backend",
+                env=env,
+                stdout=backend_log,
+                stderr=subprocess.STDOUT,
+            )
         with session.lock:
             session.backend_proc = backend_proc
         _wait_http(
@@ -542,7 +706,14 @@ def _boot_session(session: _PreviewSession) -> None:
             label="预览后端",
         )
         dist_root = session.workspace / "frontend" / "dist"
-        proxy = _start_proxy(dist_root, bind_host, preview_port, backend_port, session.workspace)
+        proxy = _start_proxy(
+            dist_root,
+            bind_host,
+            preview_port,
+            backend_port,
+            session.workspace,
+            session,
+        )
         with session.lock:
             session.proxy_server = proxy
         url = f"http://{bind_host}:{preview_port}/"
@@ -567,6 +738,9 @@ def _boot_session(session: _PreviewSession) -> None:
         )
     except Exception as exc:
         message = str(exc) if str(exc).strip() else "预览启动失败"
+        log_tail = _backend_log_tail(session)
+        if log_tail and log_tail not in message:
+            message = _with_backend_diagnostic(message, log_tail)
         logger.exception("preview boot failed project_id=%s", session.project_id)
         with session.lock:
             proc = session.backend_proc
@@ -578,7 +752,7 @@ def _boot_session(session: _PreviewSession) -> None:
             session.backend_port = None
             session.preview_port = None
             session.status = "error"
-            session.message = message[:500]
+            session.message = message[:_MAX_RUNTIME_DIAGNOSTIC_CHARS]
             session.url = None
             _touch(session)
         if server is not None:

@@ -350,7 +350,7 @@ const consoleRows = computed(() => {
       id: 'preview-status',
       label: '预览',
       detail: preview.value.message,
-      ok: preview.value.status === 'ready',
+      ok: preview.value.status === 'ready' && !preview.value.message,
     })
   }
   for (const row of previewConsoleRows.value) {
@@ -541,10 +541,11 @@ function clearPoll() {
 
 function schedulePoll() {
   clearPoll()
-  if (disposed || preview.value?.status !== 'starting') return
+  if (disposed || !['starting', 'ready'].includes(preview.value?.status ?? '')) return
+  const delay = preview.value?.status === 'starting' ? 1500 : 3000
   pollTimer = setTimeout(() => {
     void refreshPreview()
-  }, 1500)
+  }, delay)
 }
 
 async function refreshPreview() {
@@ -562,23 +563,24 @@ async function refreshPreview() {
     }
     return
   }
-  if (preview.value.status === 'starting') schedulePoll()
-  else {
-    clearPoll()
+  if (['starting', 'ready'].includes(preview.value.status)) {
+    schedulePoll()
     if (preview.value.status === 'ready') void loadDesign()
+  } else {
+    clearPoll()
   }
 }
 
 async function ensurePreview(force = false) {
   if (disposed || props.status?.state !== 'completed') return
   if (!force && (preview.value?.status === 'ready' || preview.value?.status === 'starting')) {
-    if (preview.value.status === 'starting') schedulePoll()
+    if (['starting', 'ready'].includes(preview.value.status)) schedulePoll()
     return
   }
   previewBusy.value = true
   try {
     preview.value = await previewApi.startPreview(props.projectId)
-    if (preview.value.status === 'starting') schedulePoll()
+    if (['starting', 'ready'].includes(preview.value.status)) schedulePoll()
     if (preview.value.status === 'ready') iframeKey.value += 1
     if (preview.value.status === 'ready') await loadDesign()
   } catch (err) {

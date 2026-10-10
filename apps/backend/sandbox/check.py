@@ -74,7 +74,6 @@ def materialize(files):
 
 FRONTEND_BIN_SCRIPTS = {
     "tsc": "typescript/bin/tsc",
-    "vue-tsc": "vue-tsc/bin/vue-tsc.js",
     "vite": "vite/bin/vite.js",
 }
 
@@ -576,9 +575,7 @@ def frontend():
         **(package.get("dependencies") or {}),
         **(package.get("devDependencies") or {}),
     }
-    if "vue-tsc" in dependencies:
-        frontend_command("vue-tsc", "-b")
-    elif "typescript" in dependencies:
+    if "typescript" in dependencies:
         build_config = frontend_root / "tsconfig.build.json"
         if build_config.is_file():
             frontend_command("tsc", "-p", build_config.name)
