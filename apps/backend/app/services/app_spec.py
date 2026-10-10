@@ -17,6 +17,7 @@ from app.core.exceptions import BusinessException, ConflictException, NotFoundEx
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
 from app.models.plan import Plan, PlanStatus
 from app.models.requirement_clarification import RequirementClarification
+from app.models.run_revision import RunRevision
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_result import TaskResult
 from app.models.user import User
@@ -78,6 +79,31 @@ def load_previous_app_spec(db: Session, task: Task, *, lock: bool = False) -> Ap
     if lock:
         statement = statement.with_for_update().execution_options(populate_existing=True)
     row = db.execute(statement).one_or_none()
+    if row is None:
+        revision_statement = (
+            select(ConfigurationItem, RunRevision, Plan)
+            .join(
+                RunRevision,
+                RunRevision.baseline_app_spec_item_id == ConfigurationItem.item_id,
+            )
+            .join(Plan, Plan.build_run_id == RunRevision.target_run_id)
+            .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+            .where(
+                Plan.plan_id == task.plan_id,
+                Plan.cause_message_id == RunRevision.cause_message_id,
+                RunRevision.kind == "product_change",
+                ConfigurationItem.item_id == task.input_configuration_item_ids[0],
+                ConfigurationItem.project_id == Plan.project_id,
+                TaskResult.prompt_version == "requirements_approval_v1",
+            )
+        )
+        if lock:
+            revision_statement = revision_statement.with_for_update().execution_options(
+                populate_existing=True
+            )
+        revision_row = db.execute(revision_statement).one_or_none()
+        if revision_row is not None:
+            return read_app_spec(revision_row[0])
     if row is None:
         raise BusinessException("原需求与本次补充任务的关联不正确")
     return read_app_spec(row[0])

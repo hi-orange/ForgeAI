@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.agents.test_engineer import verify_code
+from app.core.exceptions import BusinessException
 from app.core.settings import settings
 from app.generation.workspace import default_workspace_path
 from app.models.configuration_item import ConfigurationItem
@@ -16,6 +17,7 @@ from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.services import test_engineer as test_engineer_service
 from app.services.task_execution import fail_execution, renew_execution_lease
+from app.telemetry.agent import agent_telemetry_scope
 
 logger = logging.getLogger("forgeai")
 
@@ -126,27 +128,35 @@ def run_test_engineer_task(
         def save_progress(progress: dict[str, Any]) -> None:
             _save_quality_progress(db, execution, progress)
 
-        report = verify_code(
-            spec=inputs.app_spec,
-            system_design=inputs.system_design,
-            code_item_id=inputs.code_item.item_id,
-            code_source_hash=inputs.code_artifact.source_hash,
-            acceptance_test_plan_item_id=(
-                inputs.acceptance_test_plan_item.item_id
-                if inputs.acceptance_test_plan_item is not None
-                else None
-            ),
-            acceptance_test_hash=(
-                inputs.acceptance_test_plan_item.content_hash
-                if inputs.acceptance_test_plan_item is not None
-                else None
-            ),
-            acceptance_test_plan=inputs.acceptance_test_plan,
-            workspace_root=workspace_root,
-            saved_progress=_saved_quality_progress(execution),
-            heartbeat=heartbeat,
-            on_progress=save_progress,
-        )
+        with agent_telemetry_scope(
+            project_id=project_id,
+            build_run_id=run_id,
+            task_id=task_id,
+            execution_id=execution.execution_id,
+            role="Test Engineer",
+            bind=db.get_bind(),
+        ):
+            report = verify_code(
+                spec=inputs.app_spec,
+                system_design=inputs.system_design,
+                code_item_id=inputs.code_item.item_id,
+                code_source_hash=inputs.code_artifact.source_hash,
+                acceptance_test_plan_item_id=(
+                    inputs.acceptance_test_plan_item.item_id
+                    if inputs.acceptance_test_plan_item is not None
+                    else None
+                ),
+                acceptance_test_hash=(
+                    inputs.acceptance_test_plan_item.content_hash
+                    if inputs.acceptance_test_plan_item is not None
+                    else None
+                ),
+                acceptance_test_plan=inputs.acceptance_test_plan,
+                workspace_root=workspace_root,
+                saved_progress=_saved_quality_progress(execution),
+                heartbeat=heartbeat,
+                on_progress=save_progress,
+            )
         _record_quality_activity(
             db,
             execution,
@@ -183,8 +193,8 @@ def run_test_engineer_task(
         raise
 
     if report.quality_conclusion.value == "failed":
-        # Role output is routed by Leader. Test Engineer remains read-only and
-        # the report becomes the exact structured input of the repair task.
+        # Role output is routed by the NextAction engine (Leader only when ambiguous).
+        # Test Engineer remains read-only; the report is frozen repair input.
         from app.services import engineering
         from app.services import leader as leader_service
 
@@ -196,7 +206,9 @@ def run_test_engineer_task(
                 run_id,
                 report_item.item_id,
             )
-            if repair_task is not None:
+            if repair_task is None:
+                return report_item
+            if repair_task.recipient == "Code Engineer":
                 code_task, code_execution = engineering.claim_code_engineer_task(
                     db,
                     user,
@@ -212,6 +224,8 @@ def run_test_engineer_task(
                     code_task,
                     code_execution,
                 )
+            else:
+                raise BusinessException("质量失败只能派给 Code Engineer")
         except Exception:
             # The immutable report is already published. Never rewrite that
             # successful execution as failed because downstream routing broke.

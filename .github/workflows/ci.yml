@@ -19,6 +19,8 @@ jobs:
       MYSQL_PASSWORD: root
       MYSQL_DATABASE: agent_platform
       SECRET_KEY: ci-test-secret-key
+      FORGEAI_TEST_DOCKER: '1'
+      ENGINEERING_CHECK_IMAGE: forgeai-checks:fullstack-react-v1
     services:
       mysql:
         image: mysql:8.0
@@ -72,5 +74,21 @@ jobs:
         working-directory: apps/backend
         run: uv run alembic upgrade head
 
-      - name: Check
+      - name: Build isolated generated-app check image
+        run: docker build -f apps/backend/sandbox/Dockerfile -t forgeai-checks:fullstack-react-v1 apps/backend
+
+      - name: Check frontend and repository formatting
         run: pnpm check
+
+      - name: Check backend types and lint
+        working-directory: apps/backend
+        run: |
+          uv run ruff check app tests
+          uv run mypy app
+
+      - name: Run backend tests including golden DB, API, build and browser flow
+        working-directory: apps/backend
+        run: uv run python -m unittest discover -s tests -v
+
+      - name: Run frontend workflow tests
+        run: pnpm --dir apps/frontend test:requirements

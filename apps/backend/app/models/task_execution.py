@@ -25,7 +25,8 @@ class TaskExecution(Base):
         CheckConstraint("attempt > 0", name="ck_task_execution_attempt"),
         CheckConstraint(
             "(status = 'running' AND active_slot = 1 AND active_slot IS NOT NULL) OR "
-            "(status IN ('failed', 'succeeded', 'superseded') AND active_slot IS NULL)",
+            "(status IN ('failed', 'succeeded', 'superseded', 'cancelled') "
+            "AND active_slot IS NULL)",
             name="ck_task_execution_status",
         ),
     )

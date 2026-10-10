@@ -62,7 +62,10 @@ class RequirementsActionsTests(ProductManagerWorkflowFixture):
         self.assertIsNotNone(guidance)
         assert guidance is not None
         self.assertIn("描述一下你想做的应用", guidance.content)
-        self.assertEqual(guidance.client_message_id, f"guidance:msg:{message_id}:inquiry")
+        self.assertEqual(
+            guidance.client_message_id,
+            f"leader:inquiry_no_delivery:msg:{message_id}",
+        )
 
     def test_submit_on_not_started_creates_message_and_starts(self) -> None:
         with self.session_factory() as db:

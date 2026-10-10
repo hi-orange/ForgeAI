@@ -25,6 +25,7 @@ class BuildRunStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class BuildRunStage(StrEnum):
@@ -52,7 +53,7 @@ class BuildRun(Base):
     __tablename__ = "build_run"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('queued', 'running', 'succeeded', 'failed')",
+            "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
             name="ck_build_run_status",
         ),
         CheckConstraint(
@@ -63,14 +64,14 @@ class BuildRun(Base):
             # queued 还没有处理阶段；running 必须告诉调用方当前执行到哪一步。
             "((status = 'queued' AND stage IS NULL) "
             "OR (status = 'running' AND stage IS NOT NULL) "
-            "OR status IN ('succeeded', 'failed'))",
+            "OR status IN ('succeeded', 'failed', 'cancelled'))",
             name="ck_build_run_stage_by_status",
         ),
         CheckConstraint(
             # active_slot=1 表示任务仍占用项目构建名额；终态必须释放为 NULL。
             "((status IN ('queued', 'running') AND active_slot IS NOT NULL "
             "AND active_slot = 1) "
-            "OR (status IN ('succeeded', 'failed') AND active_slot IS NULL))",
+            "OR (status IN ('succeeded', 'failed', 'cancelled') AND active_slot IS NULL))",
             name="ck_build_run_active_slot",
         ),
         # 唯一约束是并发兜底：同一项目最多只能有一个 active_slot=1。
@@ -103,7 +104,7 @@ class BuildRun(Base):
         nullable=False,
         default=BuildRunStatus.QUEUED.value,
         server_default=BuildRunStatus.QUEUED.value,
-        comment="queued/running/succeeded/failed",
+        comment="queued/running/succeeded/failed/cancelled",
     )
     stage: Mapped[str | None] = mapped_column(
         String(32),

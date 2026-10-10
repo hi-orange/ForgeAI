@@ -5,7 +5,8 @@
 **ForgeAI is a conversational full-stack app builder.**
 
 The user describes an app, receives a runnable application, and keeps talking to refine it.
-Generated applications currently target FastAPI, Vue, and SQLite.
+Generated applications currently target React, TypeScript, and FastAPI. Isolated previews use
+SQLite by default; deployable workspaces can switch to PostgreSQL through the same migration layer.
 
 ## Document responsibilities
 

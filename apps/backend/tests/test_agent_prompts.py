@@ -15,6 +15,7 @@ from app.agents.prompts.contracts import (
     APPROVAL_WORKFLOW_CONTRACT,
     CONFLICT_PRIORITY_CONTRACT,
     INTERACTION_CONTRACT,
+    LEADER_DISPATCH_CONTRACT,
     PROMPT_CONTRACT_VERSION,
     QUALITY_GATE_CONTRACT,
     TOOL_EXECUTION_CONTRACT,
@@ -84,20 +85,24 @@ class AgentPromptContractTests(unittest.TestCase):
     def test_leader_routes_by_intent_complexity_and_exact_results(self):
         self.assertIn("breaking_public_contract", LEADER_SYSTEM_PROMPT)
         self.assertIn("必须先安排 Architect", LEADER_SYSTEM_PROMPT)
-        self.assertIn("完整 DAG", LEADER_SYSTEM_PROMPT)
+        self.assertIn("不预写尚未冻结输入的完整 DAG", LEADER_SYSTEM_PROMPT)
         self.assertIn("准确 task_id", LEADER_SYSTEM_PROMPT)
         self.assertIn("reason code", LEADER_SYSTEM_PROMPT)
         self.assertIn("request_user_input 只用于", LEADER_SYSTEM_PROMPT)
+        self.assertIn("工作流引擎自动交给 Test Engineer", LEADER_SYSTEM_PROMPT)
         self.assertIn("优先选择 implementation_repair", MESSAGE_CLASSIFICATION_SYSTEM_PROMPT)
 
     def test_shared_prompt_contracts_have_one_versioned_source(self):
-        self.assertEqual(PROMPT_CONTRACT_VERSION, "forgeai_prompt_contracts_v1")
+        self.assertEqual(PROMPT_CONTRACT_VERSION, "forgeai_prompt_contracts_v4")
         self.assertIn("安全、权限、所有权", CONFLICT_PRIORITY_CONTRACT)
         self.assertIn("awaiting_approval", APPROVAL_WORKFLOW_CONTRACT)
         self.assertIn("批量读取", TOOL_EXECUTION_CONTRACT)
         self.assertIn("utilitarian", VISUAL_SYSTEM_CONTRACT)
         self.assertIn("纯 UI", INTERACTION_CONTRACT)
         self.assertIn("最低联调门禁", QUALITY_GATE_CONTRACT)
+        self.assertIn("仅有一个合法后续", LEADER_DISPATCH_CONTRACT)
+        self.assertIn("BLOCKED", LEADER_DISPATCH_CONTRACT)
+        self.assertIn("不得从自由文本关键词猜测角色", LEADER_DISPATCH_CONTRACT)
 
 
 if __name__ == "__main__":

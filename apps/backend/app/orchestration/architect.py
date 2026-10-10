@@ -16,6 +16,7 @@ from app.models.user import User
 from app.services import architect as architect_service
 from app.services.engineering import load_approved_app_spec
 from app.services.task_execution import fail_execution
+from app.telemetry.agent import agent_telemetry_scope
 
 
 def run_architecture_task(
@@ -42,16 +43,24 @@ def run_architecture_task(
         _, _, _, spec = load_approved_app_spec(reader, project_id, run_id, app_spec_item_id)
     workspace_root = default_workspace_path(settings.runtime_data_root, project_id, run_id)
     try:
-        design = generate_system_design(
-            spec=spec,
-            workspace_root=workspace_root,
-            on_activity=lambda observation: architect_service.record_architect_activity(
-                db,
-                task_id,
-                execution.execution_id,
-                observation,
-            ),
-        )
+        with agent_telemetry_scope(
+            project_id=project_id,
+            build_run_id=run_id,
+            task_id=task_id,
+            execution_id=execution.execution_id,
+            role="Architect",
+            bind=db.get_bind(),
+        ):
+            design = generate_system_design(
+                spec=spec,
+                workspace_root=workspace_root,
+                on_activity=lambda observation: architect_service.record_architect_activity(
+                    db,
+                    task_id,
+                    execution.execution_id,
+                    observation,
+                ),
+            )
         design_item = architect_service.complete_architect_task(
             db,
             user,

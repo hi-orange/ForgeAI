@@ -83,6 +83,7 @@ def prepare_engineering_workspace(
     app_spec: dict[str, Any] | None = None,
     template_version: str = DEFAULT_TEMPLATE_VERSION,
     runtime_data_root: str | Path | None = None,
+    base_run_id: str | None = None,
 ) -> Path:
     """
     After requirements approval, materialize the fullstack template for this run.
@@ -98,7 +99,13 @@ def prepare_engineering_workspace(
         dest.parent.mkdir(parents=True, exist_ok=True)
         staging = dest.parent / f".{dest.name}.creating-{uuid4().hex}"
         try:
-            create_workspace(staging, template_version=template_version)
+            if base_run_id is not None:
+                source_workspace = default_workspace_path(root, project_id, base_run_id)
+                if not _workspace_tree_ready(source_workspace):
+                    raise FileNotFoundError("修订基线工作区不存在或不完整")
+                shutil.copytree(source_workspace, staging, ignore=_IGNORE, symlinks=False)
+            else:
+                create_workspace(staging, template_version=template_version)
             try:
                 staging.rename(dest)
             except OSError:

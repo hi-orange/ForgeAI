@@ -79,7 +79,7 @@ class _ProductManagerWorkflow:
         self._session_factory = session_factory
 
     def ensure_plan(self, state: WorkflowState) -> dict[str, object]:
-        """Find the clarification follow-up plan, or create the initial Plan v1."""
+        """Find clarification / Leader-authored PM plan, or create Plan v1."""
 
         with self._session_factory() as db:
             user = _get_user(db, state["user_id"])
@@ -95,6 +95,28 @@ class _ProductManagerWorkflow:
                     Plan.cause_message_id == state["cause_message_id"],
                 )
             )
+            if plan is None:
+                # Leader message-turn may already have persisted a PM-only plan for this cause.
+                # Ignore Architect/CE plans that reuse the same cause_message_id.
+                for candidate in db.scalars(
+                    select(Plan)
+                    .where(
+                        Plan.project_id == state["project_id"],
+                        Plan.build_run_id == state["build_run_id"],
+                        Plan.cause_message_id == state["cause_message_id"],
+                        Plan.status.in_((PlanStatus.PENDING.value, PlanStatus.RUNNING.value)),
+                    )
+                    .order_by(Plan.version.desc())
+                ).all():
+                    candidate_tasks = task_service.list_user_plan_tasks(
+                        db, user, state["project_id"], candidate.plan_id
+                    )
+                    try:
+                        _require_requirements_task(candidate_tasks)
+                    except (BusinessException, ConflictException):
+                        continue
+                    plan = candidate
+                    break
             if plan is None:
                 plan = leader_service.create_initial_plan(
                     db, user, state["project_id"], state["build_run_id"], state["cause_message_id"]

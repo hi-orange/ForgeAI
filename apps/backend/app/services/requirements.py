@@ -22,6 +22,7 @@ from app.orchestration.code_engineer import EXECUTION_MODE
 from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.orchestration.test_engineer import run_test_engineer_task
+from app.schemas.leader import NextActionKind
 from app.schemas.product_manager_workflow import (
     ProductManagerWorkflowOutcome,
     ProductManagerWorkflowResult,
@@ -37,9 +38,11 @@ from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import build_run as build_run_service
 from app.services import engineering
 from app.services import leader as leader_service
+from app.services import leader_next_action as leader_next_action_service
 from app.services import project as project_service
 from app.services import project_message as project_message_service
 from app.services import project_message_classification as classification_service
+from app.services import run_revision as run_revision_service
 from app.services import task as task_service
 from app.services.app_spec import approve_requirements as persist_approved_requirements
 from app.services.app_spec import read_app_spec
@@ -61,7 +64,16 @@ from app.services.test_engineer import load_test_inputs
 
 logger = logging.getLogger("forgeai")
 
-WRITABLE_STATES = frozenset({"not_started", "needs_user_input", "awaiting_approval"})
+WRITABLE_STATES = frozenset(
+    {
+        "not_started",
+        "needs_user_input",
+        "awaiting_approval",
+        "completed",
+        "stopped",
+        "quality_failed",
+    }
+)
 CONTINUE_PM_STATES = frozenset({"pending", "retry_available", "ready_for_delivery"})
 
 
@@ -137,22 +149,79 @@ def start_from_message(
     project_id: int,
     message_id: int,
 ) -> RequirementsStatus:
-    """Classify one persisted user turn and start planning only for product work."""
+    """Classify a user turn, resolve NextAction, then let the workflow engine apply it."""
 
     classification = classification_service.classify_user_message(db, user, project_id, message_id)
-    if classification.category != ProjectMessageCategory.PRODUCT_CHANGE.value:
+    status = get_requirements_status(db, user, project_id)
+    needs_run = classification.category in {
+        ProjectMessageCategory.PRODUCT_CHANGE.value,
+        ProjectMessageCategory.IMPLEMENTATION_REPAIR.value,
+    }
+    run_id = (
+        _ensure_run_id(
+            db,
+            user,
+            project_id,
+            status,
+            message_id=message_id,
+            category=classification.category,
+        )
+        if needs_run
+        else status.run_id
+    )
+    action = leader_next_action_service.decide_message_next_action(
+        db,
+        user,
+        project_id=project_id,
+        run_id=run_id,
+        message_id=message_id,
+        category=classification.category,
+    )
+    if action.action == NextActionKind.DISPATCH_PRODUCT_MANAGER and run_id:
+        leader_next_action_service.apply_message_next_action(
+            db,
+            user,
+            project_id=project_id,
+            run_id=run_id,
+            message_id=message_id,
+            action=action,
+            category=classification.category,
+        )
+        run_product_manager_workflow(db, user, project_id, run_id, message_id)
+        return get_requirements_status(db, user, project_id)
+
+    if run_id is None and action.action in {
+        NextActionKind.DISPATCH_CODE_ENGINEER,
+        NextActionKind.DISPATCH_ARCHITECT,
+        NextActionKind.DISPATCH_PRODUCT_MANAGER,
+    }:
+        raise BusinessException("交付分派需要有效的 BuildRun")
+
+    task = None
+    if run_id is not None:
+        task = leader_next_action_service.apply_message_next_action(
+            db,
+            user,
+            project_id=project_id,
+            run_id=run_id,
+            message_id=message_id,
+            action=action,
+            category=classification.category,
+        )
+    elif action.action in {NextActionKind.REPLY, NextActionKind.ASK_USER}:
+        # No run yet: still persist guidance/question on the project timeline.
+        text = action.question if action.action == NextActionKind.ASK_USER else action.reply_text
+        assert text is not None
         project_message_service.create_assistant_project_message(
             db,
             user,
             project_id,
-            _guidance_for_category(classification.category),
-            client_message_id=f"guidance:msg:{message_id}:{classification.category}",
+            text,
+            client_message_id=f"leader:{action.reason_code}:msg:{message_id}",
         )
-        return get_requirements_status(db, user, project_id)
-
-    status = get_requirements_status(db, user, project_id)
-    run_id = _ensure_run_id(db, user, project_id, status)
-    run_product_manager_workflow(db, user, project_id, run_id, message_id)
+    if task is not None:
+        assert run_id is not None
+        start_dispatched_delivery(db, user, project_id, run_id, task)
     return get_requirements_status(db, user, project_id)
 
 
@@ -216,7 +285,14 @@ def resolve_quality_challenge(
         run.active_slot = 1
         run.error = None
         db.flush()
-        task = leader_service.dispatch_quality_repair(db, user, project_id, run_id, report_item_id)
+        task = leader_service.dispatch_quality_repair(
+            db,
+            user,
+            project_id,
+            run_id,
+            report_item_id,
+            challenge_resolved=True,
+        )
         if task is not None:
             start_dispatched_delivery(db, user, project_id, run_id, task)
         return get_requirements_status(db, user, project_id)
@@ -472,19 +548,27 @@ def _resume_engineering_from_retry(
     return get_requirements_status(db, user, project_id)
 
 
-def _guidance_for_category(category: str) -> str:
-    if category == ProjectMessageCategory.INQUIRY.value:
-        return "先具体描述一下你想做的应用或功能，我再帮你整理构建计划。"
-    if category == ProjectMessageCategory.STOP.value:
-        return "当前还没有开始构建。描述你想做的应用后，就可以开始了。"
-    if category == ProjectMessageCategory.IMPLEMENTATION_REPAIR.value:
-        return "现在还没有可修复的实现。先描述你想做的应用，我会整理一份构建计划。"
-    return "请描述你要做的应用或功能，我再开始整理需求。"
-
-
-def _ensure_run_id(db: Session, user: User, project_id: int, status: RequirementsStatus) -> str:
+def _ensure_run_id(
+    db: Session,
+    user: User,
+    project_id: int,
+    status: RequirementsStatus,
+    *,
+    message_id: int,
+    category: str,
+) -> str:
     if status.run_id:
-        return status.run_id
+        existing = db.scalar(select(BuildRun).where(BuildRun.run_id == status.run_id))
+        if existing is not None and existing.status in {"queued", "running"}:
+            return status.run_id
+        return run_revision_service.create_revision_run(
+            db,
+            user,
+            project_id,
+            source_run_id=status.run_id,
+            cause_message_id=message_id,
+            kind=category,
+        ).run_id
     try:
         return build_run_service.create_build_run(db, user, project_id).run_id
     except ConflictException:
@@ -870,7 +954,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
         result.plan_id, result.task_id, result.message_id = (
             plan.plan_id,
             delivery_task.task_id,
-            source_plan.cause_message_id,
+            plan.cause_message_id,
         )
         result.app_spec = spec
         result.result = ProductManagerWorkflowResult(
@@ -904,16 +988,26 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 if report_item is not None:
                     verified = delivery_task
                 else:
-                    verified = find_pending_engineering_task(
-                        db,
-                        task_source_plan,
-                        input_item_id,
-                        (
-                            acceptance_plan_item.item_id
-                            if acceptance_plan_item is not None
+                    if task_source_plan.build_run_id != run.run_id:
+                        expected_inputs = [input_item_id]
+                        if acceptance_plan_item is not None:
+                            expected_inputs.append(acceptance_plan_item.item_id)
+                        verified = (
+                            delivery_task
+                            if delivery_task.input_configuration_item_ids == expected_inputs
                             else None
-                        ),
-                    )
+                        )
+                    else:
+                        verified = find_pending_engineering_task(
+                            db,
+                            task_source_plan,
+                            input_item_id,
+                            (
+                                acceptance_plan_item.item_id
+                                if acceptance_plan_item is not None
+                                else None
+                            ),
+                        )
             else:
                 verified = find_architecture_task(db, task_source_plan, input_item_id)
             if verified is None or verified.task_id != delivery_task.task_id:

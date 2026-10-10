@@ -143,7 +143,12 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             (run.status, run.stage, run.active_slot, run.error), ("running", "qa", 1, None)
         )
         dispatch.assert_called_once_with(
-            db, self.owner, self.project.id, self.run.run_id, "ci_report"
+            db,
+            self.owner,
+            self.project.id,
+            self.run.run_id,
+            "ci_report",
+            challenge_resolved=True,
         )
         start.assert_called_once_with(db, self.owner, self.project.id, self.run.run_id, repair_task)
 

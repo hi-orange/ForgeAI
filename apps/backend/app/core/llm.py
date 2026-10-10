@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -12,6 +13,7 @@ from app.core.exceptions import BusinessException
 from app.core.llm_response import CompletionContentKind, normalize_completion_content
 from app.core.settings import settings
 from app.schemas.agent_action import ChatWithToolsResult, TokenUsage, ToolCall, ToolDefinition
+from app.telemetry.agent import record_model_turn
 
 logger = logging.getLogger("forgeai.llm")
 
@@ -300,8 +302,10 @@ def chat_with_tools(
             for tool in tools
         ],
     }
+    started = time.perf_counter()
     data = _post_chat(body, timeout=timeout)
     result = parse_agent_action(data)
+    record_model_turn(result, round((time.perf_counter() - started) * 1000))
     logger.info(
         "LLM tool turn: model=%s finish_reason=%s tool_calls=%s content_length=%s usage=%s",
         result.model or data.get("model"),

@@ -37,6 +37,7 @@ from app.services import plan as plan_service
 from app.services import project as project_service
 from app.services import task as task_service
 from app.services.app_spec import load_previous_app_spec
+from app.telemetry.agent import agent_telemetry_scope
 
 
 def _load_task(
@@ -167,7 +168,15 @@ def generate_task_app_spec(
         raise BusinessException("Product Manager 需求输入不符合要求") from exc
 
     model = settings.deepseek_model
-    app_spec = product_manager_agent.generate_app_spec(payload)
+    with agent_telemetry_scope(
+        project_id=project_id,
+        build_run_id=run_id,
+        task_id=task_id,
+        execution_id=execution_id,
+        role="Product Manager",
+        bind=db.get_bind(),
+    ):
+        app_spec = product_manager_agent.generate_app_spec(payload)
 
     # 模型调用期间可能发生停止或取消。用新的只读事务检查，不读旧会话的缓存/快照。
     # 这里只拒绝已经失去资格的草稿；真正发布时还需要 ConfigurationManager 的事务检查。

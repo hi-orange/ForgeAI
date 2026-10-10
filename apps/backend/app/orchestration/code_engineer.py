@@ -1268,10 +1268,20 @@ def run_engineering_workflow(
         "task_id": task_id,
         "execution_id": execution_id,
     }
+    from app.telemetry.agent import agent_telemetry_scope
+
     try:
-        state.update(nodes.prepare(state))
-        while state.get("outcome") not in {"generated", "blocked", "paused"}:
-            state.update(nodes.step(state))
+        with agent_telemetry_scope(
+            project_id=project_id,
+            build_run_id=run_id,
+            task_id=task_id,
+            execution_id=execution_id,
+            role="Code Engineer",
+            bind=db.get_bind(),
+        ):
+            state.update(nodes.prepare(state))
+            while state.get("outcome") not in {"generated", "blocked", "paused"}:
+                state.update(nodes.step(state))
     except ConflictException:
         state["outcome"] = "paused"
     return {

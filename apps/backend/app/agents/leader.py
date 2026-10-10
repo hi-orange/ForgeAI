@@ -23,8 +23,14 @@ from app.tools.leader import (
     execute_message_classification_tool,
 )
 
-# Leader 管理一轮最多能调用多少次工具，防止模型一直转圈。
-MAX_LEADER_TOOL_TURNS = 12
+# Graduated tool budgets: classify is 1; simple dispatch stays small; replan may use more.
+LEADER_CLASSIFY_TURNS = 1
+# read context + classify + create plan + dispatch + finish need five tool calls.
+# Keep one recovery turn so a valid simple route cannot exhaust the budget by design.
+LEADER_SIMPLE_DISPATCH_TURNS = 6
+LEADER_COMPLEX_REPLAN_TURNS = 12
+# Backward-compatible alias for the complex budget.
+MAX_LEADER_TOOL_TURNS = LEADER_COMPLEX_REPLAN_TURNS
 # 只保留角色白名单里允许的工具定义，避免多给模型权限。
 ALLOWED_LEADER_TOOLS = [tool for tool in LEADER_TOOLS if tool.name in LEADER_PROFILE.allowed_tools]
 
@@ -107,6 +113,7 @@ def lead_project_turn(
     context: LeaderContext,
     *,
     instruction: str = "先读取冻结上下文，再管理本轮计划和分派。",
+    max_turns: int = LEADER_COMPLEX_REPLAN_TURNS,
 ) -> LeaderOutcome:
     """跑一轮有上限的管理流程；调用方负责把校验后的计划/结果另行落库。"""
 
@@ -115,6 +122,7 @@ def lead_project_turn(
         context = LeaderContext.model_validate(context.model_dump())
     except ValidationError as exc:
         raise BusinessException("Leader 项目上下文不符合要求") from exc
+    budget = max(1, min(int(max_turns), LEADER_COMPLEX_REPLAN_TURNS))
     # 本轮工具共享的内存状态（草稿计划、已分派任务、最终结果等）。
     state = LeaderToolState(context=context)
     return run_bounded_tool_loop(
@@ -122,7 +130,7 @@ def lead_project_turn(
         tools=ALLOWED_LEADER_TOOLS,
         allowed_tools=LEADER_PROFILE.allowed_tools,
         role_name="Leader",
-        max_turns=MAX_LEADER_TOOL_TURNS,
+        max_turns=budget,
         temperature=0.0,
         max_tokens=8192,
         missing_message="Leader 未调用工具更新计划或结束本轮",

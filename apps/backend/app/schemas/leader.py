@@ -118,3 +118,87 @@ class LeaderOutcome(BaseModel):
         if self.action != "wait_user" and self.question is not None:
             raise ValueError("只有等待用户时可以携带问题")
         return self
+
+
+class NextActionKind(StrEnum):
+    """Platform-facing scheduling decision after Leader (or deterministic rules)."""
+
+    REPLY = "reply"
+    ASK_USER = "ask_user"
+    DISPATCH_PRODUCT_MANAGER = "dispatch_product_manager"
+    DISPATCH_ARCHITECT = "dispatch_architect"
+    DISPATCH_CODE_ENGINEER = "dispatch_code_engineer"
+    RETRY_INFRASTRUCTURE = "retry_infrastructure"
+    AWAIT_USER_CHALLENGE = "await_user_challenge"
+    CANCEL_ACTIVE_RUN = "cancel_active_run"
+    NEEDS_LEADER = "needs_leader"
+
+
+class NextAction(BaseModel):
+    """Structured schedule result: Leader proposes semantics; the workflow engine validates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: NextActionKind
+    reason_code: str = Field(min_length=1, max_length=80)
+    summary: LeaderText
+    recipient: TaskRecipient | None = None
+    source_artifact_ids: list[str] = Field(default_factory=list, max_length=8)
+    required_inputs: list[str] = Field(default_factory=list, max_length=16)
+    risk_flags: list[str] = Field(default_factory=list, max_length=16)
+    approval_required: bool = False
+    reply_text: str | None = Field(default=None, max_length=4000)
+    question: str | None = Field(default=None, max_length=2000)
+    decided_by: Literal["engine", "leader"] = "engine"
+    # Optional Leader-authored plan for message/quality turns that create work.
+    plan: PlanCreate | None = None
+    dispatched_task_key: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_next_action_payload(self) -> Self:
+        if self.action == NextActionKind.REPLY and not (
+            self.reply_text and self.reply_text.strip()
+        ):
+            raise ValueError("reply 动作必须提供 reply_text")
+        if self.action == NextActionKind.ASK_USER and not (self.question and self.question.strip()):
+            raise ValueError("ask_user 动作必须提供 question")
+        dispatch_recipients = {
+            NextActionKind.DISPATCH_PRODUCT_MANAGER: TaskRecipient.PRODUCT_MANAGER,
+            NextActionKind.DISPATCH_ARCHITECT: TaskRecipient.ARCHITECT,
+            NextActionKind.DISPATCH_CODE_ENGINEER: TaskRecipient.CODE_ENGINEER,
+        }
+        expected_recipient = dispatch_recipients.get(self.action)
+        if expected_recipient is not None and self.recipient != expected_recipient:
+            raise ValueError("分派动作与 recipient 不一致")
+        if expected_recipient is None and self.recipient is not None:
+            raise ValueError("非分派动作不得携带 recipient")
+        if (
+            self.action
+            in {
+                NextActionKind.DISPATCH_ARCHITECT,
+                NextActionKind.DISPATCH_CODE_ENGINEER,
+            }
+            and not self.source_artifact_ids
+        ):
+            raise ValueError("工程分派必须引用准确 source_artifact_ids")
+
+        if (self.plan is None) != (self.dispatched_task_key is None):
+            raise ValueError("plan 与 dispatched_task_key 必须同时提供")
+        if self.plan is not None:
+            if expected_recipient is None:
+                raise ValueError("只有分派动作可以携带计划")
+            if len(self.plan.tasks) != 1:
+                raise ValueError("NextAction 每轮只能携带一个可立即分派的任务")
+            task = self.plan.tasks[0]
+            if task.task_key != self.dispatched_task_key:
+                raise ValueError("dispatched_task_key 不在本轮计划中")
+            if task.recipient != expected_recipient:
+                raise ValueError("计划任务接收角色与分派动作不一致")
+            if task.input_configuration_item_ids != self.source_artifact_ids:
+                raise ValueError("计划任务输入与 source_artifact_ids 不一致")
+
+        if self.action != NextActionKind.REPLY and self.reply_text is not None:
+            raise ValueError("只有 reply 动作可以携带 reply_text")
+        if self.action != NextActionKind.ASK_USER and self.question is not None:
+            raise ValueError("只有 ask_user 动作可以携带 question")
+        return self

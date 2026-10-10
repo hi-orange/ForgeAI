@@ -249,7 +249,8 @@ class ApprovalContractTests(ProductManagerWorkflowFixture):
         proposal = self._run()
         approved_id = self._approve(proposal, approval_payload())
 
-        def architect_route(context, *, instruction):
+        def architect_route(context, *, instruction, max_turns=None):
+            del max_turns
             self.assertIn(approved_id, instruction)
             task = TaskCreate(
                 task_key="system_design",

@@ -61,6 +61,16 @@ class Settings(BaseSettings):
     preview_build_timeout_seconds: int = 180
     preview_ready_timeout_seconds: int = 90
 
+    # Durable local publication provider. Cloud providers can implement the same
+    # Deployment contract without changing the workbench API.
+    deployment_enabled: bool = True
+    deployment_bind_host: str = "127.0.0.1"
+    deployment_port_min: int = 18400
+    deployment_port_max: int = 18599
+    deployment_build_timeout_seconds: int = 900
+    llm_input_cost_per_million_usd: float | None = None
+    llm_output_cost_per_million_usd: float | None = None
+
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env.development",
         env_file_encoding="utf-8",

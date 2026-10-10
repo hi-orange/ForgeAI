@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import ConflictException, NotFoundException
 from app.models.configuration_item import ConfigurationItem
 from app.models.plan import Plan
+from app.models.run_revision import RunRevision
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_result import TaskResult
 from app.schemas.app_spec import AppSpec
@@ -48,9 +49,7 @@ def load_approved_app_spec(
         .where(
             ConfigurationItem.item_id == item_id,
             ConfigurationItem.project_id == project_id,
-            ConfigurationItem.producer_run_id == run_id,
             Plan.project_id == project_id,
-            Plan.build_run_id == run_id,
         )
     )
     if lock:
@@ -59,6 +58,18 @@ def load_approved_app_spec(
     if row is None:
         raise NotFoundException("需求成果不存在或不属于当前构建的已登记任务")
     item, task, plan = row
+    same_run = item.producer_run_id == run_id and plan.build_run_id == run_id
+    lineage = None
+    if not same_run:
+        lineage = db.scalar(
+            select(RunRevision).where(
+                RunRevision.project_id == project_id,
+                RunRevision.target_run_id == run_id,
+                RunRevision.baseline_app_spec_item_id == item_id,
+            )
+        )
+    if not same_run and lineage is None:
+        raise NotFoundException("需求成果不属于当前构建或其固定修订基线")
     if (
         (item.semantic_type, item.state) != ("app_spec", "usable")
         or (task.recipient, task.expected_output_type, task.status)
@@ -85,7 +96,6 @@ def load_engineering_source(
         select(ConfigurationItem).where(
             ConfigurationItem.item_id == item_id,
             ConfigurationItem.project_id == project_id,
-            ConfigurationItem.producer_run_id == run_id,
         )
     )
     if direct is not None and direct.semantic_type == "app_spec":

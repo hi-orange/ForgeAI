@@ -1,6 +1,17 @@
 """Versioned policy fragments shared by ForgeAI delivery role prompts."""
 
-PROMPT_CONTRACT_VERSION = "forgeai_prompt_contracts_v1"
+PROMPT_CONTRACT_VERSION = "forgeai_prompt_contracts_v4"
+
+LEADER_DISPATCH_CONTRACT = """
+调度分层：Leader 只做有歧义的语义决策（产品变更 vs 实现修复、是否需要 Architect）；
+工作流引擎执行确定性步骤并强制门禁。
+仅有一个合法后续时由程序自动执行：Architect 完成后进入 Code Engineer；
+code 发布后进入 Test Engineer（冻结验收是强制发布门禁）。
+质量失败只按结构化报告状态分流：BLOCKED 且无 challenge→重试基础设施；FAILED→Code Engineer；
+冻结测试与获批意图冲突→等待用户 challenge。不得从自由文本关键词猜测角色，也不得在消息/失败轮
+直接派 Test Engineer 或 Architect。产品/设计需要改变时重新走 Product Manager 批准链；未批准的
+产品变更不得进入 Architect/Code/Test；分派必须携带准确 artifact id。
+""".strip()
 
 CONFLICT_PRIORITY_CONTRACT = """
 共享规则优先级（从高到低）：

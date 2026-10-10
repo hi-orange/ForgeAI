@@ -8,7 +8,7 @@
           <div class="avatar-row">
             <button
               v-for="(item, index) in agents"
-              :key="item.name"
+              :key="item.key"
               type="button"
               class="buddy"
               :style="{
@@ -16,8 +16,8 @@
                 background: item.bg,
                 '--buddy-glow': item.glow,
               }"
-              :title="`${item.name} - ${item.role}`"
-              :aria-label="`${item.name} - ${item.role}`"
+              :title="`${item.name} · ${item.role}`"
+              :aria-label="`${item.name} · ${item.role}`"
             >
               <span class="buddy-face" aria-hidden="true">{{ item.emoji }}</span>
               <span class="buddy-tip">{{ item.name }} · {{ item.role }}</span>
@@ -190,89 +190,66 @@ const displayName = computed(() => {
   return raw.replace(/[._-]+/g, ' ').trim()
 })
 
+/** Homepage personas mirror ForgeAI delivery roles (Leader + TaskRecipient). */
 const agents = [
   {
-    key: 'mike',
-    name: 'Mike',
-    role: 'AI 团队领导 Agent',
+    key: 'leader',
+    name: 'Leader',
+    role: '交付调度 Agent',
     emoji: '🦊',
     bg: '#ffedd5',
     glow: 'rgba(251, 146, 60, 0.75)',
   },
   {
-    key: 'adrian',
-    name: 'Adrian',
-    role: 'AI 广告专家 Agent',
-    emoji: '🐼',
-    bg: '#dbeafe',
-    glow: 'rgba(96, 165, 250, 0.85)',
-  },
-  {
-    key: 'sarah',
-    name: 'Sarah',
-    role: 'AI SEO 专家 Agent',
-    emoji: '🐯',
-    bg: '#fee2e2',
-    glow: 'rgba(248, 113, 113, 0.8)',
-  },
-  {
-    key: 'emma',
-    name: 'Emma',
-    role: 'AI 产品经理 Agent',
+    key: 'product-manager',
+    name: 'Product Manager',
+    role: '产品需求 Agent',
     emoji: '🐰',
     bg: '#ede9fe',
     glow: 'rgba(167, 139, 250, 0.85)',
   },
   {
-    key: 'bob',
-    name: 'Bob',
-    role: 'AI 架构师 Agent',
+    key: 'architect',
+    name: 'Architect',
+    role: '系统设计 Agent',
     emoji: '🐻',
     bg: '#d1fae5',
     glow: 'rgba(52, 211, 153, 0.8)',
   },
   {
-    key: 'alex',
-    name: 'Alex',
-    role: 'AI 工程师 Agent',
+    key: 'code-engineer',
+    name: 'Code Engineer',
+    role: '代码实现 Agent',
     emoji: '🐶',
     bg: '#e0f2fe',
     glow: 'rgba(56, 189, 248, 0.85)',
   },
   {
-    key: 'david',
-    name: 'David',
-    role: 'AI 数据分析师 Agent',
+    key: 'test-engineer',
+    name: 'Test Engineer',
+    role: '独立验收 Agent',
     emoji: '🦉',
     bg: '#fef3c7',
     glow: 'rgba(251, 191, 36, 0.85)',
-  },
-  {
-    key: 'iris',
-    name: 'Iris',
-    role: 'AI 深度研究员 Agent',
-    emoji: '🦄',
-    bg: '#fce7f3',
-    glow: 'rgba(244, 114, 182, 0.85)',
   },
 ] as const
 
 const features = [
   {
-    title: 'AI 协作',
-    desc: '多个 AI Agent 协同工作，帮你更快打磨产品。',
+    title: '对话式构建',
+    desc: '描述想法，Leader 调度团队产出可运行的全栈应用。',
     accent: '#dbeafe',
-    icon: '🤝',
+    icon: '💬',
   },
   {
-    title: '极速构建',
-    desc: '从想法到可运行原型，往往只需几分钟。',
+    title: '批准后交付',
+    desc: '产品意图经你勾选批准后，再进入架构、实现与验收。',
     accent: '#ede9fe',
-    icon: '⚡',
+    icon: '✅',
   },
   {
-    title: '安全可靠',
-    desc: '企业级安全与隐私保护，数据始终由你掌控。',
+    title: '隔离可追溯',
+    desc: '生成代码独立运行，成果身份冻结，验收与修复有据可查。',
     accent: '#dcfce7',
     icon: '🛡️',
   },

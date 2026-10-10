@@ -6,6 +6,7 @@
       :chat-collapsed="chatCollapsed"
       :history-open="historyOpen"
       :mode-tabs="modeTabs"
+      :can-publish="status?.state === 'completed' && !publishing"
       @update:workspace-view="setWorkspaceView"
       @toggle-chat="chatCollapsed = !chatCollapsed"
       @toggle-history="historyOpen = !historyOpen"
@@ -305,6 +306,57 @@
         @refresh="refresh"
         @resolve="resume"
       />
+      <section v-else-if="workspaceView === 'cloud'" class="deployment-pane">
+        <h2>发布</h2>
+        <p v-if="!deployment">验收通过后可构建镜像并发布为带 PostgreSQL 的应用。</p>
+        <template v-else>
+          <div class="deployment-status" :class="deployment.status">
+            <strong>版本 {{ deployment.revision }} · {{ deployment.status }}</strong>
+            <a
+              v-if="deployment.url"
+              :href="deployment.url"
+              target="_blank"
+              rel="noopener noreferrer"
+              >{{ deployment.url }}</a
+            >
+            <span v-else>正在构建容器镜像并启动服务…</span>
+          </div>
+          <dl>
+            <dt>运行版本</dt>
+            <dd>{{ deployment.build_run_id }}</dd>
+            <dt>镜像</dt>
+            <dd>{{ deployment.image_reference || '构建中' }}</dd>
+            <dt>密钥</dt>
+            <dd>{{ deployment.secret_reference || '准备中' }}</dd>
+          </dl>
+          <p v-if="deployment.error" class="error">{{ deployment.error }}</p>
+          <details v-if="deployment.logs">
+            <summary>运行日志</summary>
+            <pre>{{ deployment.logs }}</pre>
+          </details>
+          <div class="deployment-actions">
+            <button
+              v-if="deployment.status === 'ready' && deployment.previous_deployment_id"
+              type="button"
+              class="secondary"
+              :disabled="publishing"
+              @click="rollbackPublish"
+            >
+              回滚上一版本
+            </button>
+            <button
+              v-if="status?.state === 'completed'"
+              type="button"
+              class="primary"
+              :disabled="publishing || ['queued', 'building'].includes(deployment.status)"
+              @click="publishProject"
+            >
+              重新发布
+            </button>
+          </div>
+        </template>
+        <p v-if="deploymentError" class="error">{{ deploymentError }}</p>
+      </section>
       <div v-else class="mode-placeholder">
         <h2>{{ placeholderTitle }}</h2>
         <p>{{ placeholderDescription }}</p>
@@ -314,9 +366,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import ForgeLogo from '@/components/ForgeLogo.vue'
+import * as deploymentApi from '@/api/modules/deployments'
+import type { Deployment } from '@/api/modules/deployments'
 import type { WorkspaceView } from './projectView'
 import { isNearThreadBottom, isWriteActivity } from './buildTimeline'
 import AppPreviewPane from './components/AppPreviewPane.vue'
@@ -365,6 +419,10 @@ const workspaceView = ref<WorkspaceView>('design')
 const requestedWorkspacePath = ref<string | null>(null)
 const workspaceRequestSequence = ref(0)
 const thread = ref<HTMLElement | null>(null)
+const deployment = ref<Deployment | null>(null)
+const publishing = ref(false)
+const deploymentError = ref('')
+let deploymentPoll: ReturnType<typeof setTimeout> | null = null
 let autoOpenedWorkspace = false
 const featureCount = computed(
   () => planItems.value.filter((item) => item.kind === 'feature').length,
@@ -569,8 +627,49 @@ function openWorkspaceFile(path: string) {
 function shareProject() {
   void navigator.clipboard?.writeText(window.location.href)
 }
-function publishProject() {
-  window.alert('发布尚未接入。当前仅支持工作区源码浏览。')
+function scheduleDeploymentPoll() {
+  if (deploymentPoll) clearTimeout(deploymentPoll)
+  if (!deployment.value || !['queued', 'building'].includes(deployment.value.status)) return
+  deploymentPoll = setTimeout(async () => {
+    try {
+      deployment.value = await deploymentApi.getDeployment(
+        projectId,
+        deployment.value!.deployment_id,
+      )
+      scheduleDeploymentPoll()
+    } catch (cause) {
+      deploymentError.value = cause instanceof Error ? cause.message : '读取发布状态失败'
+    }
+  }, 1500)
+}
+async function publishProject() {
+  if (publishing.value || status.value?.state !== 'completed') return
+  publishing.value = true
+  deploymentError.value = ''
+  workspaceView.value = 'cloud'
+  try {
+    deployment.value = await deploymentApi.createDeployment(projectId)
+    scheduleDeploymentPoll()
+  } catch (cause) {
+    deploymentError.value = cause instanceof Error ? cause.message : '发布失败'
+  } finally {
+    publishing.value = false
+  }
+}
+async function rollbackPublish() {
+  if (!deployment.value || publishing.value) return
+  publishing.value = true
+  deploymentError.value = ''
+  try {
+    deployment.value = await deploymentApi.rollbackDeployment(
+      projectId,
+      deployment.value.deployment_id,
+    )
+  } catch (cause) {
+    deploymentError.value = cause instanceof Error ? cause.message : '回滚失败'
+  } finally {
+    publishing.value = false
+  }
 }
 function downloadWorkspaceHint() {
   window.alert(
@@ -615,9 +714,63 @@ watch(
     if (shouldFollow) thread.value?.scrollTo({ top: thread.value.scrollHeight, behavior: 'smooth' })
   },
 )
+void deploymentApi
+  .listDeployments(projectId)
+  .then((items) => {
+    deployment.value = items[0] ?? null
+    scheduleDeploymentPoll()
+  })
+  .catch(() => undefined)
+onUnmounted(() => {
+  if (deploymentPoll) clearTimeout(deploymentPoll)
+})
 </script>
 
 <style scoped lang="scss">
+.deployment-pane {
+  margin: 1rem;
+  padding: 1.25rem;
+  overflow: auto;
+  border: 1px solid #e4e7ef;
+  border-radius: 1rem;
+  background: #fff;
+  dl {
+    display: grid;
+    grid-template-columns: 7rem minmax(0, 1fr);
+    gap: 0.6rem;
+  }
+  dt {
+    color: #71717a;
+  }
+  dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  pre {
+    max-height: 24rem;
+    overflow: auto;
+    padding: 0.75rem;
+    background: #111827;
+    color: #e5e7eb;
+  }
+}
+.deployment-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+.deployment-status.ready {
+  color: #15803d;
+}
+.deployment-status.failed {
+  color: #b91c1c;
+}
+.deployment-actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
 .plan-row {
   flex-wrap: wrap;
 }

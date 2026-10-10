@@ -10,6 +10,7 @@ from app.models.project_message import ProjectMessage, ProjectMessageSender
 from app.models.project_message_classification import ProjectMessageClassification
 from app.models.user import User
 from app.services import project as project_service
+from app.telemetry.agent import agent_telemetry_scope
 
 # 喂给模型的上下文上限：条数与总字符，避免 prompt 过长。
 MAX_CONTEXT_MESSAGES = 20
@@ -101,13 +102,21 @@ def classify_user_message(
     if existing is not None:
         return existing
 
-    decision = leader_agent.classify_message(
-        project_name=project.name,
-        project_status=project.status,
-        recent_messages=_recent_context(db, message),
-        message_sequence=message.sequence,
-        message_content=message.content,
-    )
+    with agent_telemetry_scope(
+        project_id=project_id,
+        build_run_id=None,
+        task_id=None,
+        execution_id=None,
+        role="Leader",
+        bind=db.get_bind(),
+    ):
+        decision = leader_agent.classify_message(
+            project_name=project.name,
+            project_status=project.status,
+            recent_messages=_recent_context(db, message),
+            message_sequence=message.sequence,
+            message_content=message.content,
+        )
     classification = ProjectMessageClassification(
         message_id=message.id,
         category=decision.category.value,
