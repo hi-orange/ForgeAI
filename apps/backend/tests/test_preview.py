@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from app.core.exceptions import BusinessException
 from app.core.settings import settings
+from app.runtime.preview import PreviewSandboxHandle
 from app.services import preview as preview_service
 from app.services import preview_design
 
@@ -28,22 +29,108 @@ class PreviewServiceTests(unittest.TestCase):
                 status = preview_service.get_preview_status(db, user, 29)
         self.assertEqual(status.status, "disabled")
 
-    def test_start_rejects_when_not_completed(self) -> None:
+    def test_start_rejects_when_workspace_is_not_ready(self) -> None:
         db = MagicMock()
         user = MagicMock()
-        status = MagicMock(state="engineering_running", run_id="run_1")
+        status = MagicMock(
+            state="engineering_running",
+            run_id="run_1",
+            workspace_ready=False,
+            code_item_id=None,
+        )
         with (
             patch.object(settings, "preview_enabled", True),
             patch.object(preview_service.project_service, "get_user_project"),
             patch.object(preview_service, "get_requirements_status", return_value=status),
         ):
-            with self.assertRaisesRegex(BusinessException, "独立验收通过"):
+            with self.assertRaisesRegex(BusinessException, "工作区尚未就绪"):
                 preview_service.start_preview(db, user, 29)
+
+    def test_start_allows_unverified_engineering_workspace(self) -> None:
+        db = MagicMock()
+        user = MagicMock()
+        req = MagicMock(
+            state="engineering_running",
+            run_id="run_working",
+            preview_revision=None,
+            preview_source_hash=None,
+            workspace_ready=True,
+            code_item_id=None,
+        )
+        workspace = Path(tempfile.mkdtemp(prefix="forgeai-preview-working-"))
+        (workspace / "frontend").mkdir()
+        with (
+            patch.object(settings, "preview_enabled", True),
+            patch.object(preview_service.project_service, "get_user_project"),
+            patch.object(preview_service, "get_requirements_status", return_value=req),
+            patch.object(preview_service, "workspace_is_ready", return_value=True),
+            patch.object(preview_service, "default_workspace_path", return_value=workspace),
+            patch.object(preview_service, "source_snapshot", return_value=(b"{}", "a" * 64)),
+            patch.object(preview_service, "_ensure_sweeper"),
+            patch.object(preview_service.threading, "Thread") as thread_cls,
+        ):
+            result = preview_service.start_preview(db, user, 29)
+
+        self.assertEqual(result.status, "starting")
+        self.assertFalse(result.verified)
+        self.assertEqual(preview_service._sessions[29].run_id, "run_working")
+        thread_cls.assert_called_once()
+
+    def test_start_uses_exact_published_revision_snapshot(self) -> None:
+        db = MagicMock()
+        user = MagicMock()
+        req = MagicMock(
+            state="engineering_running",
+            run_id="run_revision",
+            workspace_ready=True,
+            code_item_id=None,
+            preview_revision=3,
+            preview_source_hash="a" * 64,
+        )
+        event = MagicMock(payload={"source_artifact_id": "src_revision", "source_hash": "a" * 64})
+        db.scalar.return_value = event
+        workspace = Path(tempfile.mkdtemp(prefix="forgeai-preview-revision-"))
+        (workspace / "frontend").mkdir()
+        with (
+            patch.object(settings, "preview_enabled", True),
+            patch.object(preview_service.project_service, "get_user_project"),
+            patch.object(preview_service, "get_requirements_status", return_value=req),
+            patch.object(preview_service, "workspace_is_ready", return_value=True),
+            patch.object(preview_service, "default_workspace_path", return_value=workspace),
+            patch.object(
+                preview_service,
+                "read_source_artifact_snapshot",
+                return_value=b'{"frontend/index.html":"revision"}',
+            ) as read_snapshot,
+            patch.object(preview_service, "source_snapshot") as live_snapshot,
+            patch.object(preview_service, "_ensure_sweeper"),
+            patch.object(preview_service.threading, "Thread"),
+        ):
+            result = preview_service.start_preview(db, user, 29)
+
+        self.assertEqual(result.revision, 3)
+        self.assertEqual(result.source_hash, "a" * 64)
+        session = preview_service._sessions[29]
+        self.assertEqual(session.snapshot_bytes, b'{"frontend/index.html":"revision"}')
+        read_snapshot.assert_called_once_with(
+            db,
+            project_id=29,
+            artifact_id="src_revision",
+            source_hash="a" * 64,
+        )
+        live_snapshot.assert_not_called()
 
     def test_start_is_idempotent_while_ready(self) -> None:
         db = MagicMock()
         user = MagicMock()
-        req = MagicMock(state="completed", run_id="run_abc")
+        req = MagicMock(
+            state="completed",
+            run_id="run_abc",
+            preview_revision=None,
+            preview_source_hash=None,
+            code_item_id="ci_preview_code",
+            workspace_ready=True,
+        )
         workspace = Path(tempfile.mkdtemp(prefix="forgeai-preview-"))
         (workspace / "frontend").mkdir()
         session = preview_service._PreviewSession(
@@ -52,6 +139,13 @@ class PreviewServiceTests(unittest.TestCase):
             workspace=workspace,
             status="ready",
             url="http://127.0.0.1:18100/",
+            runtime_handle=PreviewSandboxHandle(
+                sandbox_id="forgeai-preview-existing",
+                source_hash="a" * 64,
+                host="127.0.0.1",
+                port=18199,
+                log_path=workspace / "preview.log",
+            ),
         )
         preview_service._sessions[29] = session
         with (
@@ -60,7 +154,13 @@ class PreviewServiceTests(unittest.TestCase):
             patch.object(preview_service, "get_requirements_status", return_value=req),
             patch.object(preview_service, "workspace_is_ready", return_value=True),
             patch.object(preview_service, "default_workspace_path", return_value=workspace),
+            patch.object(
+                preview_service,
+                "ensure_code_workspace",
+                return_value=(workspace, False),
+            ),
             patch.object(preview_service, "_ensure_sweeper"),
+            patch.object(preview_service, "source_snapshot", return_value=(b"{}", "a" * 64)),
             patch.object(preview_service.threading, "Thread") as thread_cls,
         ):
             first = preview_service.start_preview(db, user, 29)
@@ -69,6 +169,7 @@ class PreviewServiceTests(unittest.TestCase):
         self.assertEqual(first.url, "http://127.0.0.1:18100/")
         self.assertEqual(second.status, "ready")
         thread_cls.assert_not_called()
+        self.assertTrue(second.verified)
 
     def test_stop_clears_session(self) -> None:
         session = preview_service._PreviewSession(
@@ -151,114 +252,46 @@ class PreviewServiceTests(unittest.TestCase):
             port = preview_service._allocate_port("127.0.0.1")
         self.assertEqual(port, 18102)
 
-    def test_frontend_preview_rebuilds_existing_dist_without_node_compile_cache(self) -> None:
+    def test_boot_session_runs_generated_app_only_through_sandbox_runtime(self) -> None:
         with tempfile.TemporaryDirectory(prefix="forgeai-preview-") as tmp:
             workspace = Path(tmp)
-            vite = workspace / "frontend/node_modules/vite/bin/vite.js"
-            swc = (
-                workspace / "frontend/node_modules/@swc/core-win32-x64-msvc/swc.win32-x64-msvc.node"
+            handle = PreviewSandboxHandle(
+                sandbox_id="forgeai-preview-test",
+                source_hash="a" * 64,
+                host="127.0.0.1",
+                port=18201,
+                log_path=workspace / "forgeai/logs/preview-sandbox.log",
             )
-            dist = workspace / "frontend/dist/index.html"
-            vite.parent.mkdir(parents=True)
-            swc.parent.mkdir(parents=True)
-            dist.parent.mkdir(parents=True)
-            vite.write_text("", encoding="utf-8")
-            swc.write_bytes(b"native")
-            dist.write_text("old", encoding="utf-8")
-
-            def rebuild(*args, **kwargs) -> None:
-                self.assertEqual(kwargs["env"]["NODE_DISABLE_COMPILE_CACHE"], "1")
-                if preview_service.os.name == "nt":
-                    self.assertEqual(kwargs["env"]["SWC_BINARY_PATH"], str(swc.resolve()))
-                dist.write_text("new", encoding="utf-8")
-
-            with patch.object(preview_service, "_run_checked", side_effect=rebuild) as run:
-                preview_service._ensure_frontend_dist(workspace)
-
-            run.assert_called_once()
-            self.assertEqual(dist.read_text(encoding="utf-8"), "new")
-            self.assertTrue(preview_service._frontend_build_marker(workspace).is_file())
-
-    def test_frontend_preview_reuses_dist_only_for_the_same_source(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="forgeai-preview-") as tmp:
-            workspace = Path(tmp)
-            frontend = workspace / "frontend"
-            source = frontend / "src/App.tsx"
-            dist = frontend / "dist/index.html"
-            source.parent.mkdir(parents=True)
-            dist.parent.mkdir(parents=True)
-            source.write_text("export default function App() {}", encoding="utf-8")
-            dist.write_text("built", encoding="utf-8")
-            source_hash = preview_service._frontend_source_hash(frontend)
-            preview_service._write_frontend_build_marker(workspace, source_hash)
-
-            with patch.object(preview_service, "_run_checked") as run:
-                preview_service._ensure_frontend_dist(workspace)
-
-            run.assert_not_called()
-
-    def test_frontend_source_hash_ignores_dist_and_dependencies(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="forgeai-preview-") as tmp:
-            frontend = Path(tmp) / "frontend"
-            source = frontend / "src/App.tsx"
-            dependency = frontend / "node_modules/pkg/index.js"
-            output = frontend / "dist/index.html"
-            source.parent.mkdir(parents=True)
-            dependency.parent.mkdir(parents=True)
-            output.parent.mkdir(parents=True)
-            source.write_text("source", encoding="utf-8")
-            dependency.write_text("dependency one", encoding="utf-8")
-            output.write_text("output one", encoding="utf-8")
-            before = preview_service._frontend_source_hash(frontend)
-
-            dependency.write_text("dependency two", encoding="utf-8")
-            output.write_text("output two", encoding="utf-8")
-
-            self.assertEqual(preview_service._frontend_source_hash(frontend), before)
-
-    def test_preview_commands_decode_utf8_logs_without_host_codepage_failures(self) -> None:
-        completed = MagicMock(returncode=0, stdout="完成", stderr="")
-        with patch.object(preview_service.subprocess, "run", return_value=completed) as run:
-            preview_service._run_checked(
-                ["tool", "check"],
-                cwd=Path("."),
-                env={},
-                timeout=10,
-                label="检查",
+            runtime = MagicMock()
+            runtime.start.return_value = handle
+            runtime.is_running.return_value = True
+            proxy = MagicMock()
+            session = preview_service._PreviewSession(
+                project_id=29,
+                run_id="run_sandbox",
+                workspace=workspace,
             )
+            with (
+                patch.object(preview_service, "get_preview_runtime", return_value=runtime),
+                patch.object(preview_service, "_allocate_port", side_effect=[18201, 18202]),
+                patch.object(preview_service, "_wait_http") as wait_http,
+                patch.object(preview_service, "_start_proxy", return_value=proxy),
+            ):
+                preview_service._boot_session(session)
 
-        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
-        self.assertEqual(run.call_args.kwargs["errors"], "replace")
-
-    def test_backend_preview_always_reconciles_manifest_with_existing_venv(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="forgeai-preview-") as tmp:
-            workspace = Path(tmp)
-            backend = workspace / "backend"
-            backend.mkdir()
-            (backend / ".venv").mkdir()
-            (backend / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
-            with patch.object(preview_service, "_run_checked") as run:
-                preview_service._ensure_backend_ready(workspace, {"PATH": "test"})
-
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[0].args[0], ["uv", "sync"])
-        self.assertEqual(run.call_args_list[1].args[0], ["uv", "run", "alembic", "upgrade", "head"])
-
-    def test_backend_preview_launches_the_venv_python_directly(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="forgeai-preview-") as tmp:
-            workspace = Path(tmp)
-            windows_python = workspace / "backend/.venv/Scripts/python.exe"
-            windows_python.parent.mkdir(parents=True)
-            windows_python.write_bytes(b"")
-
-            resolved = preview_service._backend_python(workspace)
-
-        self.assertEqual(resolved, windows_python)
+        request = runtime.start.call_args.args[0]
+        self.assertEqual(request.workspace, workspace)
+        self.assertEqual(request.host_port, 18201)
+        self.assertEqual(session.status, "ready")
+        self.assertEqual(session.url, "http://127.0.0.1:18202/")
+        self.assertIs(session.runtime_handle, handle)
+        self.assertEqual(wait_http.call_count, 3)
+        runtime.stop.assert_not_called()
 
     def test_runtime_backend_failure_is_visible_in_preview_status(self) -> None:
         with tempfile.TemporaryDirectory(prefix="forgeai-preview-") as tmp:
             workspace = Path(tmp)
-            log_path = workspace / "forgeai/logs/preview-backend.log"
+            log_path = workspace / "forgeai/logs/preview-sandbox.log"
             log_path.parent.mkdir(parents=True)
             log_path.write_text(
                 f"Traceback at {workspace}\\backend\\app.py\nZoneInfoNotFoundError: missing",
@@ -270,7 +303,7 @@ class PreviewServiceTests(unittest.TestCase):
                 workspace=workspace,
                 status="ready",
                 url="http://127.0.0.1:18100/",
-                backend_log_path=log_path,
+                preview_log_path=log_path,
             )
 
             preview_service._record_backend_failure(session, "/api/v1/profile", 500)

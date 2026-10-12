@@ -163,7 +163,7 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
             {
                 "max_model_turns": 40,
                 "max_tool_calls": 120,
-                "max_repair_rounds": 8,
+                "max_repair_rounds": 3,
             },
         )
 

@@ -14,7 +14,10 @@ class QualityActivityPersistenceTests(unittest.TestCase):
         execution.draft = None
         db = MagicMock()
 
-        with patch("sqlalchemy.orm.attributes.flag_modified") as flag:
+        with (
+            patch("sqlalchemy.orm.attributes.flag_modified") as flag,
+            patch("app.orchestration.test_engineer.sync_checkpoint_activity_events") as sync_events,
+        ):
             orch._record_quality_activity(
                 db,
                 execution,
@@ -39,6 +42,7 @@ class QualityActivityPersistenceTests(unittest.TestCase):
         self.assertFalse(activities[-1]["ok"])
         self.assertIn("预算已用尽", activities[-1]["detail"])
         self.assertEqual(flag.call_count, 2)
+        self.assertEqual(sync_events.call_count, 2)
         self.assertEqual(db.commit.call_count, 2)
         self.assertEqual(db.refresh.call_count, 2)
 

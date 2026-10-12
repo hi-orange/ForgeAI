@@ -99,8 +99,13 @@ export function HomePage() {
                   tone: 'bg-accent/15 text-accent-foreground',
                 },
               ].map(({ icon: Icon, title, text, tone }) => (
-                <article key={title} className="rounded-2xl border border-border/70 bg-card p-4 shadow-sm">
-                  <div className={`mb-5 flex size-10 items-center justify-center rounded-xl ${tone}`}>
+                <article
+                  key={title}
+                  className="rounded-2xl border border-border/70 bg-card p-4 shadow-sm"
+                >
+                  <div
+                    className={`mb-5 flex size-10 items-center justify-center rounded-xl ${tone}`}
+                  >
                     <Icon className="size-5" aria-hidden="true" />
                   </div>
                   <h2 className="font-semibold">{title}</h2>

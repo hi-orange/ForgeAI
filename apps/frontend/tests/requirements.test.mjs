@@ -773,8 +773,5 @@ test('preview design wrapper passes an object body without double serialization'
   await api.savePreviewDesign(4, state)
 
   const call = JSON.parse(JSON.stringify(Array.from(request.mock.calls[0].arguments)))
-  assert.deepEqual(call, [
-    '/api/v1/projects/4/preview/design',
-    { method: 'PUT', body: state },
-  ])
+  assert.deepEqual(call, ['/api/v1/projects/4/preview/design', { method: 'PUT', body: state }])
 })

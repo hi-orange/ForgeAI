@@ -1,8 +1,9 @@
 import unittest
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
@@ -17,6 +18,7 @@ from app.models.project_message import ProjectMessage
 from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.user import User
+from app.models.workflow_job import WorkflowJob
 from app.schemas.leader import NextAction, NextActionKind
 from app.services import decision_event, deployment, evaluation, run_control
 
@@ -174,6 +176,9 @@ class PlatformCompletionTests(unittest.TestCase):
             metrics = {metric.name: metric for metric in report.metrics}
             self.assertEqual(metrics["routing_accuracy"].status, "unavailable")
             self.assertEqual(metrics["message_classification_accuracy"].status, "unavailable")
+            self.assertEqual(metrics["schema_first_pass"].status, "unavailable")
+            self.assertEqual(metrics["regression_pass"].status, "unavailable")
+            self.assertNotIn("schema_and_execution_first_pass", metrics)
 
     def test_publish_creates_durable_attempt_and_external_secret_file(self) -> None:
         with self.sessions() as db, TemporaryDirectory() as runtime_root:
@@ -189,7 +194,6 @@ class PlatformCompletionTests(unittest.TestCase):
             release.status = "succeeded"
             release.active_slot = None
             db.commit()
-            worker = MagicMock()
             with (
                 patch.object(deployment.settings, "runtime_data_root", runtime_root),
                 patch.object(deployment, "workspace_is_ready", return_value=True),
@@ -199,9 +203,18 @@ class PlatformCompletionTests(unittest.TestCase):
                 patch.object(
                     deployment,
                     "get_requirements_status",
-                    return_value=SimpleNamespace(state="completed", run_id="run_release"),
+                    return_value=SimpleNamespace(
+                        state="completed",
+                        run_id="run_release",
+                        code_item_id="ci_release_code",
+                    ),
                 ),
-                patch.object(deployment.threading, "Thread", return_value=worker),
+                patch.object(
+                    deployment,
+                    "ensure_code_workspace",
+                    return_value=(Path(runtime_root), False),
+                ),
+                patch("app.services.security_gate.require_security_pass"),
             ):
                 created = deployment.start_deployment(db, self.user, self.project.id)
                 secret_file = deployment._env_path(created.deployment_id)
@@ -210,7 +223,17 @@ class PlatformCompletionTests(unittest.TestCase):
                 self.assertTrue(secret_file.is_file())
                 self.assertIn("DATABASE_URL=postgresql+psycopg://", secret_file.read_text())
                 self.assertNotIn("POSTGRES_PASSWORD", created.secret_reference)
-                worker.start.assert_called_once_with()
+                job = db.scalar(
+                    select(WorkflowJob).where(WorkflowJob.deployment_id == created.deployment_id)
+                )
+                self.assertIsNotNone(job)
+                assert job is not None
+                self.assertEqual(job.status, "queued")
+                self.assertEqual(job.job_type, "deployment")
+                self.assertEqual(
+                    job.idempotency_key,
+                    f"deployment:{created.deployment_id}",
+                )
 
 
 if __name__ == "__main__":

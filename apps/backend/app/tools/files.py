@@ -6,6 +6,8 @@ import hashlib
 import json
 import re
 from pathlib import Path
+from typing import cast
+from uuid import uuid4
 
 from app.core.exceptions import ConflictException
 from app.schemas.agent_action import ToolExecutionResult
@@ -471,6 +473,118 @@ def apply_patch(
         ok=True,
         summary=f"已写入 {path}",
         data={"path": path.replace("\\", "/"), "content_hash": sha256_bytes(payload)},
+    )
+
+
+def apply_patch_batch(
+    root: Path,
+    *,
+    writes: list[dict[str, str | None]],
+    revision_id: str,
+    tool_call_id: str = "call_patch_batch",
+) -> ToolExecutionResult:
+    """Validate every optimistic write, then replace the bounded file set as one unit."""
+
+    result = ToolExecutionResult(
+        tool_call_id=tool_call_id,
+        name="apply_patch_batch",
+        ok=False,
+        summary="",
+    )
+    if not 2 <= len(writes) <= 8:
+        return result.model_copy(
+            update={"error_code": "INVALID_BATCH", "summary": "批量写入必须包含 2～8 个文件"}
+        )
+    prepared: list[dict[str, object]] = []
+    seen: set[str] = set()
+    try:
+        for row in writes:
+            path = str(row.get("path") or "").replace("\\", "/").strip()
+            content = row.get("content")
+            expected_hash = row.get("expected_hash")
+            if not path or path in seen or not isinstance(content, str):
+                raise ConflictException("批量写入包含空路径、重复路径或无效正文")
+            if expected_hash is not None and not isinstance(expected_hash, str):
+                raise ConflictException(f"{path} 的 expected_hash 无效")
+            seen.add(path)
+            payload = content.encode("utf-8")
+            if len(payload) > MAX_WRITE_BYTES:
+                raise ConflictException(f"{path} 写入内容超过上限")
+            target = safe_path_under_root(root, path, allow_create=True)
+            if target.exists() and not target.is_file():
+                raise ConflictException(f"{path} 不是可写文件")
+            if target.exists() and not is_text_file(target):
+                raise ConflictException(f"{path} 不是可编辑的文本文件")
+            if not target.exists() and not is_text_file(Path(path)):
+                raise ConflictException(f"不允许写入文件类型：{path}")
+            original = target.read_bytes() if target.exists() else None
+            current_hash = sha256_bytes(original) if original is not None else None
+            if original is not None and expected_hash != current_hash:
+                raise ConflictException(f"{path} 已变化，请重新读取后再批量写入")
+            if original is None and expected_hash:
+                raise ConflictException(f"{path} 不存在，无法按旧 hash 批量写入")
+            prepared.append(
+                {
+                    "path": path,
+                    "target": target,
+                    "payload": payload,
+                    "original": original,
+                }
+            )
+        for item in prepared:
+            snapshot_workspace_source(root, revision_id=revision_id, path=str(item["path"]))
+    except (ConflictException, OSError, UnicodeError) as exc:
+        return result.model_copy(
+            update={"error_code": "BATCH_VALIDATION_FAILED", "summary": str(exc)[:500]}
+        )
+
+    temporaries: list[Path] = []
+    applied: list[dict[str, object]] = []
+    try:
+        for item in prepared:
+            target = cast(Path, item["target"])
+            payload = cast(bytes, item["payload"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.parent / f".{target.name}.forgeai-{uuid4().hex}"
+            temporaries.append(temporary)
+            temporary.write_bytes(payload)
+            temporary.replace(target)
+            applied.append(item)
+    except OSError as exc:
+        rollback_error: OSError | None = None
+        for item in reversed(applied):
+            target = cast(Path, item["target"])
+            original = cast(bytes | None, item["original"])
+            try:
+                if isinstance(original, bytes):
+                    target.write_bytes(original)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError as rollback_exc:
+                rollback_error = rollback_exc
+        code = "BATCH_ROLLBACK_FAILED" if rollback_error is not None else "BATCH_WRITE_FAILED"
+        detail = rollback_error or exc
+        return result.model_copy(
+            update={"error_code": code, "summary": f"批量写入失败：{str(detail)[:400]}"}
+        )
+    finally:
+        for temporary in temporaries:
+            temporary.unlink(missing_ok=True)
+
+    files = [
+        {
+            "path": str(item["path"]),
+            "content_hash": sha256_bytes(item["payload"]),
+        }
+        for item in prepared
+        if isinstance(item["payload"], bytes)
+    ]
+    return result.model_copy(
+        update={
+            "ok": True,
+            "summary": f"已原子写入 {len(files)} 个关联文件",
+            "data": {"files": files},
+        }
     )
 
 

@@ -21,9 +21,9 @@ from app.core.settings import settings
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.paths import MAX_FILE_BYTES, SKIP_DIRS, is_text_file, safe_path_under_root
 
-CHECK_IDS = {"database", "backend", "frontend", "all"}
+CHECK_IDS = {"quick", "database", "backend", "frontend", "all", "security"}
 CHECK_RUNTIME_LABEL = "org.forgeai.check-runtime-version"
-CHECK_RUNTIME_VERSION = "14"
+CHECK_RUNTIME_VERSION = "17"
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 MAX_BINARY_ASSETS_BYTES = 32 * 1024 * 1024
@@ -309,7 +309,11 @@ def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> Tool
         result.error_code = (
             None
             if result.ok
-            else ("CHECK_ENVIRONMENT_UNAVAILABLE" if code in {125, 126, 127} else "CHECK_FAILED")
+            else (
+                "CHECK_ENVIRONMENT_UNAVAILABLE"
+                if code in {125, 126, 127}
+                else ("SECURITY_CHECK_FAILED" if check_id == "security" else "CHECK_FAILED")
+            )
         )
         result.summary = (
             ("完整检查与隔离运行冒烟通过" if check_id == "all" else f"{check_id} 检查通过")

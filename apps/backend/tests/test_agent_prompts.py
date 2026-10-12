@@ -10,6 +10,7 @@ from app.agents.prompts.code_engineer import (
     CODE_ENGINEER_SYSTEM_PROMPT,
     CODE_WRITER_SYSTEM_PROMPT,
     FILE_PLANNER_SYSTEM_PROMPT,
+    REPAIR_PLANNER_SYSTEM_PROMPT,
 )
 from app.agents.prompts.contracts import (
     APPROVAL_WORKFLOW_CONTRACT,
@@ -77,6 +78,10 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("不得虚构 seed_checks", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("frontend/src/index.css", FILE_PLANNER_SYSTEM_PROMPT)
         self.assertIn("kind=image", FILE_PLANNER_SYSTEM_PROMPT)
+        self.assertIn("<Link to>", FILE_PLANNER_SYSTEM_PROMPT)
+        self.assertIn("validateSearch", FILE_PLANNER_SYSTEM_PROMPT)
+        self.assertIn("全部相关 diagnostics", REPAIR_PLANNER_SYSTEM_PROMPT)
+        self.assertIn("validateSearch", REPAIR_PLANNER_SYSTEM_PROMPT)
         self.assertIn("whole-file 编辑格式", CODE_WRITER_SYSTEM_PROMPT)
         self.assertIn("不输出 TODO", CODE_WRITER_SYSTEM_PROMPT)
         self.assertIn("不可互相替代", CODE_ENGINEER_SYSTEM_PROMPT)

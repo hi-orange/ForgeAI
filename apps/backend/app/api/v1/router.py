@@ -9,6 +9,7 @@ from app.api.v1 import (
     project_messages,
     projects,
     requirements,
+    security,
     workspace,
 )
 
@@ -20,5 +21,6 @@ api_router.include_router(build_runs.router)
 api_router.include_router(deployments.router)
 api_router.include_router(evaluations.router)
 api_router.include_router(requirements.router)
+api_router.include_router(security.router)
 api_router.include_router(workspace.router)
 api_router.include_router(preview.router)

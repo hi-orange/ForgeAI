@@ -1,11 +1,6 @@
 {
   "version": 1,
-  "top_level_fields": [
-    "version",
-    "visual_contract",
-    "api_checks",
-    "browser_checks"
-  ],
+  "top_level_fields": ["version", "visual_contract", "api_checks", "browser_checks"],
   "browser": {
     "default_viewport": {
       "width": 1440,

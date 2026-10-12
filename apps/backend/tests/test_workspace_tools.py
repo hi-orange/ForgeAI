@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from app.core.exceptions import ConflictException
 from app.tools.files import (
     apply_patch,
+    apply_patch_batch,
     edit_file_by_replace,
     list_files,
     read_file,
@@ -60,6 +61,53 @@ class WorkspaceFileToolTests(unittest.TestCase):
             (self.root / "backend" / "app" / "main.py").read_text(encoding="utf-8"),
             "print('new')\n",
         )
+
+    def test_batch_patch_validates_all_hashes_before_writing(self):
+        existing = self.root / "backend" / "app" / "main.py"
+        original = existing.read_text(encoding="utf-8")
+        new_file = self.root / "backend" / "app" / "service.py"
+        conflict = apply_patch_batch(
+            self.root,
+            writes=[
+                {
+                    "path": "backend/app/main.py",
+                    "content": "print('changed')\n",
+                    "expected_hash": "0" * 64,
+                },
+                {
+                    "path": "backend/app/service.py",
+                    "content": "VALUE = 1\n",
+                    "expected_hash": None,
+                },
+            ],
+            revision_id="exec_batch_conflict",
+        )
+        self.assertFalse(conflict.ok)
+        self.assertEqual(conflict.error_code, "BATCH_VALIDATION_FAILED")
+        self.assertEqual(existing.read_text(encoding="utf-8"), original)
+        self.assertFalse(new_file.exists())
+
+        current_hash = sha256_bytes(existing.read_bytes())
+        written = apply_patch_batch(
+            self.root,
+            writes=[
+                {
+                    "path": "backend/app/main.py",
+                    "content": "print('changed')\n",
+                    "expected_hash": current_hash,
+                },
+                {
+                    "path": "backend/app/service.py",
+                    "content": "VALUE = 1\n",
+                    "expected_hash": None,
+                },
+            ],
+            revision_id="exec_batch_success",
+        )
+        self.assertTrue(written.ok)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "print('changed')\n")
+        self.assertEqual(new_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+        self.assertEqual(len(written.data["files"]), 2)
 
     def test_empty_file_read_succeeds(self):
         target = self.root / "backend" / "app" / "empty.py"

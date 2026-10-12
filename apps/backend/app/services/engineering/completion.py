@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -31,6 +32,7 @@ from app.services import plan as plan_service
 from app.services import task as task_service
 from app.services.engineering.claim import read_frozen_input_snapshot
 from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_engineering_source
+from app.services.source_artifact import persist_source_artifact
 from app.tools.checks import source_snapshot
 
 
@@ -43,9 +45,21 @@ def _source_manifest(payload: bytes) -> list[SourceFileIdentity]:
         raise BusinessException("源码快照为空，不能发布 code 成果")
     manifest: list[SourceFileIdentity] = []
     for path, content in files.items():
-        if not isinstance(path, str) or not isinstance(content, str):
+        if not isinstance(path, str):
             raise BusinessException("源码快照格式异常")
-        raw = content.encode("utf-8")
+        if isinstance(content, str):
+            raw = content.encode("utf-8")
+        elif (
+            isinstance(content, dict)
+            and content.get("encoding") == "base64"
+            and isinstance(content.get("content"), str)
+        ):
+            try:
+                raw = base64.b64decode(content["content"], validate=True)
+            except ValueError as exc:
+                raise BusinessException("源码快照二进制格式异常") from exc
+        else:
+            raise BusinessException("源码快照格式异常")
         manifest.append(
             SourceFileIdentity(
                 path=path,
@@ -147,8 +161,17 @@ def complete_code_engineer_task(
             raise ConflictException("工程执行尚未完成全部工作单元")
         if checkpoint.get("completed_source_hash") != source_hash:
             raise ConflictException("源码在最终检查后发生变化，不能发布 code 成果")
+        stored_source = persist_source_artifact(
+            db,
+            project_id=project_id,
+            snapshot_bytes=snapshot_bytes,
+            source_hash=source_hash,
+        )
         artifact = CodeArtifact(
             source_hash=source_hash,
+            source_artifact_id=stored_source.artifact_id,
+            artifact_format=stored_source.artifact_format,
+            artifact_size_bytes=stored_source.size_bytes,
             workspace_key=str(frozen.get("workspace_key") or run_id),
             template_version=str(frozen.get("template_version") or "unknown"),
             tool_strategy_version=str(frozen.get("tool_strategy_version") or "unknown"),

@@ -56,7 +56,8 @@ const server = await createServer({
       name: 'design-preview-fixture',
       enforce: 'pre',
       resolveId(id) {
-        if (id.endsWith('/api/modules/preview') || id === '@/api/modules/preview') return '\0fixture-preview-api'
+        if (id.endsWith('/api/modules/preview') || id === '@/api/modules/preview')
+          return '\0fixture-preview-api'
         if (id === 'fixture-app') return '\0fixture-app'
       },
       load(id) {
@@ -72,7 +73,12 @@ const server = await createServer({
           }
           if (req.url !== '/') return next()
           res.setHeader('Content-Type', 'text/html; charset=utf-8')
-          res.end(await viteServer.transformIndexHtml('/', '<html lang="zh"><head><meta charset="utf-8"><title>Design 验收</title></head><body style="margin:0"><div id="app"></div><script type="module" src="/@id/__x00__fixture-app"></script></body></html>'))
+          res.end(
+            await viteServer.transformIndexHtml(
+              '/',
+              '<html lang="zh"><head><meta charset="utf-8"><title>Design 验收</title></head><body style="margin:0"><div id="app"></div><script type="module" src="/@id/__x00__fixture-app"></script></body></html>',
+            ),
+          )
         })
       },
     },

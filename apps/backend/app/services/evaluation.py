@@ -14,9 +14,11 @@ from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
 from app.models.plan import Plan
 from app.models.project_message_classification import ProjectMessageClassification
+from app.models.security_report import SecurityReport
 from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.user import User
+from app.models.workflow_event import WorkflowEvent
 from app.schemas.evaluation import (
     AgentEvalLabelCreate,
     AgentEvaluationReport,
@@ -75,7 +77,8 @@ def evaluate_project(db: Session, user: User, project_id: int) -> AgentEvaluatio
     project_service.get_user_project(db, user, project_id)
     runs = list(db.scalars(select(BuildRun).where(BuildRun.project_id == project_id)).all())
     terminal = [run for run in runs if run.status in {"succeeded", "failed", "cancelled"}]
-    succeeded = sum(run.status == "succeeded" for run in terminal)
+    evaluated_terminal = [run for run in terminal if run.status != "cancelled"]
+    succeeded = sum(run.status == "succeeded" for run in evaluated_terminal)
 
     reports = _test_reports(db, project_id)
     passed_reports = sum(
@@ -103,7 +106,13 @@ def evaluate_project(db: Session, user: User, project_id: int) -> AgentEvaluatio
         and execution.status == "succeeded"
         and execution.task_id in completed_task_ids
     }
-    retry_attempts = [execution for execution in executions if execution.attempt > 1]
+    code_task_ids = {task.task_id for task in tasks if task.recipient == "Code Engineer"}
+    completed_code_task_ids = completed_task_ids & code_task_ids
+    repair_attempts = [
+        execution
+        for execution in executions
+        if execution.task_id in code_task_ids and execution.attempt > 1
+    ]
 
     decisions = list(
         db.scalars(
@@ -126,7 +135,7 @@ def evaluate_project(db: Session, user: User, project_id: int) -> AgentEvaluatio
         or 0
     )
     unnecessary_leader = sum(
-        event.decided_by == "leader" and event.category in {"inquiry", "stop", "product_change"}
+        event.decided_by == "leader" and event.category in {"inquiry", "stop"}
         for event in decisions
     )
     leader_decisions = sum(event.decided_by == "leader" for event in decisions)
@@ -172,15 +181,59 @@ def evaluate_project(db: Session, user: User, project_id: int) -> AgentEvaluatio
         item.estimated_cost_microusd for item in usages if item.estimated_cost_microusd is not None
     ]
     durations = [max(0.0, (run.updated_at - run.created_at).total_seconds()) for run in terminal]
+    workflow_events = list(
+        db.scalars(select(WorkflowEvent).where(WorkflowEvent.project_id == project_id)).all()
+    )
+    event_run_ids = {event.build_run_id for event in workflow_events if event.build_run_id}
+    code_run_ids = set(
+        db.scalars(
+            select(ConfigurationItem.producer_run_id).where(
+                ConfigurationItem.project_id == project_id,
+                ConfigurationItem.semantic_type == "code",
+            )
+        ).all()
+    )
+    report_run_ids = set(
+        db.scalars(
+            select(ConfigurationItem.producer_run_id).where(
+                ConfigurationItem.project_id == project_id,
+                ConfigurationItem.semantic_type == "test_report",
+            )
+        ).all()
+    )
+    complete_trajectories = sum(
+        run.run_id in event_run_ids
+        and (
+            run.status != "succeeded"
+            or (run.run_id in code_run_ids and run.run_id in report_run_ids)
+        )
+        for run in evaluated_terminal
+    )
+    security_reports = list(
+        db.scalars(select(SecurityReport).where(SecurityReport.project_id == project_id)).all()
+    )
 
     metrics = [
-        _rate("end_to_end_task_success", succeeded, len(terminal)),
-        _rate("acceptance_pass", passed_reports, len(reports)),
         _rate(
-            "schema_and_execution_first_pass",
+            "end_to_end_run_success",
+            succeeded,
+            len(evaluated_terminal),
+            note="取消运行不计为成功或失败；另由 cancellation_rate 单独统计。",
+        ),
+        _rate(
+            "cancellation_rate", sum(run.status == "cancelled" for run in terminal), len(terminal)
+        ),
+        _rate("acceptance_report_pass", passed_reports, len(reports)),
+        _rate(
+            "task_first_attempt_success",
             len(first_attempt_completed),
             len(completed_task_ids),
-            note="以结构化输出通过并在首次 TaskExecution 完成作为可审计的一次通过口径。",
+            note="仅表示 TaskExecution 首次尝试成功，不再冒充 Schema 一次通过率。",
+        ),
+        EvalMetric(
+            name="schema_first_pass",
+            status="unavailable",
+            note="当前未持久化每次结构化解析尝试，不能从最终成功结果反推一次通过率。",
         ),
         _rate("routing_contract_pass", contract_passes, len(decisions)),
         _rate(
@@ -192,18 +245,41 @@ def evaluate_project(db: Session, user: User, project_id: int) -> AgentEvaluatio
         EvalMetric(
             name="average_repair_rounds",
             status="available",
-            numerator=len(retry_attempts),
-            denominator=len(terminal),
-            value=(len(retry_attempts) / len(terminal) if terminal else None),
-            unit="rounds_per_run",
-            note=None if terminal else "尚无终态运行",
+            numerator=len(repair_attempts),
+            denominator=len(completed_code_task_ids),
+            value=(
+                len(repair_attempts) / len(completed_code_task_ids)
+                if completed_code_task_ids
+                else None
+            ),
+            unit="rounds_per_completed_code_task",
+            note=(
+                "只统计 Code Engineer 的额外执行尝试；基础设施 job 重试不计入修复轮次。"
+                if completed_code_task_ids
+                else "尚无已完成的 Code Engineer 任务"
+            ),
         ),
-        _rate("regression_pass", passed_reports, len(reports)),
+        EvalMetric(
+            name="regression_pass",
+            status="unavailable",
+            note="TestReport 尚无独立回归标签，不能用总体验收结论重复冒充回归通过率。",
+        ),
         _rate(
             "trajectory_complete",
+            complete_trajectories,
+            len(evaluated_terminal),
+            note="终态运行必须有追加式事件；成功运行还必须同时有 code 与 test_report artifact。",
+        ),
+        _rate(
+            "decision_application_success",
             applied,
             len(decisions),
-            note=(f"已有 {classified_count} 条带决策事件的分类消息；failed 决策仍保留错误证据。"),
+            note=f"已有 {classified_count} 条带决策事件的分类消息；failed 决策仍保留错误证据。",
+        ),
+        _rate(
+            "security_gate_pass",
+            sum(report.conclusion == "passed" for report in security_reports),
+            len(security_reports),
         ),
         _rate(
             "replayable_decision",

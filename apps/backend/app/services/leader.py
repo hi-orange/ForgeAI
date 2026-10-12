@@ -61,6 +61,7 @@ from app.services.project_message_classification import (
     get_stored_classification,
     require_project_message,
 )
+from app.services.source_artifact import ensure_code_workspace
 from app.services.task_execution import lock_run
 from app.services.test_engineer import load_test_inputs
 
@@ -304,6 +305,15 @@ def create_architecture_task(
             RunRevision.project_id == project_id, RunRevision.target_run_id == run_id
         )
     )
+    if revision is not None and revision.source_run_id and revision.baseline_code_item_id:
+        _, restored = ensure_code_workspace(
+            db,
+            project_id=project_id,
+            run_id=revision.source_run_id,
+            code_item_id=revision.baseline_code_item_id,
+        )
+        if restored:
+            db.commit()
     prepare_engineering_workspace(
         project_id,
         run_id,
@@ -499,6 +509,15 @@ def create_engineering_delivery_task(
         raise
 
     assert delivery_task is not None and approved_payload is not None
+    if revision is not None and revision.source_run_id and revision.baseline_code_item_id:
+        _, restored = ensure_code_workspace(
+            db,
+            project_id=project_id,
+            run_id=revision.source_run_id,
+            code_item_id=revision.baseline_code_item_id,
+        )
+        if restored:
+            db.commit()
     prepare_engineering_workspace(
         project_id,
         run_id,

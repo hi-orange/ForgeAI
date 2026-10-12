@@ -124,6 +124,11 @@ class RequirementsStatus(BaseModel):
     # successful business-code write has happened in this run.
     workspace_ready: bool = False
     code_ready: bool = False
+    preview_revision: int | None = None
+    preview_source_hash: str | None = None
+    preview_work_item_id: str | None = None
+    preview_work_item_title: str | None = None
+    preview_updated_at: datetime | None = None
     code_item_id: str | None = None
     test_report_item_id: str | None = None
     test_challenges: list[TestChallenge] = Field(default_factory=list)

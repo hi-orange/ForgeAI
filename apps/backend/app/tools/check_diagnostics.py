@@ -21,6 +21,26 @@ _TYPESCRIPT_ERROR = re.compile(
 _BROWSER_ERROR = re.compile(
     r"^BROWSER_CHECK_FAILED\s+(?P<check>\S+)\s+(?P<route>\S+):\s*(?P<message>.+)$"
 )
+_TRACEBACK_FILE = re.compile(r'^\s*File\s+"(?P<path>[^"]+)",\s+line\s+(?P<line>\d+)')
+_PYTHON_EXCEPTION = re.compile(
+    r"^(?:(?:[\w]+\.)+)?(?P<code>"
+    r"ModuleNotFoundError|ImportError|SyntaxError|IndentationError|"
+    r"AttributeError|NameError|TypeError|ValueError|KeyError|"
+    r"RuntimeError|CalledProcessError|PydanticSchemaGenerationError"
+    r"):\s*(?P<message>.+)$"
+)
+# Prefer import/root failures over wrapper process errors when ranking excerpts.
+_PYTHON_ROOT_CODES = frozenset(
+    {
+        "ModuleNotFoundError",
+        "ImportError",
+        "SyntaxError",
+        "IndentationError",
+        "AttributeError",
+        "NameError",
+        "PydanticSchemaGenerationError",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,14 +74,59 @@ def normalize_check_output(output: str) -> str:
     return re.sub(r"(?<=\b127\.0\.0\.1:)\d+", "#", text)
 
 
+def _workspace_relative_path(path: str) -> str | None:
+    """Map a traceback path onto the generated workspace.
+
+    The check container roots the workspace at ``/tmp/app``. A generic ``/app/``
+    marker matches that root first and would report ``app/backend/...`` instead
+    of ``backend/...``. Prefer a path that already starts at ``backend/`` or
+    ``frontend/``.
+    """
+
+    normalized = path.replace("\\", "/")
+    candidates: list[str] = []
+    for root in ("/tmp/app/", "/workspace/"):
+        index = normalized.find(root)
+        if index >= 0:
+            relative = normalized[index + len(root) :]
+            if relative:
+                candidates.append(relative)
+    for marker in ("/backend/", "/frontend/", "/app/"):
+        index = normalized.find(marker)
+        if index >= 0:
+            relative = normalized[index + 1 :]
+            if relative.startswith("workspace/"):
+                relative = relative[len("workspace/") :]
+            if relative:
+                candidates.append(relative)
+    for relative in candidates:
+        if relative.startswith(("backend/", "frontend/")):
+            return relative
+    if normalized.startswith(("backend/", "frontend/")):
+        return normalized
+    return candidates[0] if candidates else None
+
+
 def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
     diagnostics: list[CheckDiagnostic] = []
+    last_file: str | None = None
+    last_line: int | None = None
     for raw_line in output.splitlines():
         line = raw_line.strip()
         if not line:
             continue
+        file_match = _TRACEBACK_FILE.match(raw_line)
+        if file_match:
+            # Keep the last generated-workspace frame. Library frames after it
+            # (pydantic, uvicorn) are not files the repair planner can edit.
+            relative = _workspace_relative_path(file_match.group("path"))
+            if relative is not None:
+                last_file = relative
+                last_line = int(file_match.group("line"))
+            continue
         browser_match = _BROWSER_ERROR.match(line)
         match = _TYPESCRIPT_ERROR.match(line)
+        python_match = _PYTHON_EXCEPTION.match(line)
         if browser_match:
             diagnostics.append(
                 CheckDiagnostic(
@@ -86,26 +151,53 @@ def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
                     raw=line,
                 )
             )
-        elif "SyntaxError:" in line:
-            diagnostics.append(CheckDiagnostic(kind="python", message=line, raw=line))
+        elif python_match:
+            code = python_match.group("code")
+            kind: Literal["python", "runtime", "test"] = (
+                "runtime" if code in {"RuntimeError", "CalledProcessError"} else "python"
+            )
+            if code == "CalledProcessError" and "FAILED:" in output:
+                # Keep FAILED: lines as the test identity; process wrapper is noise.
+                kind = "runtime"
+            diagnostics.append(
+                CheckDiagnostic(
+                    kind=kind,
+                    path=last_file if kind == "python" else None,
+                    line=last_line if kind == "python" else None,
+                    code=code,
+                    message=python_match.group("message"),
+                    raw=line,
+                )
+            )
         elif "FAILED:" in line:
             diagnostics.append(CheckDiagnostic(kind="test", message=line, raw=line))
-        elif "CalledProcessError:" in line or "RuntimeError:" in line:
-            diagnostics.append(CheckDiagnostic(kind="runtime", message=line, raw=line))
     return tuple(diagnostics)
 
 
 def check_output_excerpt(output: str, *, summary: str = "") -> str:
-    """Prefer actionable compiler/test diagnostics over traceback noise."""
+    """Prefer actionable compiler/import diagnostics over traceback noise."""
 
     text = output.strip()
     if not text:
         return summary or "检查失败"
     diagnostics = extract_check_diagnostics(text)
     if diagnostics:
-        primary = [item.raw for item in diagnostics if item.kind != "runtime"][-2:]
-        terminal = [item.raw for item in diagnostics if item.kind == "runtime"][-1:]
-        actionable = "\n".join([*primary, *terminal])
+        root_python = [
+            item.raw
+            for item in diagnostics
+            if item.kind == "python" and item.code in _PYTHON_ROOT_CODES
+        ]
+        primary = [
+            item.raw
+            for item in diagnostics
+            if item.kind in {"typescript", "browser", "test", "python"}
+            and item.code not in _PYTHON_ROOT_CODES
+        ][-2:]
+        # Surface import/module roots first so repair planners see the real cause.
+        actionable = "\n".join([*root_python[-2:], *primary])
+        if not actionable.strip():
+            terminal = [item.raw for item in diagnostics if item.kind == "runtime"][-1:]
+            actionable = "\n".join(terminal)
         return actionable[-MAX_CHECK_EXCERPT_CHARS:]
     if len(text) <= MAX_CHECK_EXCERPT_CHARS:
         return text

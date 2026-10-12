@@ -7,6 +7,9 @@ export type PreviewStatus = {
   url: string | null
   run_id: string | null
   message: string | null
+  verified: boolean
+  source_hash: string | null
+  revision: number | null
 }
 
 export type PreviewTheme = {

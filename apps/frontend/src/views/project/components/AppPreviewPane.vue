@@ -1,12 +1,26 @@
 <template>
   <section class="app-viewer" aria-label="App 预览">
     <header class="viewer-toolbar">
-      <strong>App 预览</strong>
+      <div class="preview-heading">
+        <strong>App 预览</strong>
+        <span
+          v-if="preview?.status === 'ready'"
+          :class="['preview-trust', { verified: preview.verified }]"
+        >
+          {{
+            preview.verified
+              ? '已验收'
+              : preview.revision
+                ? `构建中 · R${preview.revision}`
+                : '构建中 · 模板'
+          }}
+        </span>
+      </div>
       <button
         type="button"
         class="design-toggle"
         :class="{ active: designOpen }"
-        :disabled="preview?.status !== 'ready' || designLoading"
+        :disabled="preview?.status !== 'ready' || !preview.verified || designLoading"
         title="打开 Design"
         @click="toggleDesign"
       >
@@ -154,13 +168,13 @@
                 本地预览未启用。可在后端配置 PREVIEW_ENABLED=true。
               </p>
               <p v-else-if="status?.state === 'completed'" class="preview-note verified">
-                独立验收已通过。点击下方按钮启动本机预览。
+                独立验收已通过，正在准备准确代码版本的预览。
               </p>
-              <p v-else-if="status?.code_ready" class="preview-note">
-                源码已经生成，可在顶部“编辑器”中查看；正在进行独立验收和隔离运行验证。
+              <p v-else-if="canPreview" class="preview-note">
+                工作区已经就绪，正在启动构建中预览；该版本尚未通过独立验收。
               </p>
               <button
-                v-if="status?.state === 'completed' && preview?.status !== 'starting'"
+                v-if="canPreview && preview?.status !== 'starting'"
                 type="button"
                 class="preview-start"
                 :disabled="previewBusy"
@@ -335,6 +349,9 @@ const previewDescription = computed(() => {
   if (props.canApprove) return '在左侧确认功能清单，批准后开始生成应用。'
   return '描述你的想法，确认核心功能，应用生成后将在这里预览。'
 })
+const canPreview = computed(
+  () => postApproval.value && Boolean(props.status?.run_id && props.status?.workspace_ready),
+)
 const consoleRows = computed(() => {
   const rows = (props.status?.activities ?? []).map((activity) => ({
     id: activity.id,
@@ -559,6 +576,9 @@ async function refreshPreview() {
         url: null,
         run_id: null,
         message: err instanceof Error ? err.message : '读取预览状态失败',
+        verified: false,
+        source_hash: null,
+        revision: null,
       }
     }
     return
@@ -572,7 +592,7 @@ async function refreshPreview() {
 }
 
 async function ensurePreview(force = false) {
-  if (disposed || props.status?.state !== 'completed') return
+  if (disposed || !canPreview.value || previewBusy.value) return
   if (!force && (preview.value?.status === 'ready' || preview.value?.status === 'starting')) {
     if (['starting', 'ready'].includes(preview.value.status)) schedulePoll()
     return
@@ -589,6 +609,9 @@ async function ensurePreview(force = false) {
       url: null,
       run_id: null,
       message: err instanceof Error ? err.message : '启动预览失败',
+      verified: false,
+      source_hash: null,
+      revision: null,
     }
   } finally {
     previewBusy.value = false
@@ -602,19 +625,20 @@ function openExternal() {
 
 async function reload() {
   emit('refresh')
-  if (props.status?.state === 'completed') {
-    if (preview.value?.status === 'ready') {
-      iframeKey.value += 1
-      await refreshPreview()
-    } else {
-      await ensurePreview(true)
-    }
-  }
+  if (canPreview.value) await ensurePreview(true)
 }
 
 watch(
-  () => [props.projectId, props.status?.run_id, props.status?.state] as const,
-  ([projectId, runId, state]) => {
+  () =>
+    [
+      props.projectId,
+      props.status?.run_id,
+      props.status?.state,
+      props.status?.workspace_ready,
+      props.status?.code_ready,
+      props.status?.preview_revision ?? 0,
+    ] as const,
+  ([projectId, runId, state, workspaceReady, _codeReady, revision], previous) => {
     const identity = `${projectId}:${runId ?? ''}`
     if (activePreviewIdentity !== identity) {
       activePreviewIdentity = identity
@@ -630,8 +654,11 @@ watch(
       previewConsoleRows.value = []
       currentPath.value = '/'
     }
-    if (state === 'completed') void ensurePreview(false)
-    else {
+    if (workspaceReady && postApproval.value) {
+      const revisionChanged = revision !== (previous?.[5] ?? revision)
+      const stateChanged = state !== previous?.[2]
+      void ensurePreview(revisionChanged || stateChanged || state === 'completed')
+    } else {
       clearPoll()
       preview.value = null
       designOpen.value = false
@@ -708,6 +735,27 @@ onBeforeUnmount(() => {
   button:disabled {
     cursor: not-allowed;
     opacity: 0.38;
+  }
+}
+.preview-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+  > strong {
+    color: #27272a;
+  }
+}
+.preview-trust {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #fff3cd;
+  color: #8a6d3b;
+  font-size: 10px;
+  font-weight: 600;
+  &.verified {
+    background: #e7f6eb;
+    color: #417a50;
   }
 }
 .design-toggle {

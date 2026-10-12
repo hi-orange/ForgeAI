@@ -11,6 +11,7 @@ from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.services.engineering import mark_engineering_inactive
 from app.services.task_execution import lock_run
+from app.services.workflow_jobs import cancel_jobs_for_run
 
 
 def cancel_active_run(
@@ -86,6 +87,7 @@ def cancel_active_run(
     run.status = BuildRunStatus.CANCELLED.value
     run.active_slot = None
     run.error = reason
+    cancel_jobs_for_run(db, run_id)
     db.commit()
     db.refresh(run)
     for execution_id in execution_ids:

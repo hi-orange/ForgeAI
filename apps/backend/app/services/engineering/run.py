@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Any
 
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
-from app.core.exceptions import ConflictException
 from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.user import User
@@ -18,19 +16,29 @@ from app.services.task_execution import latest_execution, renew_execution_lease,
 
 logger = logging.getLogger("forgeai")
 
-_active_executions: set[str] = set()
-_active_lock = threading.Lock()
-
 
 def is_engineering_active(execution_id: str) -> bool:
-    with _active_lock:
-        return execution_id in _active_executions
+    """Compatibility query backed by the durable job table."""
+
+    from sqlalchemy import select
+
+    from app.db.database import SessionLocal
+    from app.models.workflow_job import WorkflowJob
+
+    with SessionLocal() as db:
+        return (
+            db.scalar(
+                select(WorkflowJob.job_id).where(
+                    WorkflowJob.execution_id == execution_id,
+                    WorkflowJob.status.in_(("queued", "running", "retry_wait")),
+                )
+            )
+            is not None
+        )
 
 
 def mark_engineering_inactive(execution_id: str) -> None:
-    """Drop the in-process active marker so pause/resume can reclaim the slot."""
-    with _active_lock:
-        _active_executions.discard(execution_id)
+    """Compatibility no-op; execution fencing and job cancellation are durable."""
 
 
 def _record_loop_failure(
@@ -94,6 +102,7 @@ def _run_and_publish(
     execution_id: str,
     *,
     session_factory: Any | None = None,
+    enqueue_quality: bool = True,
 ) -> dict:
     # Lazy import: orchestration.code_engineer imports engineering.claim, and
     # engineering.__init__ imports this module — avoid a circular import at load time.
@@ -131,30 +140,31 @@ def _run_and_publish(
         code_item.item_id,
     )
     result.update(code_item_id=code_item.item_id, quality_task_id=quality_task.task_id)
-    # Approval starts one SOP that runs through verification. Previously the worker
-    # stopped after merely creating the QA task, leaving every successful code build
-    # stranded in quality_pending until another HTTP request happened to continue it.
-    from app.orchestration.test_engineer import run_test_engineer_task
+    if enqueue_quality:
+        from app.services.security_gate import enqueue_security_gate
+        from app.services.workflow_jobs import enqueue_job
 
-    try:
-        report_item = run_test_engineer_task(
+        enqueue_job(
             db,
-            user,
-            project_id,
-            run_id,
-            quality_task.task_id,
+            job_type="quality",
+            idempotency_key=f"quality:{quality_task.task_id}",
+            project_id=project_id,
+            build_run_id=run_id,
+            task_id=quality_task.task_id,
+            payload={
+                "user_id": user.id,
+                "project_id": project_id,
+                "run_id": run_id,
+                "task_id": quality_task.task_id,
+            },
         )
-    except Exception as exc:
-        # Code is already published. Test Engineer records quality_error and fails its
-        # own execution; do not rewrite that as a Code Engineer loop crash.
-        logger.warning(
-            "quality verification failed after code generation run_id=%s error=%s",
-            run_id,
-            exc,
+        enqueue_security_gate(
+            db,
+            user_id=user.id,
+            project_id=project_id,
+            run_id=run_id,
+            code_item_id=code_item.item_id,
         )
-        result["quality_error"] = str(exc) or "Test Engineer 执行失败"
-        return result
-    result["test_report_item_id"] = report_item.item_id
     return result
 
 
@@ -168,7 +178,7 @@ def start_claimed_engineering(
     *,
     wait: bool = False,
 ) -> dict:
-    """Run the coding loop. Default is a background thread so the chat can poll tool steps."""
+    """Run immediately for tests, otherwise enqueue one durable engineering job."""
     if wait:
         return _run_and_publish(
             db,
@@ -178,53 +188,27 @@ def start_claimed_engineering(
             task.task_id,
             execution.execution_id,
         )
-    if db.new or db.dirty or db.deleted:
-        db.commit()
-    bind = db.get_bind()
-    user_id = user.id
-    task_id = task.task_id
-    execution_id = execution.execution_id
+    from app.services.workflow_jobs import enqueue_job
 
-    with _active_lock:
-        if execution_id in _active_executions:
-            return {"started": False, "execution_id": execution_id, "already_running": True}
-        _active_executions.add(execution_id)
-
-    def worker() -> None:
-        factory = sessionmaker(
-            bind=bind,
-            autocommit=False,
-            autoflush=False,
-            expire_on_commit=False,
-        )
-        try:
-            with factory() as session:
-                owner = session.get(User, user_id)
-                if owner is None:
-                    _record_loop_failure(factory, task_id, execution_id, "工程执行用户不存在")
-                    return
-                _run_and_publish(
-                    session,
-                    owner,
-                    project_id,
-                    run_id,
-                    task_id,
-                    execution_id,
-                    session_factory=factory,
-                )
-        except ConflictException as exc:
-            # Soft pause / fencing: the user can resume; do not treat as a loop crash.
-            logger.info(
-                "engineering loop stopped execution_id=%s reason=%s",
-                execution_id,
-                exc,
-            )
-        except Exception as exc:
-            logger.exception("engineering loop failed execution_id=%s", execution_id)
-            _record_loop_failure(factory, task_id, execution_id, str(exc) or "工程循环失败")
-        finally:
-            with _active_lock:
-                _active_executions.discard(execution_id)
-
-    threading.Thread(target=worker, daemon=True, name=f"forgeai-eng-{execution_id[:12]}").start()
-    return {"started": True, "execution_id": execution_id}
+    job = enqueue_job(
+        db,
+        job_type="engineering",
+        idempotency_key=f"engineering:{execution.execution_id}",
+        project_id=project_id,
+        build_run_id=run_id,
+        task_id=task.task_id,
+        execution_id=execution.execution_id,
+        payload={
+            "user_id": user.id,
+            "project_id": project_id,
+            "run_id": run_id,
+            "task_id": task.task_id,
+            "execution_id": execution.execution_id,
+        },
+    )
+    return {
+        "started": job.status in {"queued", "running", "retry_wait"},
+        "execution_id": execution.execution_id,
+        "job_id": job.job_id,
+        "already_running": job.attempt > 0 or job.status == "running",
+    }

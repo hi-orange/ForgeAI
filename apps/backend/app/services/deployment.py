@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import os
 import secrets
-import shutil
 import socket
 import subprocess
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -21,12 +19,14 @@ from app.db.database import SessionLocal
 from app.generation.template_registry import get_template_root
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.deployment import Deployment
+from app.models.project import Project
 from app.models.user import User
+from app.runtime.docker import get_docker_sandbox_runtime
 from app.services import project as project_service
 from app.services.requirements import get_requirements_status
+from app.services.source_artifact import ensure_code_workspace
 
 _MAX_LOG_CHARS = 20_000
-_start_lock = threading.Lock()
 _TRUSTED_DEPLOYMENT_FILES = (
     "compose.yml",
     "backend/Dockerfile",
@@ -56,13 +56,7 @@ def _allocate_port() -> int:
 
 
 def _docker_binary() -> str:
-    binary = shutil.which("docker")
-    if binary is None:
-        raise BusinessException("发布环境未安装 Docker")
-    probe = subprocess.run([binary, "info"], capture_output=True, timeout=15, check=False)
-    if probe.returncode != 0:
-        raise BusinessException("Docker 守护进程不可用")
-    return binary
+    return get_docker_sandbox_runtime().require_daemon(purpose="发布")
 
 
 def _assert_trusted_deployment_files(workspace: Path) -> None:
@@ -116,23 +110,13 @@ def _run_compose(
         settings.runtime_data_root, deployment.project_id, deployment.build_run_id
     )
     binary = _docker_binary()
-    return subprocess.run(
-        [
-            binary,
-            "compose",
-            "--env-file",
-            str(_env_path(deployment.deployment_id)),
-            "-p",
-            deployment.compose_project,
-            *arguments,
-        ],
-        cwd=workspace,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    return get_docker_sandbox_runtime().compose(
+        binary,
+        workspace=workspace,
+        env_file=_env_path(deployment.deployment_id),
+        project=deployment.compose_project,
+        arguments=arguments,
         timeout=timeout or settings.deployment_build_timeout_seconds,
-        check=False,
     )
 
 
@@ -145,6 +129,10 @@ def _deploy_worker(deployment_id: str) -> None:
         deployment = db.get(Deployment, deployment_id)
         if deployment is None:
             return
+        if deployment.status == "ready":
+            return
+        if deployment.status in {"cancelled", "stopped"}:
+            raise ConflictException("发布任务已终止")
         deployment.status = "building"
         db.commit()
         try:
@@ -162,6 +150,17 @@ def _deploy_worker(deployment_id: str) -> None:
             deployment.deployed_at = datetime.now(UTC).replace(tzinfo=None)
             deployment.error = None
             db.commit()
+            if deployment.previous_deployment_id:
+                previous = db.get(Deployment, deployment.previous_deployment_id)
+                if previous is not None and previous.status == "ready":
+                    stopped = _run_compose(previous, "stop", timeout=60)
+                    if stopped.returncode == 0:
+                        previous.status = "stopped"
+                    else:
+                        warning = _bounded_logs(stopped) or "停止上一发布版本失败"
+                        cutover_logs = deployment.logs + f"\n\n[cutover warning]\n{warning}"
+                        deployment.logs = cutover_logs[-_MAX_LOG_CHARS:]
+                    db.commit()
         except Exception as exc:  # noqa: BLE001 - persisted worker boundary
             db.rollback()
             deployment = db.get(Deployment, deployment_id)
@@ -176,58 +175,81 @@ def start_deployment(db: Session, user: User, project_id: int) -> Deployment:
     if not settings.deployment_enabled:
         raise BusinessException("发布能力未启用")
     status = get_requirements_status(db, user, project_id)
-    if status.state != "completed" or status.run_id is None:
+    if status.state != "completed" or status.run_id is None or status.code_item_id is None:
         raise BusinessException("只有独立验收通过的版本才能发布")
+    from app.services.security_gate import require_security_pass
+
+    require_security_pass(
+        db,
+        project_id=project_id,
+        run_id=status.run_id,
+        code_item_id=status.code_item_id,
+    )
+    _, restored = ensure_code_workspace(
+        db,
+        project_id=project_id,
+        run_id=status.run_id,
+        code_item_id=status.code_item_id,
+    )
+    if restored:
+        db.commit()
     if not workspace_is_ready(project_id, status.run_id):
         raise BusinessException("发布工作区不存在")
     workspace = default_workspace_path(settings.runtime_data_root, project_id, status.run_id)
     _assert_trusted_deployment_files(workspace)
     _docker_binary()
-    with _start_lock:
-        active = db.scalar(
-            select(Deployment)
-            .where(
-                Deployment.project_id == project_id,
-                Deployment.status.in_(("queued", "building", "ready")),
+    db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    active = db.scalar(
+        select(Deployment)
+        .where(
+            Deployment.project_id == project_id,
+            Deployment.status.in_(("queued", "building", "ready")),
+        )
+        .order_by(Deployment.revision.desc())
+        .limit(1)
+    )
+    if active is not None and active.build_run_id == status.run_id:
+        return active
+    revision = (
+        int(
+            db.scalar(
+                select(func.max(Deployment.revision)).where(Deployment.project_id == project_id)
             )
-            .order_by(Deployment.revision.desc())
-            .limit(1)
+            or 0
         )
-        if active is not None and active.build_run_id == status.run_id:
-            return active
-        revision = (
-            int(
-                db.scalar(
-                    select(func.max(Deployment.revision)).where(Deployment.project_id == project_id)
-                )
-                or 0
-            )
-            + 1
-        )
-        deployment_id = f"dep_{uuid4().hex}"
-        deployment = Deployment(
-            deployment_id=deployment_id,
-            project_id=project_id,
-            build_run_id=status.run_id,
-            revision=revision,
-            provider="local_docker",
-            status="queued",
-            compose_project=f"forgeai-{project_id}-{deployment_id[-8:]}",
-            port=_allocate_port(),
-            previous_deployment_id=active.deployment_id if active else None,
-            secret_reference=f"local-file:{deployment_id}",
-        )
-        db.add(deployment)
-        db.commit()
-        db.refresh(deployment)
-        _write_secret_env(deployment)
-        threading.Thread(
-            target=_deploy_worker,
-            args=(deployment.deployment_id,),
-            name=f"forgeai-deploy-{deployment.deployment_id[-8:]}",
-            daemon=True,
-        ).start()
-        return deployment
+        + 1
+    )
+    deployment_id = f"dep_{uuid4().hex}"
+    deployment = Deployment(
+        deployment_id=deployment_id,
+        project_id=project_id,
+        build_run_id=status.run_id,
+        revision=revision,
+        provider="local_docker",
+        status="queued",
+        compose_project=f"forgeai-{project_id}-{deployment_id[-8:]}",
+        port=_allocate_port(),
+        previous_deployment_id=active.deployment_id if active else None,
+        secret_reference=f"local-file:{deployment_id}",
+    )
+    db.add(deployment)
+    db.flush()
+    _write_secret_env(deployment)
+    from app.services.workflow_jobs import enqueue_job
+
+    enqueue_job(
+        db,
+        job_type="deployment",
+        idempotency_key=f"deployment:{deployment.deployment_id}",
+        project_id=project_id,
+        build_run_id=status.run_id,
+        deployment_id=deployment.deployment_id,
+        payload={"deployment_id": deployment.deployment_id},
+        commit=False,
+    )
+    db.commit()
+    db.refresh(deployment)
+    return deployment
 
 
 def list_deployments(db: Session, user: User, project_id: int) -> list[Deployment]:

@@ -1,26 +1,26 @@
-import playwright from "/opt/visual/node_modules/playwright-core/index.js";
-import fs from "node:fs/promises";
+import playwright from '/opt/visual/node_modules/playwright-core/index.js'
+import fs from 'node:fs/promises'
 
-const { chromium } = playwright;
+const { chromium } = playwright
 
-const [url, outputDirectory] = process.argv.slice(2);
+const [url, outputDirectory] = process.argv.slice(2)
 if (!url || !outputDirectory) {
-  throw new Error("capture.mjs requires a URL and output directory");
+  throw new Error('capture.mjs requires a URL and output directory')
 }
 
 const viewports = [
-  { name: "desktop", width: 1440, height: 900, isMobile: false, hasTouch: false },
-  { name: "mobile", width: 390, height: 844, isMobile: true, hasTouch: true },
-];
+  { name: 'desktop', width: 1440, height: 900, isMobile: false, hasTouch: false },
+  { name: 'mobile', width: 390, height: 844, isMobile: true, hasTouch: true },
+]
 
-await fs.mkdir(outputDirectory, { recursive: true });
+await fs.mkdir(outputDirectory, { recursive: true })
 const browser = await chromium.launch({
-  executablePath: "/usr/bin/chromium",
+  executablePath: '/usr/bin/chromium',
   headless: true,
-  args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-});
+  args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+})
 
-const results = [];
+const results = []
 try {
   for (const viewport of viewports) {
     const context = await browser.newContext({
@@ -29,47 +29,46 @@ try {
       isMobile: viewport.isMobile,
       hasTouch: viewport.hasTouch,
       deviceScaleFactor: 1,
-      locale: "zh-CN",
-    });
-    const page = await context.newPage();
-    page.setDefaultTimeout(15000);
-    page.setDefaultNavigationTimeout(30000);
-    const consoleErrors = [];
-    const pageErrors = [];
-    page.on("console", (message) => {
-      const text = message.text();
-      const locationUrl = message.location().url;
-      let isMissingFavicon = false;
+      locale: 'zh-CN',
+    })
+    const page = await context.newPage()
+    page.setDefaultTimeout(15000)
+    page.setDefaultNavigationTimeout(30000)
+    const consoleErrors = []
+    const pageErrors = []
+    page.on('console', (message) => {
+      const text = message.text()
+      const locationUrl = message.location().url
+      let isMissingFavicon = false
       try {
-        isMissingFavicon =
-          text.includes("404") && new URL(locationUrl).pathname === "/favicon.ico";
+        isMissingFavicon = text.includes('404') && new URL(locationUrl).pathname === '/favicon.ico'
       } catch {
         // Keep malformed or absent console locations visible as real evidence.
       }
-      if (message.type() === "error" && !isMissingFavicon && consoleErrors.length < 20) {
-        consoleErrors.push(text.slice(0, 500));
+      if (message.type() === 'error' && !isMissingFavicon && consoleErrors.length < 20) {
+        consoleErrors.push(text.slice(0, 500))
       }
-    });
-    page.on("pageerror", (error) => {
-      if (pageErrors.length < 20) pageErrors.push(String(error).slice(0, 500));
-    });
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    })
+    page.on('pageerror', (error) => {
+      if (pageErrors.length < 20) pageErrors.push(String(error).slice(0, 500))
+    })
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
     await page.evaluate(async () => {
-      if (!document.fonts) return;
+      if (!document.fonts) return
       await Promise.race([
         document.fonts.ready,
         new Promise((resolve) => window.setTimeout(resolve, 3000)),
-      ]);
-    });
+      ])
+    })
     const horizontalOverflow = await page.evaluate(
       () => document.documentElement.scrollWidth > window.innerWidth + 1,
-    );
+    )
     await page.screenshot({
       path: `${outputDirectory}/${viewport.name}.png`,
       fullPage: false,
-      animations: "disabled",
-    });
+      animations: 'disabled',
+    })
     results.push({
       name: viewport.name,
       width: viewport.width,
@@ -77,15 +76,15 @@ try {
       horizontal_overflow: horizontalOverflow,
       console_errors: consoleErrors,
       page_errors: pageErrors,
-    });
-    await context.close();
+    })
+    await context.close()
   }
 } finally {
-  await browser.close();
+  await browser.close()
 }
 
 await fs.writeFile(
   `${outputDirectory}/manifest.json`,
-  JSON.stringify({ browser: "chromium", url, viewports: results }, null, 2),
-  "utf8",
-);
+  JSON.stringify({ browser: 'chromium', url, viewports: results }, null, 2),
+  'utf8',
+)

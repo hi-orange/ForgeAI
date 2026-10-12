@@ -6,6 +6,7 @@ Create Date: 2026-10-10 10:00:00.000000
 """
 
 from collections.abc import Sequence
+from typing import Any
 
 import sqlalchemy as sa
 
@@ -17,37 +18,72 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+def _has_table(table_name: str) -> bool:
+    return sa.inspect(op.get_bind()).has_table(table_name)
+
+
+def _create_table_if_missing(table_name: str, *elements: Any) -> None:
+    """Recover safely after partially applied MySQL DDL.
+
+    MySQL commits each DDL statement independently. A later failure therefore leaves
+    complete tables behind even though Alembic cannot advance its version row.
+    """
+
+    if not _has_table(table_name):
+        op.create_table(table_name, *elements)
+
+
+def _create_index_if_missing(index_name: str, table_name: str, columns: list[str]) -> None:
+    if not _has_table(table_name):
+        return
+    indexes = {item["name"] for item in sa.inspect(op.get_bind()).get_indexes(table_name)}
+    if index_name not in indexes:
+        op.create_index(index_name, table_name, columns)
+
+
+def _replace_check_constraint(table_name: str, name: str, condition: str) -> None:
+    checks = {
+        item["name"]
+        for item in sa.inspect(op.get_bind()).get_check_constraints(table_name)
+        if item.get("name")
+    }
+    if name in checks:
+        op.drop_constraint(name, table_name, type_="check")
+    op.create_check_constraint(name, table_name, condition)
+
+
+def _drop_table_if_exists(table_name: str) -> None:
+    if _has_table(table_name):
+        op.drop_table(table_name)
+
+
 def upgrade() -> None:
-    op.drop_constraint("ck_build_run_status", "build_run", type_="check")
-    op.drop_constraint("ck_build_run_stage_by_status", "build_run", type_="check")
-    op.drop_constraint("ck_build_run_active_slot", "build_run", type_="check")
-    op.create_check_constraint(
-        "ck_build_run_status",
+    _replace_check_constraint(
         "build_run",
+        "ck_build_run_status",
         "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
     )
-    op.create_check_constraint(
-        "ck_build_run_stage_by_status",
+    _replace_check_constraint(
         "build_run",
+        "ck_build_run_stage_by_status",
         "((status = 'queued' AND stage IS NULL) OR "
         "(status = 'running' AND stage IS NOT NULL) OR "
         "status IN ('succeeded', 'failed', 'cancelled'))",
     )
-    op.create_check_constraint(
-        "ck_build_run_active_slot",
+    _replace_check_constraint(
         "build_run",
+        "ck_build_run_active_slot",
         "((status IN ('queued', 'running') AND active_slot = 1) OR "
         "(status IN ('succeeded', 'failed', 'cancelled') AND active_slot IS NULL))",
     )
-    op.drop_constraint("ck_task_execution_status", "task_execution", type_="check")
-    op.create_check_constraint(
-        "ck_task_execution_status",
+    _replace_check_constraint(
         "task_execution",
+        "ck_task_execution_status",
         "(status = 'running' AND active_slot = 1) OR "
         "(status IN ('failed', 'succeeded', 'superseded', 'cancelled') AND active_slot IS NULL)",
     )
 
-    op.create_table(
+    _create_table_if_missing(
         "run_revision",
         sa.Column("revision_id", sa.String(40), primary_key=True),
         sa.Column("project_id", sa.Integer(), nullable=False),
@@ -74,9 +110,9 @@ def upgrade() -> None:
         sa.UniqueConstraint("target_run_id", name="uq_run_revision_target_run"),
         sa.UniqueConstraint("cause_message_id", name="uq_run_revision_cause_message"),
     )
-    op.create_index("ix_run_revision_project_id", "run_revision", ["project_id"])
+    _create_index_if_missing("ix_run_revision_project_id", "run_revision", ["project_id"])
 
-    op.create_table(
+    _create_table_if_missing(
         "agent_decision_event",
         sa.Column("event_id", sa.String(40), primary_key=True),
         sa.Column("decision_key", sa.String(200), nullable=False, unique=True),
@@ -107,13 +143,17 @@ def upgrade() -> None:
             ["report_item_id"], ["configuration_item.item_id"], ondelete="SET NULL"
         ),
     )
-    op.create_index("ix_agent_decision_event_project_id", "agent_decision_event", ["project_id"])
-    op.create_index(
+    _create_index_if_missing(
+        "ix_agent_decision_event_project_id", "agent_decision_event", ["project_id"]
+    )
+    _create_index_if_missing(
         "ix_agent_decision_event_build_run_id", "agent_decision_event", ["build_run_id"]
     )
-    op.create_index("ix_agent_decision_event_message_id", "agent_decision_event", ["message_id"])
+    _create_index_if_missing(
+        "ix_agent_decision_event_message_id", "agent_decision_event", ["message_id"]
+    )
 
-    op.create_table(
+    _create_table_if_missing(
         "agent_usage_event",
         sa.Column("event_id", sa.String(40), primary_key=True),
         sa.Column("project_id", sa.Integer(), nullable=False),
@@ -136,11 +176,13 @@ def upgrade() -> None:
             ["execution_id"], ["task_execution.execution_id"], ondelete="SET NULL"
         ),
     )
-    op.create_index("ix_agent_usage_event_project_id", "agent_usage_event", ["project_id"])
-    op.create_index("ix_agent_usage_event_build_run_id", "agent_usage_event", ["build_run_id"])
-    op.create_index("ix_agent_usage_event_task_id", "agent_usage_event", ["task_id"])
+    _create_index_if_missing("ix_agent_usage_event_project_id", "agent_usage_event", ["project_id"])
+    _create_index_if_missing(
+        "ix_agent_usage_event_build_run_id", "agent_usage_event", ["build_run_id"]
+    )
+    _create_index_if_missing("ix_agent_usage_event_task_id", "agent_usage_event", ["task_id"])
 
-    op.create_table(
+    _create_table_if_missing(
         "agent_eval_label",
         sa.Column("label_id", sa.String(40), primary_key=True),
         sa.Column("project_id", sa.Integer(), nullable=False),
@@ -154,36 +196,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["labeled_by_user_id"], ["user.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("message_id", name="uq_agent_eval_label_message"),
     )
-    op.create_index("ix_agent_eval_label_project_id", "agent_eval_label", ["project_id"])
+    _create_index_if_missing("ix_agent_eval_label_project_id", "agent_eval_label", ["project_id"])
 
-    op.create_table(
-        "agent_usage_event",
-        sa.Column("event_id", sa.String(40), primary_key=True),
-        sa.Column("project_id", sa.Integer(), nullable=False),
-        sa.Column("build_run_id", sa.String(40)),
-        sa.Column("task_id", sa.String(40)),
-        sa.Column("execution_id", sa.String(40)),
-        sa.Column("role", sa.String(32), nullable=False),
-        sa.Column("model", sa.String(100)),
-        sa.Column("protocol", sa.String(16), nullable=False),
-        sa.Column("prompt_tokens", sa.Integer()),
-        sa.Column("completion_tokens", sa.Integer()),
-        sa.Column("total_tokens", sa.Integer()),
-        sa.Column("duration_ms", sa.Integer(), nullable=False),
-        sa.Column("estimated_cost_microusd", sa.Integer()),
-        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
-        sa.ForeignKeyConstraint(["project_id"], ["project.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["build_run_id"], ["build_run.run_id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["task_id"], ["task.task_id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(
-            ["execution_id"], ["task_execution.execution_id"], ondelete="SET NULL"
-        ),
-    )
-    op.create_index("ix_agent_usage_event_project_id", "agent_usage_event", ["project_id"])
-    op.create_index("ix_agent_usage_event_build_run_id", "agent_usage_event", ["build_run_id"])
-    op.create_index("ix_agent_usage_event_task_id", "agent_usage_event", ["task_id"])
-
-    op.create_table(
+    _create_table_if_missing(
         "deployment",
         sa.Column("deployment_id", sa.String(40), primary_key=True),
         sa.Column("project_id", sa.Integer(), nullable=False),
@@ -214,38 +229,35 @@ def upgrade() -> None:
             ["previous_deployment_id"], ["deployment.deployment_id"], ondelete="SET NULL"
         ),
     )
-    op.create_index("ix_deployment_project_id", "deployment", ["project_id"])
+    _create_index_if_missing("ix_deployment_project_id", "deployment", ["project_id"])
 
 
 def downgrade() -> None:
-    op.drop_table("deployment")
-    op.drop_table("agent_eval_label")
-    op.drop_table("agent_usage_event")
-    op.drop_table("agent_usage_event")
-    op.drop_table("agent_decision_event")
-    op.drop_table("run_revision")
-    op.drop_constraint("ck_task_execution_status", "task_execution", type_="check")
-    op.create_check_constraint(
-        "ck_task_execution_status",
+    _drop_table_if_exists("deployment")
+    _drop_table_if_exists("agent_eval_label")
+    _drop_table_if_exists("agent_usage_event")
+    _drop_table_if_exists("agent_decision_event")
+    _drop_table_if_exists("run_revision")
+    _replace_check_constraint(
         "task_execution",
+        "ck_task_execution_status",
         "(status = 'running' AND active_slot = 1) OR "
         "(status IN ('failed', 'succeeded', 'superseded') AND active_slot IS NULL)",
     )
-    op.drop_constraint("ck_build_run_status", "build_run", type_="check")
-    op.drop_constraint("ck_build_run_stage_by_status", "build_run", type_="check")
-    op.drop_constraint("ck_build_run_active_slot", "build_run", type_="check")
-    op.create_check_constraint(
-        "ck_build_run_status", "build_run", "status IN ('queued', 'running', 'succeeded', 'failed')"
-    )
-    op.create_check_constraint(
-        "ck_build_run_stage_by_status",
+    _replace_check_constraint(
         "build_run",
+        "ck_build_run_status",
+        "status IN ('queued', 'running', 'succeeded', 'failed')",
+    )
+    _replace_check_constraint(
+        "build_run",
+        "ck_build_run_stage_by_status",
         "((status = 'queued' AND stage IS NULL) OR "
         "(status = 'running' AND stage IS NOT NULL) OR status IN ('succeeded', 'failed'))",
     )
-    op.create_check_constraint(
-        "ck_build_run_active_slot",
+    _replace_check_constraint(
         "build_run",
+        "ck_build_run_active_slot",
         "((status IN ('queued', 'running') AND active_slot = 1) OR "
         "(status IN ('succeeded', 'failed') AND active_slot IS NULL))",
     )

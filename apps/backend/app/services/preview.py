@@ -1,13 +1,9 @@
-"""Local loopback preview sessions for completed generated apps."""
+"""Local loopback preview sessions for approved generated-app workspaces."""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import os
 import socket
-import subprocess
 import threading
 import time
 import urllib.error
@@ -19,29 +15,32 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
 from app.core.settings import settings
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
+from app.models.workflow_event import WorkflowEvent
+from app.runtime.preview import (
+    PreviewSandboxHandle,
+    PreviewSandboxRequest,
+    get_preview_runtime,
+)
 from app.services import project as project_service
 from app.services.preview_design import inject_design_bridge
 from app.services.requirements import get_requirements_status
+from app.services.source_artifact import (
+    ensure_code_workspace,
+    read_source_artifact_snapshot,
+)
+from app.tools.checks import source_snapshot
 
 logger = logging.getLogger("forgeai.preview")
 
 PreviewState = Literal["idle", "starting", "ready", "error", "disabled"]
 _MAX_RUNTIME_DIAGNOSTIC_CHARS = 4_000
-_FRONTEND_BUILD_MARKER_VERSION = 1
-_FRONTEND_BUILD_SKIP_DIRS = {
-    ".git",
-    ".cache",
-    ".vite",
-    "coverage",
-    "dist",
-    "node_modules",
-}
 
 
 class PreviewStatus(BaseModel):
@@ -51,6 +50,10 @@ class PreviewStatus(BaseModel):
     url: str | None = None
     run_id: str | None = None
     message: str | None = None
+    verified: bool = False
+    source_hash: str | None = None
+
+    revision: int | None = None
 
 
 @dataclass
@@ -59,16 +62,21 @@ class _PreviewSession:
     run_id: str
     workspace: Path
     status: PreviewState = "starting"
+    source_hash: str | None = None
+    revision: int | None = None
+    snapshot_bytes: bytes | None = None
     url: str | None = None
     message: str | None = None
-    backend_port: int | None = None
+    runtime_port: int | None = None
     preview_port: int | None = None
-    backend_proc: subprocess.Popen[bytes] | None = None
-    backend_log_path: Path | None = None
+    runtime_handle: PreviewSandboxHandle | None = None
+    preview_log_path: Path | None = None
     backend_error_path: str | None = None
     proxy_server: ThreadingHTTPServer | None = None
     proxy_thread: threading.Thread | None = None
     last_access: float = field(default_factory=time.monotonic)
+    verified: bool = False
+    stopped: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -170,7 +178,14 @@ def _status_from_session(session: _PreviewSession | None) -> PreviewStatus:
             status=session.status,
             url=session.url,
             run_id=session.run_id,
+            verified=session.verified,
+            source_hash=(
+                session.runtime_handle.source_hash
+                if session.runtime_handle
+                else session.source_hash
+            ),
             message=session.message,
+            revision=session.revision,
         )
 
 
@@ -189,32 +204,93 @@ def start_preview(db: Session, user: User, project_id: int) -> PreviewStatus:
         return PreviewStatus(status="disabled", message="本地预览未启用")
 
     status = get_requirements_status(db, user, project_id)
-    if status.state != "completed" or not status.run_id:
-        raise BusinessException("只有独立验收通过的构建才能启动预览")
+    if not status.run_id or not status.workspace_ready:
+        raise BusinessException("批准后的应用工作区尚未就绪，无法启动预览")
     run_id = status.run_id
+    verified = status.state == "completed"
+    if status.code_item_id:
+        _, restored = ensure_code_workspace(
+            db,
+            project_id=project_id,
+            run_id=run_id,
+            code_item_id=status.code_item_id,
+        )
+        if restored:
+            db.commit()
     if not workspace_is_ready(project_id, run_id):
         raise BusinessException("工作区尚未就绪，无法启动预览")
     workspace = default_workspace_path(settings.runtime_data_root, project_id, run_id)
     if not workspace.is_dir():
         raise BusinessException("工作区目录不存在")
 
+    snapshot_bytes: bytes | None = None
+    revision = status.preview_revision
+    if revision is not None and status.preview_source_hash is not None:
+        revision_event = db.scalar(
+            select(WorkflowEvent).where(
+                WorkflowEvent.stream_key == f"preview:{run_id}",
+                WorkflowEvent.event_type == "preview_revision_published",
+                WorkflowEvent.sequence == revision,
+            )
+        )
+        payload = revision_event.payload if revision_event is not None else None
+        artifact_id = payload.get("source_artifact_id") if isinstance(payload, dict) else None
+        event_hash = payload.get("source_hash") if isinstance(payload, dict) else None
+        if not isinstance(artifact_id, str) or event_hash != status.preview_source_hash:
+            raise BusinessException("预览 revision 身份不完整，请等待下一次快速检查")
+        snapshot_bytes = read_source_artifact_snapshot(
+            db,
+            project_id=project_id,
+            artifact_id=artifact_id,
+            source_hash=status.preview_source_hash,
+        )
+        current_source_hash = status.preview_source_hash
+    else:
+        # Before the first generated slice, expose the copied template immediately.
+        _, current_source_hash = source_snapshot(workspace)
+
     _ensure_sweeper()
     with _sessions_lock:
         existing = _sessions.get(project_id)
         if existing is not None:
             with existing.lock:
-                if existing.run_id == run_id and existing.status in {"starting", "ready"}:
+                existing_hash = (
+                    existing.runtime_handle.source_hash
+                    if existing.runtime_handle
+                    else existing.source_hash
+                )
+                if (
+                    existing.run_id == run_id
+                    and existing.status == "starting"
+                    and existing_hash == current_source_hash
+                ) or (
+                    existing.run_id == run_id
+                    and existing.status == "ready"
+                    and existing_hash == current_source_hash
+                ):
+                    existing.verified = verified
                     _touch(existing)
                     return PreviewStatus(
                         status=existing.status,
                         url=existing.url,
                         run_id=existing.run_id,
                         message=existing.message,
+                        verified=existing.verified,
+                        source_hash=existing_hash,
+                        revision=existing.revision,
                     )
             _stop_session_locked(existing)
             _sessions.pop(project_id, None)
 
-        session = _PreviewSession(project_id=project_id, run_id=run_id, workspace=workspace)
+        session = _PreviewSession(
+            project_id=project_id,
+            run_id=run_id,
+            workspace=workspace,
+            source_hash=current_source_hash,
+            revision=revision,
+            snapshot_bytes=snapshot_bytes,
+            verified=verified,
+        )
         _sessions[project_id] = session
 
     worker = threading.Thread(
@@ -244,13 +320,16 @@ def stop_preview_for_user(db: Session, user: User, project_id: int) -> PreviewSt
 def _stop_session_locked(session: _PreviewSession) -> None:
     with session.lock:
         server = session.proxy_server
-        proc = session.backend_proc
-        backend_port = session.backend_port
+        handle = session.runtime_handle
+        runtime_port = session.runtime_port
         preview_port = session.preview_port
+        worker_owns_pending_ports = session.status == "starting" and handle is None
         session.proxy_server = None
-        session.backend_proc = None
-        session.backend_port = None
-        session.preview_port = None
+        session.runtime_handle = None
+        if not worker_owns_pending_ports:
+            session.runtime_port = None
+            session.preview_port = None
+        session.stopped = True
         session.status = "idle"
         session.url = None
     if server is not None:
@@ -258,42 +337,23 @@ def _stop_session_locked(session: _PreviewSession) -> None:
             server.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("preview proxy shutdown failed project_id=%s", session.project_id)
-    if proc is not None:
-        _stop_process(proc)
-    _release_ports(backend_port, preview_port)
+    if handle is not None:
+        try:
+            get_preview_runtime().stop(handle)
+        except Exception:  # noqa: BLE001 - stop remains best effort
+            logger.exception("preview sandbox shutdown failed project_id=%s", session.project_id)
+    if not worker_owns_pending_ports:
+        _release_ports(runtime_port, preview_port)
 
 
-def _stop_process(proc: subprocess.Popen[bytes]) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _backend_env(workspace: Path) -> dict[str, str]:
-    db_path = (workspace / "backend" / "data" / "app.db").resolve()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env["DATABASE_URL"] = f"sqlite:///{db_path.as_posix()}"
-    env["DEBUG"] = "false"
-    env["PYTHONUNBUFFERED"] = "1"
-    # Allow embedding from the ForgeAI workbench origin.
-    env["CORS_ORIGINS"] = settings.cors_origins
-    return env
-
-
-def _backend_log_path(workspace: Path) -> Path:
-    path = workspace / "forgeai" / "logs" / "preview-backend.log"
+def _preview_log_path(workspace: Path) -> Path:
+    path = workspace / "forgeai" / "logs" / "preview-sandbox.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _backend_log_tail(session: _PreviewSession) -> str:
-    path = session.backend_log_path
+def _preview_log_tail(session: _PreviewSession) -> str:
+    path = session.preview_log_path
     if path is None or not path.is_file():
         return ""
     try:
@@ -302,7 +362,9 @@ def _backend_log_tail(session: _PreviewSession) -> str:
     except OSError:
         return ""
     workspace = str(session.workspace.resolve())
-    return text.replace(workspace, "<workspace>")[-_MAX_RUNTIME_DIAGNOSTIC_CHARS:]
+    return text.replace(workspace, "<workspace>").replace("/tmp/app", "<sandbox-workspace>")[
+        -_MAX_RUNTIME_DIAGNOSTIC_CHARS:
+    ]
 
 
 def _with_backend_diagnostic(summary: str, detail: str) -> str:
@@ -316,7 +378,7 @@ def _with_backend_diagnostic(summary: str, detail: str) -> str:
 
 
 def _record_backend_failure(session: _PreviewSession, request_path: str, status: int) -> None:
-    detail = _backend_log_tail(session)
+    detail = _preview_log_tail(session)
     message = _with_backend_diagnostic(f"预览 API {request_path} 返回 HTTP {status}", detail)
     with session.lock:
         session.message = message
@@ -330,159 +392,6 @@ def _clear_backend_failure(session: _PreviewSession, request_path: str) -> None:
             session.message = None
             session.backend_error_path = None
         _touch(session)
-
-
-def _run_checked(
-    argv: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    timeout: int,
-    label: str,
-) -> None:
-    logger.info("preview %s: %s", label, " ".join(argv))
-    completed = subprocess.run(
-        argv,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
-    )
-    if completed.returncode == 0:
-        return
-    tail = (completed.stderr or completed.stdout or "").strip()[-800:]
-    raise BusinessException(f"{label}失败" + (f"：{tail}" if tail else ""))
-
-
-def _frontend_source_hash(frontend: Path) -> str:
-    digest = hashlib.sha256()
-    for current, directories, files in os.walk(frontend, followlinks=False):
-        directories[:] = sorted(
-            name for name in directories if name not in _FRONTEND_BUILD_SKIP_DIRS
-        )
-        current_path = Path(current)
-        for name in sorted(files):
-            path = current_path / name
-            if path.is_symlink():
-                raise BusinessException("前端源码包含符号链接，无法建立可信预览产物")
-            relative = path.relative_to(frontend).as_posix()
-            digest.update(relative.encode("utf-8"))
-            digest.update(b"\0")
-            try:
-                with path.open("rb") as source:
-                    while chunk := source.read(1024 * 1024):
-                        digest.update(chunk)
-            except OSError as exc:
-                raise BusinessException(f"无法读取前端源码：{relative}") from exc
-            digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _frontend_build_marker(workspace: Path) -> Path:
-    return workspace / "forgeai" / "preview" / "frontend-build.json"
-
-
-def _frontend_dist_matches(workspace: Path, source_hash: str) -> bool:
-    marker = _frontend_build_marker(workspace)
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    return (
-        payload.get("version") == _FRONTEND_BUILD_MARKER_VERSION
-        and payload.get("source_hash") == source_hash
-    )
-
-
-def _write_frontend_build_marker(workspace: Path, source_hash: str) -> None:
-    marker = _frontend_build_marker(workspace)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    temporary = marker.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(
-            {"version": _FRONTEND_BUILD_MARKER_VERSION, "source_hash": source_hash},
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    temporary.replace(marker)
-
-
-def _frontend_build_env(frontend: Path) -> dict[str, str]:
-    env = dict(os.environ)
-    # Node's compile cache can leave native SWC bindings unusable across interrupted
-    # Windows preview runs. Vite is short-lived here, so disabling it is deterministic.
-    env["NODE_DISABLE_COMPILE_CACHE"] = "1"
-    if os.name == "nt":
-        for package, binary in (
-            ("core-win32-x64-msvc", "swc.win32-x64-msvc.node"),
-            ("core-win32-arm64-msvc", "swc.win32-arm64-msvc.node"),
-            ("core-win32-ia32-msvc", "swc.win32-ia32-msvc.node"),
-        ):
-            candidate = frontend / "node_modules" / "@swc" / package / binary
-            if candidate.is_file():
-                # Bypass @swc/core's package auto-loader. It can retain a failed
-                # native package cache across interrupted Windows builds.
-                env["SWC_BINARY_PATH"] = str(candidate.resolve())
-                break
-    return env
-
-
-def _ensure_frontend_dist(workspace: Path) -> None:
-    frontend = workspace / "frontend"
-    dist_index = frontend / "dist" / "index.html"
-    source_hash = _frontend_source_hash(frontend)
-    if dist_index.is_file() and _frontend_dist_matches(workspace, source_hash):
-        return
-    vite_entry = frontend / "node_modules" / "vite" / "bin" / "vite.js"
-    if not vite_entry.is_file():
-        raise BusinessException("前端依赖未安装，无法构建预览（缺少 vite）")
-    _run_checked(
-        ["node", str(vite_entry), "build"],
-        cwd=frontend,
-        env=_frontend_build_env(frontend),
-        timeout=int(settings.preview_build_timeout_seconds),
-        label="前端构建",
-    )
-    if not dist_index.is_file():
-        raise BusinessException("前端构建未生成 dist/index.html")
-    _write_frontend_build_marker(workspace, source_hash)
-
-
-def _ensure_backend_ready(workspace: Path, env: dict[str, str]) -> None:
-    backend = workspace / "backend"
-    if not (backend / "pyproject.toml").is_file():
-        raise BusinessException("工作区缺少后端工程")
-    # Always reconcile the environment with the current manifest. Reusing an old
-    # .venv after pyproject.toml changed is a common source of preview-only failures.
-    _run_checked(
-        ["uv", "sync"],
-        cwd=backend,
-        env=env,
-        timeout=int(settings.preview_build_timeout_seconds),
-        label="后端依赖同步",
-    )
-    _run_checked(
-        ["uv", "run", "alembic", "upgrade", "head"],
-        cwd=backend,
-        env=env,
-        timeout=60,
-        label="数据库迁移",
-    )
-
-
-def _backend_python(workspace: Path) -> Path:
-    backend = workspace / "backend"
-    for relative in (Path(".venv/Scripts/python.exe"), Path(".venv/bin/python")):
-        candidate = backend / relative
-        if candidate.is_file():
-            return candidate
-    raise BusinessException("后端虚拟环境不完整，无法启动预览（缺少 Python）")
 
 
 def _wait_http(url: str, *, timeout: float, label: str) -> None:
@@ -501,8 +410,7 @@ def _wait_http(url: str, *, timeout: float, label: str) -> None:
 
 
 def _make_proxy_handler(
-    dist_root: Path,
-    backend_port: int,
+    runtime_port: int,
     bind_host: str,
     workspace: Path,
     session: _PreviewSession,
@@ -513,12 +421,12 @@ def _make_proxy_handler(
         def log_message(self, format: str, *args: object) -> None:  # noqa: A003
             logger.debug("preview-proxy: " + format, *args)
 
-        def _backend_base(self) -> str:
-            return f"http://{bind_host}:{backend_port}"
+        def _runtime_base(self) -> str:
+            return f"http://{bind_host}:{runtime_port}"
 
         def _proxy(self) -> None:
             split = urlsplit(self.path)
-            target = f"{self._backend_base()}{split.path}"
+            target = f"{self._runtime_base()}{split.path}"
             if split.query:
                 target = f"{target}?{split.query}"
             length = int(self.headers.get("Content-Length") or 0)
@@ -530,102 +438,61 @@ def _make_proxy_handler(
                 headers={
                     key: value
                     for key, value in self.headers.items()
-                    if key.lower() not in {"host", "content-length", "connection"}
+                    if key.lower()
+                    not in {"host", "content-length", "connection", "accept-encoding"}
                 },
             )
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     payload = response.read()
-                    _clear_backend_failure(session, split.path)
+                    content_type = response.headers.get("Content-Type", "")
+                    if "text/html" in content_type.lower() and self.command != "HEAD":
+                        payload = inject_design_bridge(payload, workspace)
+                    if split.path.startswith("/api"):
+                        _clear_backend_failure(session, split.path)
                     self.send_response(response.status)
                     for key, value in response.headers.items():
-                        if key.lower() in {"transfer-encoding", "connection", "content-encoding"}:
+                        if key.lower() in {
+                            "transfer-encoding",
+                            "connection",
+                            "content-encoding",
+                            "content-length",
+                        }:
                             continue
                         self.send_header(key, value)
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
-                    self.wfile.write(payload)
+                    if self.command != "HEAD":
+                        self.wfile.write(payload)
             except urllib.error.HTTPError as exc:
                 payload = exc.read()
-                if exc.code >= 500:
+                if split.path.startswith("/api") and exc.code >= 500:
                     _record_backend_failure(session, split.path, exc.code)
                 self.send_response(exc.code)
                 self.send_header("Content-Type", exc.headers.get("Content-Type", "text/plain"))
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                if self.command != "HEAD":
+                    self.wfile.write(payload)
             except Exception as exc:  # noqa: BLE001
                 message = str(exc).encode("utf-8")
+                if split.path.startswith("/api"):
+                    _record_backend_failure(session, split.path, 502)
                 self.send_response(502)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(message)))
                 self.end_headers()
-                self.wfile.write(message)
-
-        def _safe_file(self, url_path: str) -> Path | None:
-            relative = url_path.lstrip("/")
-            if not relative or relative.endswith("/"):
-                relative = relative + "index.html"
-            candidate = (dist_root / relative).resolve()
-            try:
-                candidate.relative_to(dist_root.resolve())
-            except ValueError:
-                return None
-            if candidate.is_file():
-                return candidate
-            # SPA fallback
-            index = dist_root / "index.html"
-            return index if index.is_file() else None
-
-        def _serve_static(self) -> None:
-            split = urlsplit(self.path)
-            path = split.path or "/"
-            if path.startswith("/api"):
-                self._proxy()
-                return
-            file_path = self._safe_file(path)
-            if file_path is None:
-                self.send_error(404, "Not Found")
-                return
-            data = file_path.read_bytes()
-            content_type = "text/html; charset=utf-8"
-            suffix = file_path.suffix.lower()
-            if suffix == ".html":
-                data = inject_design_bridge(data, workspace)
-            if suffix == ".js":
-                content_type = "text/javascript; charset=utf-8"
-            elif suffix == ".css":
-                content_type = "text/css; charset=utf-8"
-            elif suffix == ".json":
-                content_type = "application/json"
-            elif suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg"}:
-                content_type = {
-                    ".png": "image/png",
-                    ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg",
-                    ".gif": "image/gif",
-                    ".webp": "image/webp",
-                    ".ico": "image/x-icon",
-                    ".svg": "image/svg+xml",
-                }[suffix]
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+                if self.command != "HEAD":
+                    self.wfile.write(message)
 
         def do_GET(self) -> None:  # noqa: N802
-            self._serve_static()
+            self._proxy()
 
         def do_HEAD(self) -> None:  # noqa: N802
-            self._serve_static()
+            self._proxy()
 
         def do_POST(self) -> None:  # noqa: N802
-            if urlsplit(self.path).path.startswith("/api"):
-                self._proxy()
-            else:
-                self.send_error(405, "Method Not Allowed")
+            self._proxy()
 
         def do_PUT(self) -> None:  # noqa: N802
             self.do_POST()
@@ -640,14 +507,13 @@ def _make_proxy_handler(
 
 
 def _start_proxy(
-    dist_root: Path,
     bind_host: str,
     preview_port: int,
-    backend_port: int,
+    runtime_port: int,
     workspace: Path,
     session: _PreviewSession,
 ) -> ThreadingHTTPServer:
-    handler = _make_proxy_handler(dist_root, backend_port, bind_host, workspace, session)
+    handler = _make_proxy_handler(runtime_port, bind_host, workspace, session)
     server = ThreadingHTTPServer((bind_host, preview_port), handler)
     thread = threading.Thread(
         target=server.serve_forever,
@@ -660,57 +526,58 @@ def _start_proxy(
 
 def _boot_session(session: _PreviewSession) -> None:
     bind_host = settings.preview_bind_host.strip() or "127.0.0.1"
+    runtime = get_preview_runtime()
     try:
         with session.lock:
             session.status = "starting"
-            session.message = "正在准备预览环境…"
+            session.message = "正在启动隔离预览环境…"
             _touch(session)
-        env = _backend_env(session.workspace)
-        _ensure_frontend_dist(session.workspace)
-        with session.lock:
-            session.message = "正在准备后端…"
-            _touch(session)
-        _ensure_backend_ready(session.workspace, env)
-        backend_port = _allocate_port(bind_host)
+        runtime_port = _allocate_port(bind_host)
         preview_port = _allocate_port(bind_host)
         with session.lock:
-            session.backend_port = backend_port
+            session.runtime_port = runtime_port
             session.preview_port = preview_port
-            session.message = "正在启动应用…"
+            session.message = "正在容器内准备依赖、迁移数据库并启动开发预览…"
             _touch(session)
-        log_path = _backend_log_path(session.workspace)
+            if session.stopped:
+                session.runtime_port = None
+                session.preview_port = None
+                _release_ports(runtime_port, preview_port)
+                return
+        log_path = _preview_log_path(session.workspace)
         with session.lock:
-            session.backend_log_path = log_path
-        with log_path.open("wb") as backend_log:
-            backend_proc = subprocess.Popen(
-                [
-                    str(_backend_python(session.workspace)),
-                    "-m",
-                    "uvicorn",
-                    "app.main:app",
-                    "--host",
-                    bind_host,
-                    "--port",
-                    str(backend_port),
-                ],
-                cwd=session.workspace / "backend",
-                env=env,
-                stdout=backend_log,
-                stderr=subprocess.STDOUT,
+            session.preview_log_path = log_path
+        handle = runtime.start(
+            PreviewSandboxRequest(
+                project_id=session.project_id,
+                run_id=session.run_id,
+                workspace=session.workspace,
+                bind_host=bind_host,
+                host_port=runtime_port,
+                log_path=log_path,
+                snapshot_bytes=session.snapshot_bytes,
             )
-        with session.lock:
-            session.backend_proc = backend_proc
-        _wait_http(
-            f"http://{bind_host}:{backend_port}/api/v1/health",
-            timeout=float(settings.preview_ready_timeout_seconds),
-            label="预览后端",
         )
-        dist_root = session.workspace / "frontend" / "dist"
+        with session.lock:
+            session.runtime_handle = handle
+            if session.stopped:
+                session.runtime_handle = None
+                session.runtime_port = None
+                session.preview_port = None
+                runtime.stop(handle)
+                _release_ports(runtime_port, preview_port)
+                return
+        _wait_http(
+            f"{handle.base_url}/api/v1/health",
+            timeout=float(
+                settings.preview_build_timeout_seconds + settings.preview_ready_timeout_seconds
+            ),
+            label="隔离预览容器",
+        )
         proxy = _start_proxy(
-            dist_root,
             bind_host,
             preview_port,
-            backend_port,
+            runtime_port,
             session.workspace,
             session,
         )
@@ -724,8 +591,10 @@ def _boot_session(session: _PreviewSession) -> None:
             label="预览 API 代理",
         )
         with session.lock:
-            if backend_proc.poll() is not None:
-                raise BusinessException("预览后端进程已退出")
+            if session.stopped:
+                raise BusinessException("预览已停止")
+            if not runtime.is_running(handle):
+                raise BusinessException("隔离预览容器已退出")
             session.url = url
             session.status = "ready"
             session.message = None
@@ -738,21 +607,22 @@ def _boot_session(session: _PreviewSession) -> None:
         )
     except Exception as exc:
         message = str(exc) if str(exc).strip() else "预览启动失败"
-        log_tail = _backend_log_tail(session)
+        log_tail = _preview_log_tail(session)
         if log_tail and log_tail not in message:
             message = _with_backend_diagnostic(message, log_tail)
         logger.exception("preview boot failed project_id=%s", session.project_id)
         with session.lock:
-            proc = session.backend_proc
+            cleanup_handle = session.runtime_handle
             server = session.proxy_server
-            released_backend_port = session.backend_port
+            released_runtime_port = session.runtime_port
             released_preview_port = session.preview_port
-            session.backend_proc = None
+            stopped = session.stopped
+            session.runtime_handle = None
             session.proxy_server = None
-            session.backend_port = None
+            session.runtime_port = None
             session.preview_port = None
-            session.status = "error"
-            session.message = message[:_MAX_RUNTIME_DIAGNOSTIC_CHARS]
+            session.status = "idle" if stopped else "error"
+            session.message = None if stopped else message[:_MAX_RUNTIME_DIAGNOSTIC_CHARS]
             session.url = None
             _touch(session)
         if server is not None:
@@ -760,6 +630,6 @@ def _boot_session(session: _PreviewSession) -> None:
                 server.shutdown()
             except Exception:  # noqa: BLE001
                 pass
-        if proc is not None:
-            _stop_process(proc)
-        _release_ports(released_backend_port, released_preview_port)
+        if cleanup_handle is not None:
+            runtime.stop(cleanup_handle)
+        _release_ports(released_runtime_port, released_preview_port)

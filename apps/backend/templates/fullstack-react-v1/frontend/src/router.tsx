@@ -1,10 +1,4 @@
-import {
-  Link,
-  Outlet,
-  createRootRoute,
-  createRoute,
-  createRouter,
-} from '@tanstack/react-router'
+import { Link, Outlet, createRootRoute, createRoute, createRouter } from '@tanstack/react-router'
 
 import { HomePage } from './App'
 

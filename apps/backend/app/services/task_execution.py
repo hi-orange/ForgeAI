@@ -159,6 +159,11 @@ def renew_execution_lease(db: Session, task_id: str, execution_id: str) -> None:
     )
     if renewed.rowcount != 1:
         raise ConflictException("执行编号已失效或任务正在由其他执行处理")
+    execution = db.get(TaskExecution, execution_id)
+    if execution is not None:
+        from app.services.workflow_events import sync_checkpoint_activity_events
+
+        sync_checkpoint_activity_events(db, execution)
     db.commit()
 
 

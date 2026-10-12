@@ -142,15 +142,15 @@ CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="install_project_dependency",
         description=(
-            "在 frontend/ 或 backend/ 内用白名单包管理器增删项目依赖"
-            "（npm/pnpm/uv/pip）。禁止 apt 等系统安装；Runtime 基线由平台提供。"
+            "在隔离容器内解析并更新项目依赖清单（frontend/npm、backend/uv）。"
+            "禁止 apt 等系统安装；Runtime 基线由平台提供。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "manager": {
                     "type": "string",
-                    "enum": ["npm", "pnpm", "uv", "pip"],
+                    "enum": ["npm", "uv"],
                 },
                 "action": {"type": "string", "enum": ["add", "remove"]},
                 "packages": {
@@ -162,7 +162,7 @@ CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
                 "target": {
                     "type": "string",
                     "enum": ["frontend", "backend"],
-                    "description": "npm/pnpm→frontend；uv/pip→backend",
+                    "description": "npm→frontend；uv→backend",
                 },
             },
             "required": ["manager", "action", "packages", "target"],

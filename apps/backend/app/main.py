@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,7 +10,27 @@ from app.core.settings import settings
 
 configure_logging()
 
-app = FastAPI(title=settings.app_name, version="0.1.0", debug=settings.debug)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if settings.workflow_embedded_worker:
+        from app.worker import start_embedded_worker, stop_embedded_worker
+
+        start_embedded_worker()
+        try:
+            yield
+        finally:
+            stop_embedded_worker()
+        return
+    yield
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version="0.1.0",
+    debug=settings.debug,
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,

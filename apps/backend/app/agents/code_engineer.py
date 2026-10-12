@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.agents.prompts.code_engineer import (
+    CODE_BATCH_WRITER_SYSTEM_PROMPT,
     CODE_ENGINEER_SYSTEM_PROMPT,
     CODE_WRITER_SYSTEM_PROMPT,
     FILE_PLANNER_SYSTEM_PROMPT,
@@ -36,6 +37,7 @@ CODE_ENGINEER_TOOLS = [
 
 # 同一文件在拆包/语法/协议校验失败后的重生次数（含首次）。
 MAX_WRITER_ATTEMPTS = 3
+MAX_SOURCE_FILES_PER_BATCH = 4
 
 
 class FileGenerationError(BusinessException):
@@ -120,7 +122,7 @@ def _planner_messages(
                     "constraints": {
                         "max_files_per_work_item": MAX_FILES_PER_WORK_ITEM,
                         "files_array_length": f"1..{MAX_FILES_PER_WORK_ITEM}",
-                        "prefer_at_most": min(12, MAX_FILES_PER_WORK_ITEM),
+                        "prefer_at_most": min(6, MAX_FILES_PER_WORK_ITEM),
                         "image_generation_available": settings.image_generation_enabled,
                         "image_provider": "Volcengine Ark / Seedream",
                         "image_default_size": "2K",
@@ -392,6 +394,110 @@ def generate_file_content(
                         f"上一次 {path} 输出不能写入（第 {attempt + 1}/"
                         f"{MAX_WRITER_ATTEMPTS} 次）：{last_error}。"
                         "请按系统约定重新输出唯一的 whole-file 代码围栏，不得包含解释文字。"
+                    ),
+                },
+            ]
+        )
+    assert last_error is not None
+    raise FileGenerationError(str(last_error), model_calls=model_calls) from last_error
+
+
+def _normalize_generated_batch(raw: str, *, tasks: list[FileTask]) -> dict[str, str]:
+    payload = _unwrap_json_object(raw)
+    rows = payload.get("files")
+    if not isinstance(rows, list):
+        raise BusinessException("批量写码模型必须返回 files 数组")
+    expected = [task.path for task in tasks]
+    generated: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise BusinessException(f"批量写码 files.{index} 必须是对象")
+        path = row.get("path")
+        content = row.get("content")
+        if not isinstance(path, str) or path not in expected:
+            raise BusinessException(f"批量写码返回了计划外路径：{path!r}")
+        if path in generated:
+            raise BusinessException(f"批量写码重复返回路径：{path}")
+        if not isinstance(content, str):
+            raise BusinessException(f"批量写码没有返回 {path} 的完整正文")
+        generated[path] = _normalize_source_candidate(content, path=path)
+    missing = [path for path in expected if path not in generated]
+    if missing or len(generated) != len(expected):
+        raise BusinessException("批量写码没有完整覆盖目标文件：" + "、".join(missing))
+    return generated
+
+
+def generate_file_batch(
+    *,
+    spec: AppSpec,
+    work_item: WorkItem,
+    tasks: list[FileTask],
+    engineering_contexts: dict[str, dict[str, Any]],
+    system_design: SystemDesign | None,
+) -> tuple[dict[str, str], int]:
+    """Generate one coherent, bounded multi-file slice in a single model turn."""
+
+    if not 2 <= len(tasks) <= MAX_SOURCE_FILES_PER_BATCH:
+        raise BusinessException(f"批量写码必须包含 2～{MAX_SOURCE_FILES_PER_BATCH} 个源码文件")
+    if any(task.kind != "source" for task in tasks):
+        raise BusinessException("批量写码只能处理源码文件")
+    paths = [task.path for task in tasks]
+    if len(set(paths)) != len(paths) or set(engineering_contexts) != set(paths):
+        raise BusinessException("批量写码上下文与目标文件不一致")
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": CODE_BATCH_WRITER_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "goal": spec.goal,
+                    "constraints": [item.model_dump(mode="json") for item in spec.constraints],
+                    "current_work_item": work_item.model_dump(mode="json"),
+                    "system_design": (
+                        system_design.model_dump(mode="json") if system_design is not None else None
+                    ),
+                    "target_files": [
+                        {"path": task.path, "description": task.description} for task in tasks
+                    ],
+                    "platform_file_contexts": engineering_contexts,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    last_error: BusinessException | None = None
+    model_calls = 0
+    for attempt in range(MAX_WRITER_ATTEMPTS):
+        raw = ""
+        try:
+            raw = chat_completion(
+                messages=list(messages),
+                temperature=0.15 if attempt == 0 else 0.0,
+                max_tokens=32768,
+                json_output=True,
+            )
+        except CompletionContentError as exc:
+            model_calls += 1
+            last_error = exc
+        else:
+            model_calls += 1
+            try:
+                return _normalize_generated_batch(raw, tasks=tasks), model_calls
+            except BusinessException as exc:
+                last_error = exc
+        assert last_error is not None
+        if attempt + 1 >= MAX_WRITER_ATTEMPTS:
+            break
+        messages.extend(
+            [
+                {"role": "assistant", "content": raw},
+                {
+                    "role": "user",
+                    "content": (
+                        f"上一次批量输出不能写入（第 {attempt + 1}/"
+                        f"{MAX_WRITER_ATTEMPTS} 次）：{last_error}。"
+                        "请只重新输出一个 JSON 对象，files 必须恰好覆盖所有 target_files。"
                     ),
                 },
             ]

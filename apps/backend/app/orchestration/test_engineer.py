@@ -10,13 +10,14 @@ from sqlalchemy.orm import Session
 
 from app.agents.test_engineer import verify_code
 from app.core.exceptions import BusinessException
-from app.core.settings import settings
-from app.generation.workspace import default_workspace_path
 from app.models.configuration_item import ConfigurationItem
 from app.models.task_execution import TaskExecution
 from app.models.user import User
+from app.schemas.test_report import TestReport
 from app.services import test_engineer as test_engineer_service
+from app.services.source_artifact import ensure_code_workspace
 from app.services.task_execution import fail_execution, renew_execution_lease
+from app.services.workflow_events import sync_checkpoint_activity_events
 from app.telemetry.agent import agent_telemetry_scope
 
 logger = logging.getLogger("forgeai")
@@ -52,6 +53,7 @@ def _record_quality_activity(
     # JSON columns need an explicit dirty flag or later activity rows never persist.
     execution.draft = json.loads(json.dumps(draft, ensure_ascii=False))
     flag_modified(execution, "draft")
+    sync_checkpoint_activity_events(db, execution)
     db.commit()
     db.refresh(execution)
 
@@ -119,7 +121,12 @@ def run_test_engineer_task(
             run_id,
             task.input_configuration_item_ids[0],
         )
-    workspace_root = default_workspace_path(settings.runtime_data_root, project_id, run_id)
+    workspace_root, _ = ensure_code_workspace(
+        db,
+        project_id=project_id,
+        run_id=run_id,
+        code_item_id=inputs.code_item.item_id,
+    )
     try:
 
         def heartbeat() -> None:
@@ -192,9 +199,22 @@ def run_test_engineer_task(
         )
         raise
 
+    route_completed_test_report(db, user, project_id, run_id, report_item)
+    return report_item
+
+
+def route_completed_test_report(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    report_item: ConfigurationItem,
+) -> None:
+    """Idempotently apply deterministic routing for one immutable quality report."""
+
+    report = TestReport.model_validate(report_item.payload)
     if report.quality_conclusion.value == "failed":
-        # Role output is routed by the NextAction engine (Leader only when ambiguous).
-        # Test Engineer remains read-only; the report is frozen repair input.
+        # Test Engineer remains read-only; Leader consumes the immutable report.
         from app.services import engineering
         from app.services import leader as leader_service
 
@@ -207,7 +227,7 @@ def run_test_engineer_task(
                 report_item.item_id,
             )
             if repair_task is None:
-                return report_item
+                return
             if repair_task.recipient == "Code Engineer":
                 code_task, code_execution = engineering.claim_code_engineer_task(
                     db,
@@ -234,4 +254,3 @@ def run_test_engineer_task(
                 report_item.item_id,
             )
             raise
-    return report_item

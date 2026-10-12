@@ -47,10 +47,14 @@ class Settings(BaseSettings):
     max_resume_size_mb: int = 10
     # Isolated engineering workspaces: runtime-data/work/{project}/{execution}
     runtime_data_root: str = "runtime-data"
+    # Durable, content-addressed source snapshots. Keep this on durable storage
+    # separate from disposable runtime-data in production.
+    source_artifact_root: str = "artifact-data"
 
     # Disposable Linux check containers for generated fullstack-react-v1 apps.
     engineering_check_image: str = "forgeai-checks:fullstack-react-v1"
     engineering_check_timeout_seconds: int = 300
+    security_scanner_version: str = "forgeai-security-v1"
 
     # Local loopback preview of a completed generated app (not a multi-tenant gateway).
     preview_enabled: bool = True
@@ -60,6 +64,21 @@ class Settings(BaseSettings):
     preview_idle_timeout_seconds: int = 1800
     preview_build_timeout_seconds: int = 180
     preview_ready_timeout_seconds: int = 90
+    preview_runtime_image: str = "forgeai-checks:fullstack-react-v1"
+    preview_container_cpus: float = 2.0
+    preview_container_memory_mb: int = 2048
+    preview_container_pids_limit: int = 256
+    dependency_runtime_image: str = "forgeai-checks:fullstack-react-v1"
+
+    # Database-backed role/deployment queue. Development embeds one worker in the
+    # API process; production can disable it and run ``python -m app.worker``.
+    workflow_embedded_worker: bool = True
+    workflow_poll_interval_seconds: float = 1.0
+    workflow_recovery_interval_seconds: float = 15.0
+    workflow_orphan_grace_seconds: int = 30
+    workflow_job_lease_seconds: int = 90
+    workflow_job_heartbeat_seconds: int = 20
+    workflow_job_max_attempts: int = 3
 
     # Durable local publication provider. Cloud providers can implement the same
     # Deployment contract without changing the workbench API.

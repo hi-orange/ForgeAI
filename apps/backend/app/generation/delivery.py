@@ -10,9 +10,10 @@ from app.core.exceptions import ConflictException
 from app.schemas.app_spec import AppSpec
 from app.schemas.test_report import TestReport, VerificationStatus
 
-# Soft cap for one work-item file plan. Planners may overshoot; the platform
-# truncates in dependency order rather than failing the whole engineering turn.
-MAX_FILES_PER_WORK_ITEM = 20
+# Soft cap for one work-item file plan. Large cross-file batches leave
+# inconsistent imports; planners may overshoot and the platform truncates /
+# defers in dependency order rather than failing the whole engineering turn.
+MAX_FILES_PER_WORK_ITEM = 10
 
 
 class WorkItem(BaseModel):

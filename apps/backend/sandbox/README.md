@@ -1,8 +1,10 @@
 # 工程检查环境
 
 工程 Agent 在 `fullstack-react-v1` 工作区按功能读写代码，并使用 `run_check` 获取真实反馈。
-项目级依赖通过有界工具 `install_project_dependency`（npm/pnpm/uv/pip）增删；
-写入 `frontend/package.json` 后平台会尝试在工作区同步安装。系统包（apt 等）不在此工具范围。
+项目级依赖通过有界工具 `install_project_dependency`（frontend/npm、backend/uv）增删；
+解析过程在无宿主挂载的容器中完成，联网容器只接收对应的依赖清单和锁文件，不接收应用源码，
+并且只将清单和锁文件写回工作区。写入
+`frontend/package.json` 后平台会在同一边界内同步锁文件。系统包（apt 等）不在此工具范围。
 提交 `complete_work_item` 会强制运行全部工程检查；失败保留当前功能并交回模型修复。
 检查通过的状态是 `engineering_checked`，不是业务验收通过、发布成功或在线预览可用。
 
@@ -22,6 +24,12 @@ docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-react-v1 .
 
 配置：`ENGINEERING_CHECK_IMAGE`（默认上述标签）与
 `ENGINEERING_CHECK_TIMEOUT_SECONDS`（默认 300 秒，平台硬限制 300 秒）。
+预览使用 `PREVIEW_RUNTIME_IMAGE`（默认复用同一镜像），并可通过
+`PREVIEW_CONTAINER_CPUS`、`PREVIEW_CONTAINER_MEMORY_MB`、
+`PREVIEW_CONTAINER_PIDS_LIMIT` 设置容器资源上限。
+预览、依赖解析和发布共用平台持有的 `DockerSandboxRuntime` 来探测 Docker、校验镜像和执行
+固定参数；生产发布仍使用模板中受信任的 Compose/Dockerfile，生成代码不能替换发布定义或
+读取平台生成的外部 secret 文件。
 缺少 Docker、守护进程或镜像时暂停构建，代码与日志保留。环境就绪后点击“继续构建”。
 
 ## 实际检查范围
@@ -39,8 +47,9 @@ docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-react-v1 .
 临时数据库只用于验证，检查结束后销毁；不能把“验证建表成功”理解为生产数据库已经部署。
 这些工程检查不会证明所有业务验收条款、权限流程或浏览器交互都已满足。
 工程检查容器仍是一次性冒烟，不负责在线预览。
-构建完成后，平台可在本机 `127.0.0.1` 启动 loopback 预览会话（构建 `dist`、起生成后端、
-静态页 + `/api` 反代），并在工作台 iframe 中加载；这不是多租户公网预览网关。
+构建完成后，平台可在本机 `127.0.0.1` 启动 loopback 预览会话。生成源码通过标准输入复制到
+独立的无特权容器，在容器内安装依赖、迁移临时 SQLite、构建前端并启动后端；宿主只运行可信
+的 loopback 代理，以注入设计桥并转发静态页和 `/api`。这不是多租户公网预览网关。
 
 ## 隔离与恢复
 

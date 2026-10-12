@@ -16,6 +16,7 @@ from app.schemas.response import ApiResponse, success
 from app.services.leader import create_clarification_plan
 from app.services.requirements import (
     approve_requirement_plan,
+    cancel_active_execution,
     continue_engineering,
     continue_requirements,
     ensure_engineering_running,
@@ -81,6 +82,19 @@ def pause_build_run(
     current_user: CurrentUser,
 ) -> dict:
     return success(pause_active_execution(db, current_user, project_id, run_id))
+
+
+@router.post(
+    "/build-runs/{run_id}/cancel",
+    response_model=ApiResponse[RequirementsStatus],
+)
+def cancel_build_run(
+    project_id: int,
+    run_id: str,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    return success(cancel_active_execution(db, current_user, project_id, run_id))
 
 
 @router.post(

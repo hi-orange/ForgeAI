@@ -81,6 +81,11 @@ export type RequirementsStatus = {
     | 'completed'
     | 'quality_challenge'
     | 'quality_failed'
+  preview_revision?: number | null
+  preview_source_hash?: string | null
+  preview_work_item_id?: string | null
+  preview_work_item_title?: string | null
+  preview_updated_at?: string | null
   execution_id: string | null
   execution_expires_at: string | null
   error: string | null
@@ -156,6 +161,12 @@ export function continueRequirements(id: number) {
 
 export function pauseBuildRun(id: number, runId: string) {
   return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/build-runs/${runId}/pause`, {
+    method: 'POST',
+  })
+}
+
+export function cancelBuildRun(id: number, runId: string) {
+  return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/build-runs/${runId}/cancel`, {
     method: 'POST',
   })
 }

@@ -7,10 +7,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
+from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.code_engineer import (
+    MAX_SOURCE_FILES_PER_BATCH,
     FileGenerationError,
+    generate_file_batch,
     generate_file_content,
     plan_work_item_files,
 )
@@ -27,22 +30,27 @@ from app.generation.delivery import (
 )
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
+from app.schemas.agent_action import ToolExecutionResult
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import TestReport
 from app.services.engineering.claim import DEFAULT_CALL_BUDGET, read_frozen_input_snapshot
 from app.services.engineering.handoff import load_approved_app_spec
+from app.services.source_artifact import persist_source_artifact
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
+from app.services.workflow_events import append_event
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
 from app.tools import images as image_tools
 from app.tools import project_deps as project_deps_tools
-from app.tools.check_diagnostics import analyze_check_failure
+from app.tools.check_diagnostics import CheckFailureAnalysis, analyze_check_failure
 from app.tools.paths import is_text_file, safe_path_under_root, sha256_bytes
 
 CHECKPOINT_KIND = "engineering_checkpoint"
-CHECKPOINT_SCHEMA_VERSION = 7
-EXECUTION_MODE = "planned_files_v4"
+CHECKPOINT_SCHEMA_VERSION = 9
+# v6 preserves a terminal failed-check checkpoint through migration so the
+# explicit recovery attempt can replan from its last structured diagnostics.
+EXECUTION_MODE = "planned_files_v7"
 MAX_CONTEXT_FILES = 160
 MAX_PLAN_HISTORY = 24
 MAX_IDENTICAL_CHECK_FAILURES = 3
@@ -149,6 +157,16 @@ def _new_checkpoint() -> dict[str, Any]:
     }
 
 
+def _is_terminal_check_failure(checkpoint: dict[str, Any]) -> bool:
+    reason = str(checkpoint.get("blocked_reason") or "")
+    reason_code = str(checkpoint.get("blocked_reason_code") or "")
+    return reason_code in {
+        "REPEATED_CHECK_FAILURE",
+        "REPAIR_BUDGET_EXHAUSTED",
+        "NO_SOURCE_PROGRESS",
+    } or ("自动修复轮次已用尽" in reason)
+
+
 def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
     raw = snapshot.get("checkpoint")
     if not isinstance(raw, dict) or raw.get("kind") != CHECKPOINT_KIND:
@@ -177,6 +195,9 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
         checkpoint.setdefault(key, default)
 
     if previous_mode != EXECUTION_MODE:
+        preserve_terminal_failure = checkpoint.get(
+            "outcome"
+        ) == "blocked" and _is_terminal_check_failure(checkpoint)
         # Controller v3 could spend an entire attempt selecting and re-reading files. Preserve
         # real files and completed items, but never replay that observation loop after upgrade.
         checkpoint.update(
@@ -184,6 +205,7 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
             observations=[],
             active_file_plan=None,
             active_plan_kind=None,
+            deferred_file_plan=[],
             failure_streaks={},
             repair_rounds={},
             repair_context=None,
@@ -191,14 +213,62 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
         )
         if checkpoint.get("outcome") != "generated":
             checkpoint.update(
-                outcome="running",
-                blocked_reason=None,
                 model_turns=0,
                 tool_calls=0,
             )
-            checkpoint.pop("blocked_reason_code", None)
-            checkpoint.pop("last_error", None)
+            if not preserve_terminal_failure:
+                checkpoint.update(
+                    outcome="running",
+                    blocked_reason=None,
+                )
+                checkpoint.pop("blocked_reason_code", None)
+                checkpoint.pop("last_error", None)
     return checkpoint
+
+
+def _repair_diagnostics(failure: CheckFailureAnalysis) -> list[dict[str, Any]]:
+    root = [item.to_payload() for item in failure.diagnostics if item.kind != "runtime"]
+    return root or [item.to_payload() for item in failure.diagnostics]
+
+
+def _seed_repair_from_last_check(checkpoint: dict[str, Any]) -> None:
+    """Turn the last failed check into the next repair plan.
+
+    A budget stop used to leave the finished file plan in place, so the next
+    attempt only reran the same check. Re-parse that output with the current
+    diagnostics so the planner sees the import or schema error, not the
+    ``后端启动失败`` wrapper.
+    """
+
+    history = checkpoint.get("plan_history")
+    if not isinstance(history, list):
+        return
+    for item in reversed(history):
+        if not isinstance(item, dict):
+            continue
+        check = item.get("check")
+        if not isinstance(check, dict) or check.get("ok") is True:
+            continue
+        try:
+            result = ToolExecutionResult.model_validate(check)
+        except ValidationError:
+            return
+        failure = analyze_check_failure(result)
+        previous = item.get("plan")
+        if not isinstance(previous, dict):
+            active = checkpoint.get("active_file_plan")
+            previous = active if isinstance(active, dict) else None
+        checkpoint["repair_context"] = {
+            "round": 1,
+            "failed_check": result.model_dump(mode="json"),
+            "excerpt": failure.excerpt,
+            "diagnostics": _repair_diagnostics(failure),
+            "previous_plan": previous,
+            "modified_files": list(checkpoint.get("modified_files") or []),
+        }
+        checkpoint["active_file_plan"] = None
+        checkpoint["active_plan_kind"] = None
+        return
 
 
 def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
@@ -206,13 +276,7 @@ def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
 
     if checkpoint.get("outcome") != "blocked":
         return False
-    reason = str(checkpoint.get("blocked_reason") or "")
-    reason_code = str(checkpoint.get("blocked_reason_code") or "")
-    terminal_check_failure = reason_code in {
-        "REPEATED_CHECK_FAILURE",
-        "REPAIR_BUDGET_EXHAUSTED",
-        "NO_SOURCE_PROGRESS",
-    } or ("自动修复轮次已用尽" in reason)
+    terminal_check_failure = _is_terminal_check_failure(checkpoint)
     if terminal_check_failure:
         # Do not let a button click erase identical-failure memory forever. A newer
         # executor version may recover an old checkpoint once; after that the user
@@ -224,6 +288,7 @@ def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
             values = checkpoint.get(key)
             if isinstance(values, dict):
                 values.pop(current_item_id, None)
+        _seed_repair_from_last_check(checkpoint)
     checkpoint["outcome"] = "running"
     checkpoint["blocked_reason"] = None
     checkpoint.pop("blocked_reason_code", None)
@@ -374,6 +439,25 @@ def _next_file(plan: dict[str, Any]) -> dict[str, Any] | None:
         (item for item in files if isinstance(item, dict) and item.get("status") == "pending"),
         None,
     )
+
+
+def _next_source_batch(plan: dict[str, Any]) -> list[FileTask]:
+    """Return the next consecutive source tasks without crossing an image dependency."""
+
+    files = plan.get("files")
+    if not isinstance(files, list):
+        return []
+    batch: list[FileTask] = []
+    for raw in files:
+        if not isinstance(raw, dict) or raw.get("status") != "pending":
+            continue
+        task = FileTask.model_validate(raw)
+        if task.kind != "source":
+            break
+        batch.append(task)
+        if len(batch) >= MAX_SOURCE_FILES_PER_BATCH:
+            break
+    return batch
 
 
 def _promote_deferred_batch(
@@ -539,11 +623,16 @@ class _EngineeringNodes:
                 checkpoint["tool_calls"] = 0
             resumed = execution.attempt > 1 and _resume_blocked_checkpoint(checkpoint)
             if resumed:
+                repair = checkpoint.get("repair_context")
+                excerpt = str(repair.get("excerpt") or "") if isinstance(repair, dict) else ""
+                detail = "保留已完成文件，从上次真实检查结果继续修复"
+                if excerpt.strip():
+                    detail = f"{detail}：{excerpt.strip()}"
                 _append_activity(
                     checkpoint,
                     name="resume",
                     label="Resume build",
-                    detail="保留已完成文件，从上次真实检查结果继续修复",
+                    detail=detail,
                     ok=True,
                 )
 
@@ -635,7 +724,39 @@ class _EngineeringNodes:
             return self._write_step(
                 state, snapshot, checkpoint, spec, system_design, work_item, root
             )
+        # Finish every planned batch before the full check so missing later-batch
+        # modules are not misread as defects in already-written files.
+        deferred_raw = checkpoint.get("deferred_file_plan")
+        deferred = deferred_raw if isinstance(deferred_raw, list) else []
+        pending_deferred = [item for item in deferred if isinstance(item, dict)]
+        if pending_deferred:
+            return self._promote_deferred_step(state, work_item, pending_deferred)
         return self._check_step(state, snapshot, checkpoint, work_item, root)
+
+    def _promote_deferred_step(
+        self,
+        state: _WorkflowState,
+        work_item: WorkItem,
+        deferred: list[dict[str, Any]],
+    ) -> _WorkflowUpdate:
+        next_plan, remaining = _promote_deferred_batch(work_item=work_item, deferred=deferred)
+        with self._session_factory() as db:
+            execution, current_snapshot, current = _locked_current(db, state)
+            current["active_file_plan"] = next_plan.model_dump(mode="json")
+            current["active_plan_kind"] = "implementation"
+            current["deferred_file_plan"] = remaining
+            current["repair_context"] = None
+            _append_activity(
+                current,
+                name="plan_ready",
+                label="Continue file batch",
+                detail=next_plan.summary,
+                ok=True,
+            )
+            current_snapshot["checkpoint"] = current
+            _save_snapshot(db, execution.execution_id, current_snapshot)
+            renew_execution_lease(db, state["task_id"], execution.execution_id)
+            return self._result(current)
 
     def _load_step(
         self, state: _WorkflowState
@@ -870,6 +991,18 @@ class _EngineeringNodes:
         root: Path,
     ) -> _WorkflowUpdate:
         plan = ImplementationPlan.model_validate(checkpoint["active_file_plan"])
+        source_batch = _next_source_batch(checkpoint["active_file_plan"])
+        if len(source_batch) > 1:
+            return self._write_batch_step(
+                state,
+                snapshot=snapshot,
+                checkpoint=checkpoint,
+                spec=spec,
+                system_design=system_design,
+                work_item=work_item,
+                root=root,
+                tasks=source_batch,
+            )
         raw_task = _next_file(checkpoint["active_file_plan"])
         assert raw_task is not None
         task = FileTask.model_validate(raw_task)
@@ -1010,6 +1143,164 @@ class _EngineeringNodes:
             renew_execution_lease(db, state["task_id"], execution.execution_id)
             return self._result(current)
 
+    def _write_batch_step(
+        self,
+        state: _WorkflowState,
+        *,
+        snapshot: dict[str, Any],
+        checkpoint: dict[str, Any],
+        spec: AppSpec,
+        system_design: SystemDesign | None,
+        work_item: WorkItem,
+        root: Path,
+        tasks: list[FileTask],
+    ) -> _WorkflowUpdate:
+        plan = ImplementationPlan.model_validate(checkpoint["active_file_plan"])
+        maximum_context_reads = sum(
+            len(dict.fromkeys([task.path, *task.context_paths])) for task in tasks
+        )
+        if int(checkpoint.get("tool_calls") or 0) + maximum_context_reads + 1 > _call_budget(
+            snapshot, "max_tool_calls"
+        ):
+            return self._persist_failure(state, "工具调用预算已用尽")
+
+        contexts: dict[str, dict[str, Any]] = {}
+        expected_hashes: dict[str, str | None] = {}
+        read_count = 0
+        try:
+            for task in tasks:
+                context, expected_hash, task_reads = _platform_file_context(root, task)
+                contexts[task.path] = context
+                expected_hashes[task.path] = expected_hash
+                read_count += task_reads
+        except (BusinessException, ConflictException) as exc:
+            return self._persist_failure(state, str(exc), tool_calls=read_count)
+
+        self._persist_waiting(
+            state,
+            name="generate_file_batch",
+            label="Generate file batch",
+            detail=f"一次生成 {len(tasks)} 个关联文件：" + "、".join(task.path for task in tasks),
+        )
+        shared_context = {
+            "template_version": snapshot.get("template_version"),
+            "stack": snapshot.get("stack") or {},
+            "workspace_file_index": checkpoint.get("workspace_file_index") or {},
+            "files_modified_in_this_run": list(checkpoint.get("modified_files") or []),
+            "implementation_plan": plan.model_dump(mode="json"),
+            "smoke_contract": check_tools.load_smoke_contract(),
+            "acceptance_test_plan": snapshot.get("acceptance_test_plan"),
+            "acceptance_test_hash": snapshot.get("acceptance_test_hash"),
+            "protected_acceptance_paths": list(PROTECTED_ACCEPTANCE_PATHS),
+            "repair_context": checkpoint.get("repair_context"),
+            "quality_report": snapshot.get("quality_report"),
+        }
+        engineering_contexts = {
+            task.path: {**shared_context, "platform_file_context": contexts[task.path]}
+            for task in tasks
+        }
+        try:
+            contents, writer_calls = generate_file_batch(
+                spec=spec,
+                work_item=work_item,
+                tasks=tasks,
+                engineering_contexts=engineering_contexts,
+                system_design=system_design,
+            )
+        except FileGenerationError as exc:
+            return self._queue_generation_repair(
+                state,
+                work_item=work_item,
+                plan=plan,
+                task=tasks[0],
+                message=f"关联文件批量生成失败：{exc}",
+                writer_model_calls=exc.model_calls,
+                tool_calls=read_count,
+            )
+        except BusinessException as exc:
+            return self._persist_failure(
+                state,
+                str(exc),
+                model_kind="writer",
+                tool_calls=read_count,
+            )
+
+        with self._session_factory() as db:
+            execution, current_snapshot, current = _locked_current(db, state)
+            current_plan = ImplementationPlan.model_validate(current["active_file_plan"])
+            current_by_id = {item.id: item for item in current_plan.files}
+            current_tasks = [current_by_id.get(task.id) for task in tasks]
+            if any(item is None or item.status != "pending" for item in current_tasks):
+                raise ConflictException("批量文件计划已变化，请重新继续工程执行")
+            written = file_tools.apply_patch_batch(
+                root,
+                writes=[
+                    {
+                        "path": task.path,
+                        "content": contents[task.path],
+                        "expected_hash": expected_hashes[task.path],
+                    }
+                    for task in tasks
+                ],
+                revision_id=execution.execution_id,
+                tool_call_id=f"write_batch_{work_item.id}_{tasks[0].id}",
+            )
+            current["model_turns"] = int(current.get("model_turns") or 0) + writer_calls
+            current["writer_model_calls"] = (
+                int(current.get("writer_model_calls") or 0) + writer_calls
+            )
+            current["tool_calls"] = int(current.get("tool_calls") or 0) + read_count + 1
+            if not written.ok:
+                _block_checkpoint(current, written.summary, reason_code=written.error_code)
+            else:
+                hashes = {
+                    str(item.get("path")): str(item.get("content_hash"))
+                    for item in written.data.get("files") or []
+                    if isinstance(item, dict)
+                }
+                modified = list(current.get("modified_files") or [])
+                for item in current_tasks:
+                    assert item is not None
+                    item.status = "completed"
+                    item.content_hash = hashes.get(item.path)
+                    if item.path not in modified:
+                        modified.append(item.path)
+                    _update_file_index(current, item.path)
+                current["active_file_plan"] = current_plan.model_dump(mode="json")
+                current["modified_files"] = modified[-80:]
+                current["revision_id"] = execution.execution_id
+                _append_activity(
+                    current,
+                    name="write_file_batch",
+                    label="File batch written",
+                    detail=written.summary,
+                    ok=True,
+                )
+                for item in current_tasks:
+                    assert item is not None
+                    sync = project_deps_tools.sync_manifest_dependencies(
+                        root,
+                        item.path,
+                        tool_call_id=f"sync_deps_{work_item.id}_{item.id}",
+                    )
+                    if sync is None:
+                        continue
+                    current["tool_calls"] = int(current.get("tool_calls") or 0) + 1
+                    _append_activity(
+                        current,
+                        name="install_project_dependency",
+                        label="Install project deps",
+                        detail=sync.summary,
+                        ok=sync.ok,
+                    )
+                    if not sync.ok and sync.error_code == "DEPENDENCY_INSTALL_FAILED":
+                        _block_checkpoint(current, sync.summary, reason_code=sync.error_code)
+                        break
+            current_snapshot["checkpoint"] = current
+            _save_snapshot(db, execution.execution_id, current_snapshot)
+            renew_execution_lease(db, state["task_id"], execution.execution_id)
+            return self._result(current)
+
     def _image_step(
         self,
         state: _WorkflowState,
@@ -1084,36 +1375,148 @@ class _EngineeringNodes:
         work_item: WorkItem,
         root: Path,
     ) -> _WorkflowUpdate:
-        del snapshot, checkpoint
+        del snapshot
+        pending_ids = [
+            str(item.get("id"))
+            for item in checkpoint.get("work_items") or []
+            if isinstance(item, dict) and item.get("status") == "pending"
+        ]
+        is_final_work_item = pending_ids == [work_item.id]
         self._persist_waiting(
             state,
-            name="run_check",
-            label="Run checks",
-            detail=f"自动验证“{work_item.title}”的最新源码",
+            name="run_quick_check",
+            label="Run quick checks",
+            detail=f"快速验证“{work_item.title}”的语法和类型契约",
         )
-        result = check_tools.run_check(root, check_id="all", tool_call_id=f"check_{work_item.id}")
+        quick_result = check_tools.run_check(
+            root,
+            check_id="quick",
+            tool_call_id=f"quick_{work_item.id}",
+        )
+        preview_snapshot: bytes | None = None
+        preview_source_hash: str | None = None
+        if quick_result.ok:
+            preview_snapshot, preview_source_hash = check_tools.source_snapshot(root)
+            checked_hash = quick_result.data.get("source_hash")
+            if checked_hash != preview_source_hash:
+                quick_result = quick_result.model_copy(
+                    update={
+                        "ok": False,
+                        "error_code": "SOURCE_CHANGED",
+                        "summary": "快速检查后源码发生变化，需要重新检查",
+                    }
+                )
+                preview_snapshot = None
+                preview_source_hash = None
+
+        final_result: ToolExecutionResult | None = None
+        result = quick_result
+        if quick_result.ok and is_final_work_item:
+            self._persist_waiting(
+                state,
+                name="run_final_check",
+                label="Run final checks",
+                detail="所有工作项已生成，执行完整构建、迁移和真实前后端冒烟",
+            )
+            final_result = check_tools.run_check(
+                root,
+                check_id="all",
+                tool_call_id=f"final_{work_item.id}",
+            )
+            result = final_result
+
         with self._session_factory() as db:
             execution, current_snapshot, current = _locked_current(db, state)
-            current["tool_calls"] = int(current.get("tool_calls") or 0) + 1
+            current["tool_calls"] = int(current.get("tool_calls") or 0) + (
+                2 if final_result is not None else 1
+            )
             plan = ImplementationPlan.model_validate(current["active_file_plan"])
             history = list(current.get("plan_history") or [])
             history.append(
                 {
                     "kind": current.get("active_plan_kind") or "implementation",
                     "plan": plan.model_dump(mode="json"),
+                    "quick_check": quick_result.model_dump(mode="json"),
+                    "final_check": (
+                        final_result.model_dump(mode="json") if final_result is not None else None
+                    ),
                     "check": result.model_dump(mode="json"),
                 }
             )
             current["plan_history"] = history[-MAX_PLAN_HISTORY:]
-            failure = None if result.ok else analyze_check_failure(result)
-            excerpt = "" if failure is None else failure.excerpt
+            quick_failure = None if quick_result.ok else analyze_check_failure(quick_result)
+            quick_excerpt = "" if quick_failure is None else quick_failure.excerpt
             _append_activity(
                 current,
-                name="check_result",
-                label="Checks passed" if result.ok else "Checks failed",
-                detail=(result.summary if result.ok else f"{result.summary}：{excerpt}"),
-                ok=result.ok,
+                name="quick_check_result",
+                label="Quick checks passed" if quick_result.ok else "Quick checks failed",
+                detail=(
+                    quick_result.summary
+                    if quick_result.ok
+                    else f"{quick_result.summary}：{quick_excerpt}"
+                ),
+                ok=quick_result.ok,
             )
+
+            if quick_result.ok and preview_snapshot is not None and preview_source_hash is not None:
+                artifact = persist_source_artifact(
+                    db,
+                    project_id=state["project_id"],
+                    snapshot_bytes=preview_snapshot,
+                    source_hash=preview_source_hash,
+                )
+                event = append_event(
+                    db,
+                    idempotency_key=(
+                        f"preview-revision:{state['build_run_id']}:"
+                        f"{work_item.id}:{preview_source_hash}"
+                    ),
+                    stream_key=f"preview:{state['build_run_id']}",
+                    event_type="preview_revision_published",
+                    project_id=state["project_id"],
+                    build_run_id=state["build_run_id"],
+                    task_id=state["task_id"],
+                    execution_id=execution.execution_id,
+                    payload={
+                        "source_hash": preview_source_hash,
+                        "source_artifact_id": artifact.artifact_id,
+                        "work_item_id": work_item.id,
+                        "work_item_title": work_item.title,
+                        "check_id": "quick",
+                        "check_runtime_version": check_tools.CHECK_RUNTIME_VERSION,
+                    },
+                )
+                current["preview_revision"] = {
+                    "revision": event.sequence,
+                    "source_hash": preview_source_hash,
+                    "source_artifact_id": artifact.artifact_id,
+                    "work_item_id": work_item.id,
+                }
+                _append_activity(
+                    current,
+                    name="preview_revision_published",
+                    label="Preview revision ready",
+                    detail=f"Revision {event.sequence} · {work_item.title}",
+                    ok=True,
+                )
+
+            if final_result is not None:
+                final_failure = None if final_result.ok else analyze_check_failure(final_result)
+                final_excerpt = "" if final_failure is None else final_failure.excerpt
+                _append_activity(
+                    current,
+                    name="final_check_result",
+                    label="Final checks passed" if final_result.ok else "Final checks failed",
+                    detail=(
+                        final_result.summary
+                        if final_result.ok
+                        else f"{final_result.summary}：{final_excerpt}"
+                    ),
+                    ok=final_result.ok,
+                )
+
+            failure = None if result.ok else analyze_check_failure(result)
+            excerpt = "" if failure is None else failure.excerpt
             if result.ok:
                 streaks = current.get("failure_streaks")
                 if isinstance(streaks, dict):
@@ -1121,52 +1524,32 @@ class _EngineeringNodes:
                 current_raw = _current_item(current["work_items"])
                 if current_raw is None or current_raw.get("id") != work_item.id:
                     raise ConflictException("当前工作单元已变化")
-                deferred_raw = current.get("deferred_file_plan")
-                deferred = deferred_raw if isinstance(deferred_raw, list) else []
-                pending_deferred = [item for item in deferred if isinstance(item, dict)]
-                if pending_deferred:
-                    next_plan, remaining = _promote_deferred_batch(
-                        work_item=work_item, deferred=pending_deferred
-                    )
-                    current["active_file_plan"] = next_plan.model_dump(mode="json")
-                    current["active_plan_kind"] = "implementation"
-                    current["deferred_file_plan"] = remaining
-                    current["repair_context"] = None
-                    _append_activity(
-                        current,
-                        name="plan_ready",
-                        label="Continue file batch",
-                        detail=next_plan.summary,
-                        ok=True,
-                    )
-                else:
-                    current_raw["status"] = "completed"
-                    current_raw["summary"] = plan.summary[:500]
-                    current["active_file_plan"] = None
-                    current["active_plan_kind"] = None
-                    current["deferred_file_plan"] = []
-                    current["repair_context"] = None
-                    next_item = _current_item(current["work_items"])
-                    current["current_work_item_id"] = next_item["id"] if next_item else None
-                    _append_activity(
-                        current,
-                        name="work_item_complete",
-                        label="Work item complete",
-                        detail=work_item.title,
-                        ok=True,
-                    )
-                    if next_item is None:
-                        source_hash = result.data.get("source_hash")
-                        if not isinstance(source_hash, str):
-                            raise ConflictException("完整检查没有返回源码 hash")
-                        current["outcome"] = "generated"
-                        current["completed_source_hash"] = source_hash
+                current_raw["status"] = "completed"
+                current_raw["summary"] = plan.summary[:500]
+                current["active_file_plan"] = None
+                current["active_plan_kind"] = None
+                current["deferred_file_plan"] = []
+                current["repair_context"] = None
+                next_item = _current_item(current["work_items"])
+                current["current_work_item_id"] = next_item["id"] if next_item else None
+                _append_activity(
+                    current,
+                    name="work_item_complete",
+                    label="Work item complete",
+                    detail=work_item.title,
+                    ok=True,
+                )
+                if next_item is None:
+                    source_hash = result.data.get("source_hash")
+                    if not isinstance(source_hash, str):
+                        raise ConflictException("完整检查没有返回源码 hash")
+                    current["outcome"] = "generated"
+                    current["completed_source_hash"] = source_hash
             elif result.error_code == "CHECK_ENVIRONMENT_UNAVAILABLE":
                 _block_checkpoint(current, result.summary, reason_code=result.error_code)
             else:
                 assert failure is not None
                 fingerprint = failure.fingerprint
-                excerpt = failure.excerpt
                 streaks = current.get("failure_streaks")
                 streaks = streaks if isinstance(streaks, dict) else {}
                 previous = streaks.get(work_item.id)
@@ -1207,14 +1590,17 @@ class _EngineeringNodes:
                 elif unchanged_source >= MAX_UNCHANGED_SOURCE_FAILURES:
                     _block_checkpoint(
                         current,
-                        (f"源码连续 {unchanged_source} 次未发生变化，停止无进展修复：{excerpt}"),
+                        f"源码连续 {unchanged_source} 次未发生变化，停止无进展修复：{excerpt}",
                         reason_code="NO_SOURCE_PROGRESS",
                         check_runtime_version=check_tools.CHECK_RUNTIME_VERSION,
                     )
                 elif round_number > _call_budget(current_snapshot, "max_repair_rounds"):
+                    reason = "自动修复轮次已用尽，校验仍未通过"
+                    if excerpt.strip():
+                        reason = f"{reason}：{excerpt.strip()}"
                     _block_checkpoint(
                         current,
-                        "自动修复轮次已用尽，完整检查仍未通过",
+                        reason[:500],
                         reason_code="REPAIR_BUDGET_EXHAUSTED",
                         check_runtime_version=check_tools.CHECK_RUNTIME_VERSION,
                     )
@@ -1222,15 +1608,13 @@ class _EngineeringNodes:
                     current["repair_context"] = {
                         "round": round_number,
                         "failed_check": result.model_dump(mode="json"),
-                        "diagnostics": [
-                            diagnostic.to_payload() for diagnostic in failure.diagnostics
-                        ],
+                        "excerpt": excerpt,
+                        "diagnostics": _repair_diagnostics(failure),
                         "previous_plan": plan.model_dump(mode="json"),
                         "modified_files": list(current.get("modified_files") or []),
                     }
                     current["active_file_plan"] = None
                     current["active_plan_kind"] = None
-                    # Keep deferred_file_plan so overflow still runs after repair succeeds.
             current_snapshot["checkpoint"] = current
             _save_snapshot(db, execution.execution_id, current_snapshot)
             renew_execution_lease(db, state["task_id"], execution.execution_id)

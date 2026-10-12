@@ -108,7 +108,9 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
     def setUp(self) -> None:
         directory = self.enterContext(TemporaryDirectory(prefix="forgeai-pm-workflow-test-"))
         self.workspace_root = self.enterContext(TemporaryDirectory(prefix="forgeai-ws-"))
+        self.artifact_root = self.enterContext(TemporaryDirectory(prefix="forgeai-artifacts-"))
         self.enterContext(patch.object(settings, "runtime_data_root", self.workspace_root))
+        self.enterContext(patch.object(settings, "source_artifact_root", self.artifact_root))
         self.engine = create_engine(
             f"sqlite+pysqlite:///{Path(directory) / 'workflow.db'}",
             connect_args={"check_same_thread": False, "timeout": 10},

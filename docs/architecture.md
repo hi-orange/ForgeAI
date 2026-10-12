@@ -38,6 +38,19 @@ turned into an isolated, traceable and recoverable generated application.
 13. Publication is a separate gate after acceptance. A Deployment binds one successful BuildRun to a
     provider attempt, PostgreSQL instance, secret reference, image identity, URL, bounded logs and
     rollback lineage. Preview success is never treated as publication success.
+14. Long-running role and deployment work is represented by a durable `WorkflowJob`, not by an
+    in-process background thread. A worker claims one job with a renewable lease; a lost lease fences
+    the old `TaskExecution`, preserves its checkpoint, and creates a new recovery attempt.
+15. Workflow history is an append-only `WorkflowEvent` stream. Mutable task checkpoints remain useful
+    for resuming tools, while UI timelines and audit/replay evidence consume immutable activity, job
+    and decision facts with stable idempotency keys.
+16. A published code result includes an immutable `SourceArtifact` pointer to a content-addressed,
+    integrity-checked source snapshot stored outside disposable `runtime-data`. Test, preview,
+    deployment and revision handoffs may rehydrate a missing workspace only from that exact
+    `code_item_id` and `source_hash`; an existing mismatched workspace is never overwritten silently.
+17. Independent security scanning is a sibling of acceptance, not a Test Engineer prompt convention.
+    An immutable `SecurityReport` binds the exact code item, source hash and scanner version. A
+    current passing report is required before deployment.
 
 ## Rule priority
 
@@ -51,8 +64,8 @@ turned into an isolated, traceable and recoverable generated application.
 ## Delivery state transitions
 
 `message -> classification -> app_spec draft -> awaiting_approval -> approved app_spec -> architecture
-decision -> code candidate -> smoke gate -> immutable code artifact -> acceptance gate -> release or
-bounded repair`
+decision -> code candidate -> smoke gate -> durable source snapshot -> immutable code artifact ->
+acceptance gate -> release or bounded repair`
 
 After a terminal run, a new message follows
 `message -> classification -> RunRevision -> new BuildRun -> approval or repair -> independent gates`.
@@ -79,14 +92,30 @@ gates.
   ownership and frozen inputs before creating tasks.
 - The validated decision is persisted before side effects. Retries replay the same decision key rather
   than invoking Leader again, and the event records whether application succeeded or failed.
+- Product Manager recovery and Architect, Code Engineer, Test Engineer and Deployment handoffs use
+  idempotent database jobs.
+  Development may embed one worker in the API process. Production disables the embedded worker and
+  runs one or more `python -m app.worker` processes against the same database.
+- Workers heartbeat both their job lease and attached task execution. Periodic recovery first requeues
+  expired jobs, then replays old unapplied decisions and scans for legacy/orphaned expired executions,
+  old pending tasks, and queued deployments that have no active job. A grace period prevents recovery
+  from racing the request that originally created a decision or task. Conditional claims and active
+  execution slots prevent duplicate workers from publishing the same result.
 
 ## Evaluation and release evidence
 
-- Project Eval aggregates end-to-end success, acceptance results, first-attempt completion, repair
-  rounds, routing-contract validity, unnecessary Leader use, trajectory completeness, replayability,
-  elapsed time, tokens and configured cost from persisted records.
+- Project Eval is production telemetry over persisted runs. It aggregates end-to-end success,
+  acceptance results, first-attempt completion, Code Engineer repair rounds, routing-contract
+  validity, unnecessary Leader use, trajectory completeness, security results, elapsed time, tokens
+  and configured cost. Infrastructure retries are not counted as code repair rounds.
 - Classification and routing accuracy are reported only when a human or benchmark label exists. An
   unlabelled production trace is marked unavailable, not counted as correct by construction.
+- Fixed benchmark suites live under `benchmarks/`, are immutable by version and content-hashed when
+  loaded. Scoring consumes captured observations and records per-case routing, architecture,
+  end-to-end, security, repair-budget, trajectory, latency, token and cost evidence. Golden fixtures
+  validate the scorer contract; they are not evidence of model quality.
+- Schema first-pass and regression pass remain unavailable until attempt-level schema evidence and an
+  independently labelled regression field are persisted; final success is never reused to invent them.
 - CI builds the isolated check image and runs the pinned template through database migration, real API,
   frontend build and Chromium screenshot checks. Unit mocks remain useful but do not replace this gate.
 - The initial publication provider is bounded Docker Compose: generated backend/frontend images and a

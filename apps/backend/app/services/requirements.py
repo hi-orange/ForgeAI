@@ -18,6 +18,7 @@ from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
+from app.models.workflow_event import WorkflowEvent
 from app.orchestration.code_engineer import EXECUTION_MODE
 from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
 from app.orchestration.product_manager import run_product_manager_workflow
@@ -59,6 +60,7 @@ from app.services.engineering import (
     read_frozen_input_snapshot,
 )
 from app.services.leader import create_clarification_plan, create_product_revision_plan
+from app.services.run_control import cancel_active_run
 from app.services.task_execution import fail_execution, latest_execution, lock_run, utc_now
 from app.services.test_engineer import load_test_inputs
 
@@ -630,6 +632,15 @@ def pause_active_execution(
     return get_requirements_status(db, user, project_id)
 
 
+def cancel_active_execution(
+    db: Session, user: User, project_id: int, run_id: str
+) -> RequirementsStatus:
+    """Cancel every active owner and expose the resulting terminal project status."""
+
+    cancel_active_run(db, user, project_id, run_id)
+    return get_requirements_status(db, user, project_id)
+
+
 def _activities_from_checkpoint(checkpoint: object) -> list[EngineeringActivity]:
     if not isinstance(checkpoint, dict):
         return []
@@ -679,22 +690,40 @@ def _activities_for_run(db: Session, run_id: str) -> list[EngineeringActivity]:
             )
         ).all()
     }
+    events_by_execution: dict[str, list[dict[str, object]]] = {}
+    for event in db.scalars(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.build_run_id == run_id,
+            WorkflowEvent.event_type == "activity",
+            WorkflowEvent.execution_id.in_(execution_ids),
+        )
+        .order_by(WorkflowEvent.created_at, WorkflowEvent.event_id)
+    ):
+        if event.execution_id is not None and isinstance(event.payload, dict):
+            events_by_execution.setdefault(event.execution_id, []).append(dict(event.payload))
 
     previous_by_task: dict[str, list[dict[str, object]]] = {}
     activities: list[EngineeringActivity] = []
     for task_id, title, recipient, execution_id, attempt in ordered:
-        draft = drafts.get(execution_id)
-        draft = draft if isinstance(draft, dict) else None
-        checkpoint = draft.get("checkpoint") if draft else None
-        raw_items = (
-            [item for item in checkpoint.get("activity") or [] if isinstance(item, dict)]
-            if isinstance(checkpoint, dict)
-            else []
-        )
-        previous = previous_by_task.get(task_id, [])
-        prefix_matches = len(raw_items) >= len(previous) and raw_items[: len(previous)] == previous
-        visible_items = raw_items[len(previous) :] if prefix_matches else raw_items
-        previous_by_task[task_id] = raw_items
+        event_items = events_by_execution.get(execution_id)
+        if event_items is not None:
+            visible_items = event_items
+        else:
+            draft = drafts.get(execution_id)
+            draft = draft if isinstance(draft, dict) else None
+            checkpoint = draft.get("checkpoint") if draft else None
+            raw_items = (
+                [item for item in checkpoint.get("activity") or [] if isinstance(item, dict)]
+                if isinstance(checkpoint, dict)
+                else []
+            )
+            previous = previous_by_task.get(task_id, [])
+            prefix_matches = (
+                len(raw_items) >= len(previous) and raw_items[: len(previous)] == previous
+            )
+            visible_items = raw_items[len(previous) :] if prefix_matches else raw_items
+            previous_by_task[task_id] = raw_items
         # Recovery attempts are continuations of the same role assignment. Exposing every
         # TaskExecution as a new chat block made one failed work item appear dozens of times.
         for index, raw in enumerate(visible_items, start=1):
@@ -719,6 +748,8 @@ def _checkpoint_has_written_code(checkpoint: object) -> bool:
         return False
     if checkpoint.get("outcome") == "generated":
         return True
+    if checkpoint.get("modified_files"):
+        return True
     for item in checkpoint.get("observations") or []:
         if (
             isinstance(item, dict)
@@ -732,6 +763,27 @@ def _checkpoint_has_written_code(checkpoint: object) -> bool:
 def _attach_workspace_status(db: Session, result: RequirementsStatus) -> RequirementsStatus:
     if result.run_id is not None:
         result.activities = _activities_for_run(db, result.run_id)
+        preview_event = db.scalar(
+            select(WorkflowEvent)
+            .where(
+                WorkflowEvent.stream_key == f"preview:{result.run_id}",
+                WorkflowEvent.event_type == "preview_revision_published",
+            )
+            .order_by(WorkflowEvent.sequence.desc())
+            .limit(1)
+        )
+        if preview_event is not None and isinstance(preview_event.payload, dict):
+            payload = preview_event.payload
+            source_hash = payload.get("source_hash")
+            work_item_id = payload.get("work_item_id")
+            work_item_title = payload.get("work_item_title")
+            result.preview_revision = preview_event.sequence
+            result.preview_source_hash = source_hash if isinstance(source_hash, str) else None
+            result.preview_work_item_id = work_item_id if isinstance(work_item_id, str) else None
+            result.preview_work_item_title = (
+                work_item_title if isinstance(work_item_title, str) else None
+            )
+            result.preview_updated_at = preview_event.created_at
     if result.run_id is None or result.state not in (
         "design_pending",
         "design_running",

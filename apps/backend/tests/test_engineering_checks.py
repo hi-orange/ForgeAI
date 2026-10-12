@@ -226,6 +226,16 @@ class EngineeringCheckTests(unittest.TestCase):
         self.assertEqual(cleanup.call_args.args[0][0:3], ["docker", "rm", "-f"])
         self.assertTrue(cleanup.call_args.args[0][-1].startswith("forgeai-check-"))
 
+    def test_security_failure_has_distinct_error_code(self):
+        with (
+            patch("app.tools.checks.shutil.which", return_value="docker"),
+            patch("app.tools.checks._execute", return_value=(3, "blocked", False)),
+            patch("app.tools.checks.subprocess.run"),
+        ):
+            result = run_check(self.root, check_id="security")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "SECURITY_CHECK_FAILED")
+
     def test_timeout_also_removes_container(self):
         with (
             patch("app.tools.checks.shutil.which", return_value="docker"),
@@ -256,6 +266,12 @@ class EngineeringCheckTests(unittest.TestCase):
         os.getenv("FORGEAI_TEST_DOCKER") == "1", "requires built check image and Docker"
     )
     def test_real_template_checks_and_browser_screenshots(self):
+        security = run_check(self.root, check_id="security")
+        quick = run_check(self.root, check_id="quick")
+        self.assertTrue(quick.ok, quick.model_dump())
+        self.assertIn("tsc", quick.data["output"])
+        self.assertTrue(security.ok, security.model_dump())
+        self.assertIn("FORGEAI_SECURITY_REPORT=", security.data["output"])
         result = run_check(self.root, check_id="all")
         self.assertTrue(result.ok, result.model_dump())
         self.assertIn("实际表结构", result.data["output"])

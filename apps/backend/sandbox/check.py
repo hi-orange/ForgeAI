@@ -31,6 +31,8 @@ CSS_VARIABLE_PATTERN = re.compile(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;]+);")
 REQUIRED_THEME_TOKENS = {"--color-primary", "--color-accent", "--color-muted"}
 BINARY_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
+SECURITY_SCANNER_VERSION = "forgeai-security-v1"
+SECURITY_REPORT_PREFIX = "FORGEAI_SECURITY_REPORT="
 
 
 def command(argv, cwd, timeout=90):
@@ -70,6 +72,183 @@ def materialize(files):
         path.write_bytes(payload)
     os.environ["DATABASE_URL"] = f"sqlite:///{DATABASE}"
     os.environ["DEBUG"] = "false"
+
+
+def scan_security(root=ROOT):
+    """Run deterministic rules owned by the platform, not generated source."""
+    findings = []
+
+    def add(rule_id, severity, path, line, message, evidence=None):
+        if len(findings) < 40:
+            safe_evidence = (
+                "[REDACTED]"
+                if rule_id in {"PRIVATE_KEY", "CLOUD_ACCESS_KEY"}
+                else ((evidence or "")[:300] or None)
+            )
+            findings.append(
+                {
+                    "rule_id": rule_id,
+                    "severity": severity,
+                    "path": path,
+                    "line": line,
+                    "message": message,
+                    "evidence": safe_evidence,
+                }
+            )
+
+    source_rules = [
+        (
+            "PY_DYNAMIC_EXECUTION",
+            "high",
+            re.compile(r"\b(?:eval|exec)\s*\("),
+            "动态执行字符串可能造成代码注入",
+        ),
+        ("PY_OS_COMMAND", "high", re.compile(r"\bos\.system\s*\("), "os.system 可能造成命令注入"),
+        (
+            "PY_UNSAFE_PICKLE",
+            "high",
+            re.compile(r"\bpickle\.loads?\s*\("),
+            "反序列化不可信 pickle 可执行任意代码",
+        ),
+        (
+            "JS_DYNAMIC_EXECUTION",
+            "high",
+            re.compile(r"\b(?:eval\s*\(|new\s+Function\s*\()"),
+            "动态 JavaScript 执行可能造成代码注入",
+        ),
+        (
+            "REACT_UNSAFE_HTML",
+            "high",
+            re.compile(r"dangerouslySetInnerHTML"),
+            "直接注入 HTML 需要独立净化与审计",
+        ),
+        (
+            "CONTAINER_PRIVILEGED",
+            "critical",
+            re.compile(
+                r"(?:privileged\s*:\s*true|network_mode\s*:\s*host|/var/run/docker\.sock)",
+                re.I,
+            ),
+            "生成应用不得获得宿主机或 Docker daemon 权限",
+        ),
+        (
+            "PRIVATE_KEY",
+            "critical",
+            re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+            "源码中包含私钥",
+        ),
+        (
+            "CLOUD_ACCESS_KEY",
+            "critical",
+            re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+            "源码中包含云访问密钥",
+        ),
+    ]
+    allowed_suffixes = {
+        ".py",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".json",
+        ".toml",
+        ".yml",
+        ".yaml",
+        ".env",
+    }
+    for file in sorted(root.rglob("*")):
+        if not file.is_file() or "node_modules" in file.parts or ".git" in file.parts:
+            continue
+        relative = file.relative_to(root).as_posix()
+        if file.suffix.lower() not in allowed_suffixes and file.name not in {
+            "Dockerfile",
+            "package.json",
+            "pyproject.toml",
+        }:
+            continue
+        try:
+            content = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        lines = content.splitlines()
+        for rule_id, severity, pattern, message in source_rules:
+            for index, line in enumerate(lines, 1):
+                if pattern.search(line):
+                    add(rule_id, severity, relative, index, message, line.strip())
+        if file.suffix == ".py":
+            for index, line in enumerate(lines, 1):
+                shell_call = re.search(
+                    r"subprocess\.(?:run|Popen|call|check_call|check_output)\s*\(",
+                    line,
+                )
+                if shell_call and re.search(r"shell\s*=\s*True", line):
+                    add(
+                        "PY_SHELL_TRUE",
+                        "high",
+                        relative,
+                        index,
+                        "subprocess shell=True 可能造成命令注入",
+                        line.strip(),
+                    )
+        if relative == "frontend/package.json":
+            try:
+                package = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            for section in ("dependencies", "devDependencies"):
+                dependencies = package.get(section) or {}
+                if not isinstance(dependencies, dict):
+                    continue
+                for name, version in dependencies.items():
+                    value = str(version).strip().lower()
+                    unpinned = value in {"*", "latest"} or value.startswith(
+                        (
+                            "git+",
+                            "github:",
+                            "file:",
+                            "http://",
+                            "https://",
+                        )
+                    )
+                    if unpinned:
+                        add(
+                            "UNPINNED_NPM_SOURCE",
+                            "high",
+                            relative,
+                            None,
+                            f"依赖 {name} 使用未受控来源或浮动版本",
+                            str(version),
+                        )
+        if relative == "backend/pyproject.toml":
+            try:
+                dependencies = tomllib.loads(content).get("project", {}).get("dependencies", [])
+            except tomllib.TOMLDecodeError:
+                dependencies = []
+            for dependency in dependencies:
+                value = str(dependency).lower()
+                if " @ " in value or value.startswith(("git+", "http://", "https://", "file:")):
+                    add(
+                        "UNPINNED_PYTHON_SOURCE",
+                        "high",
+                        relative,
+                        None,
+                        "Python 依赖使用未受控直接来源",
+                        str(dependency),
+                    )
+    blocking = any(item["severity"] in {"high", "critical"} for item in findings)
+    return {
+        "scanner_version": SECURITY_SCANNER_VERSION,
+        "conclusion": "failed" if blocking else "passed",
+        "findings": findings,
+    }
+
+
+def security():
+    report = scan_security(ROOT)
+    payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    print(SECURITY_REPORT_PREFIX + payload, flush=True)
+    if report["conclusion"] != "passed":
+        raise SystemExit(3)
 
 
 FRONTEND_BIN_SCRIPTS = {
@@ -183,6 +362,27 @@ def ensure_backend_dependencies(backend: Path):
         backend,
         timeout=180,
     )
+
+
+def quick():
+    """Cheap per-work-item gate: syntax and TypeScript contracts, no build or runtime smoke."""
+
+    backend_root = ROOT / "backend"
+    command(["python", "-m", "compileall", "-q", "app", "alembic"], backend_root)
+    frontend_root = ROOT / "frontend"
+    ensure_frontend_dependencies()
+    package = json.loads((frontend_root / "package.json").read_text(encoding="utf-8"))
+    dependencies = {
+        **(package.get("dependencies") or {}),
+        **(package.get("devDependencies") or {}),
+    }
+    if "typescript" not in dependencies:
+        raise ValueError("frontend/package.json 必须配置 TypeScript 检查器")
+    build_config = frontend_root / "tsconfig.build.json"
+    if build_config.is_file():
+        frontend_command("tsc", "-p", build_config.name)
+    else:
+        frontend_command("tsc", "--noEmit")
 
 
 def database():
@@ -663,12 +863,16 @@ def visual(route):
 
 def main():
     check = sys.argv[1]
-    if check not in {"database", "backend", "frontend", "all", "visual"}:
+    if check not in {"quick", "database", "backend", "frontend", "all", "visual", "security"}:
         raise ValueError("Unknown check")
     materialize(json.load(sys.stdin))
-    if check == "database":
+    if check == "quick":
+        quick()
+    elif check == "database":
         database()
-    if check == "all":
+    elif check == "security":
+        security()
+    elif check == "all":
         runtime_smoke()
     elif check == "visual":
         visual(sys.argv[2] if len(sys.argv) > 2 else "/")

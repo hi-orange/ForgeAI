@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Any
 
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from app.models.task import Task
 from app.models.user import User
@@ -15,9 +14,6 @@ from app.services import leader as leader_service
 from app.services.engineering import claim_code_engineer_task, start_claimed_engineering
 
 logger = logging.getLogger("forgeai")
-
-_active_architecture_tasks: set[str] = set()
-_active_architecture_lock = threading.Lock()
 
 
 def start_dispatched_delivery(
@@ -47,49 +43,23 @@ def start_dispatched_delivery(
     if task.recipient != "Architect":
         raise ValueError(f"Leader 分派了不支持自动启动的角色：{task.recipient}")
 
-    with _active_architecture_lock:
-        if task.task_id in _active_architecture_tasks:
-            return {"started": False, "task_id": task.task_id, "already_running": True}
-        _active_architecture_tasks.add(task.task_id)
+    from app.services.workflow_jobs import enqueue_job
 
-    if db.new or db.dirty or db.deleted:
-        db.commit()
-    bind = db.get_bind()
-    user_id = user.id
-    task_id = task.task_id
-
-    def worker() -> None:
-        factory = sessionmaker(
-            bind=bind,
-            autocommit=False,
-            autoflush=False,
-            expire_on_commit=False,
-        )
-        try:
-            with factory() as session:
-                owner = session.get(User, user_id)
-                if owner is None:
-                    logger.error("architecture task owner missing task_id=%s", task_id)
-                    return
-                run_architect_and_continue(
-                    session,
-                    owner,
-                    project_id,
-                    run_id,
-                    task_id,
-                )
-        except Exception:
-            logger.exception("architecture delivery failed task_id=%s", task_id)
-        finally:
-            with _active_architecture_lock:
-                _active_architecture_tasks.discard(task_id)
-
-    threading.Thread(
-        target=worker,
-        daemon=True,
-        name=f"forgeai-architect-{task_id[:12]}",
-    ).start()
-    return {"started": True, "task_id": task_id}
+    job = enqueue_job(
+        db,
+        job_type="architect",
+        idempotency_key=f"architect:{task.task_id}",
+        project_id=project_id,
+        build_run_id=run_id,
+        task_id=task.task_id,
+        payload={
+            "user_id": user.id,
+            "project_id": project_id,
+            "run_id": run_id,
+            "task_id": task.task_id,
+        },
+    )
+    return {"started": True, "task_id": task.task_id, "job_id": job.job_id}
 
 
 def run_architect_and_continue(

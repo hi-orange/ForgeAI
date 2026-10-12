@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import ConflictException
 from app.models.agent_decision_event import AgentDecisionEvent
 from app.schemas.leader import NextAction
+from app.services.workflow_events import append_event
 
 
 def get_decision(db: Session, decision_key: str) -> tuple[AgentDecisionEvent, NextAction] | None:
@@ -56,6 +57,15 @@ def record_decision(
     )
     db.add(event)
     try:
+        append_event(
+            db,
+            idempotency_key=f"decision:{decision_key}:recorded",
+            stream_key=f"decision:{decision_key}",
+            event_type="decision_recorded",
+            project_id=project_id,
+            build_run_id=build_run_id,
+            payload={"action": action.action.value, "reason_code": action.reason_code},
+        )
         db.commit()
     except Exception:
         db.rollback()
@@ -78,6 +88,15 @@ def mark_applied(db: Session, decision_key: str) -> None:
         event.status = "applied"
         event.applied_at = datetime.now(UTC).replace(tzinfo=None)
         event.error = None
+        append_event(
+            db,
+            idempotency_key=f"decision:{decision_key}:applied",
+            stream_key=f"decision:{decision_key}",
+            event_type="decision_applied",
+            project_id=event.project_id,
+            build_run_id=event.build_run_id,
+            payload={"action": event.action},
+        )
         db.commit()
 
 
@@ -92,6 +111,15 @@ def mark_failed(db: Session, decision_key: str, error: Exception) -> None:
         return
     event.status = "failed"
     event.error = (str(error).strip() or error.__class__.__name__)[:4000]
+    append_event(
+        db,
+        idempotency_key=f"decision:{decision_key}:failed:{event.error[:80]}",
+        stream_key=f"decision:{decision_key}",
+        event_type="decision_failed",
+        project_id=event.project_id,
+        build_run_id=event.build_run_id,
+        payload={"action": event.action, "error": event.error},
+    )
     db.commit()
 
 

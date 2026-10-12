@@ -13,6 +13,7 @@ from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
 from app.services import project as project_service
 from app.services.requirements import get_requirements_status
+from app.services.source_artifact import ensure_code_workspace
 
 _SKIP_DIRS = {
     ".git",
@@ -105,6 +106,16 @@ def _file_kind(path: Path) -> WorkspaceFileKind | None:
 def list_project_workspace(db: Session, user: User, project_id: int) -> WorkspaceListing:
     project_service.get_user_project(db, user, project_id)
     status = get_requirements_status(db, user, project_id)
+    if status.run_id is not None and status.code_item_id and not status.workspace_ready:
+        _, restored = ensure_code_workspace(
+            db,
+            project_id=project_id,
+            run_id=status.run_id,
+            code_item_id=status.code_item_id,
+        )
+        if restored:
+            db.commit()
+            status.workspace_ready = True
     if (
         status.run_id is None
         or not status.workspace_ready
@@ -141,6 +152,16 @@ def read_project_workspace_file(
 ) -> WorkspaceFileContent:
     project_service.get_user_project(db, user, project_id)
     status = get_requirements_status(db, user, project_id)
+    if status.run_id is not None and status.code_item_id and not status.workspace_ready:
+        _, restored = ensure_code_workspace(
+            db,
+            project_id=project_id,
+            run_id=status.run_id,
+            code_item_id=status.code_item_id,
+        )
+        if restored:
+            db.commit()
+            status.workspace_ready = True
     if (
         status.run_id is None
         or not status.workspace_ready
