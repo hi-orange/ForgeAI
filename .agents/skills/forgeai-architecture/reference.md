@@ -44,7 +44,8 @@
 
 ## Runtime and release
 
-- Pause is resumable execution fencing; cancel atomically closes execution, task, plan and BuildRun.
+- Pause blocks new job claims for the BuildRun, releases active leases, fences any active execution,
+  and preserves queued work and checkpoints for explicit resume.
 - Eval metrics come from persisted runs, reports, decisions and model-usage events. Accuracy requires
   external labels; absent labels are reported as unavailable.
 - Preview is local inspection. Deployment is a separate accepted-source record with provider status,

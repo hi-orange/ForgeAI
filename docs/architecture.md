@@ -29,9 +29,10 @@ turned into an isolated, traceable and recoverable generated application.
     new `BuildRun` with an explicit `RunRevision` edge to the exact prior app specification and code
     baseline. Product changes return to approval; repairs retain approved intent and receive a new
     code identity and acceptance run.
-11. Stop and pause are different transitions. Pause fences only the active execution and remains
-    resumable. Cancel atomically closes the active execution, task, plan and BuildRun with a durable
-    `cancelled` state while preserving historical artifacts.
+11. Stop and pause are different transitions. Pause prevents new job claims for the BuildRun,
+    releases any current job lease, fences the active execution, and preserves queued work and
+    checkpoints for explicit resume. Cancel atomically closes the active execution, task, plan and
+    BuildRun with a durable `cancelled` state while preserving historical artifacts.
 12. Every routing outcome is a persisted, idempotent `AgentDecisionEvent`. Model turns record measured
     latency and provider token usage; configured model rates may additionally produce estimated cost.
     Eval reports distinguish metrics backed by evidence from metrics that require human labels.

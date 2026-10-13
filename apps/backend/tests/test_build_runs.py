@@ -1,10 +1,14 @@
+import importlib.util
 import re
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, func, inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -233,6 +237,29 @@ class BuildRunApiTests(unittest.TestCase):
 
         self.assertIn("post", paths["/api/v1/projects/{project_id}/build-runs"])
         self.assertIn("get", paths["/api/v1/projects/{project_id}/build-runs/{run_id}"])
+
+    def test_pause_migration_adds_and_removes_paused_at(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "alembic/versions/f3a5c7e9b1d2_add_build_run_pause.py"
+        )
+        spec = importlib.util.spec_from_file_location("build_run_pause_migration", path)
+        assert spec is not None and spec.loader is not None
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+
+        engine = create_engine("sqlite:///:memory:")
+        with engine.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE build_run (id INTEGER PRIMARY KEY)")
+            migration.op = Operations(MigrationContext.configure(connection))
+            migration.upgrade()
+            columns = {column["name"] for column in inspect(connection).get_columns("build_run")}
+            self.assertIn("paused_at", columns)
+            migration.downgrade()
+            columns = {column["name"] for column in inspect(connection).get_columns("build_run")}
+            self.assertNotIn("paused_at", columns)
+
+        engine.dispose()
 
     def test_database_rejects_two_active_slots_for_one_project(self) -> None:
         with self.session_factory() as db:

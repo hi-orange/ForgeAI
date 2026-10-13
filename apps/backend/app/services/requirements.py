@@ -5,6 +5,7 @@ import logging
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.exceptions import BusinessException, ConflictException
 from app.core.settings import settings
@@ -19,7 +20,11 @@ from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
-from app.orchestration.code_engineer import EXECUTION_MODE
+from app.orchestration.code_engineer import (
+    EXECUTION_MODE,
+    is_terminal_engineering_failure,
+    prepare_manual_repair_retry,
+)
 from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.orchestration.test_engineer import run_test_engineer_task
@@ -63,6 +68,8 @@ from app.services.leader import create_clarification_plan, create_product_revisi
 from app.services.run_control import cancel_active_run
 from app.services.task_execution import fail_execution, latest_execution, lock_run, utc_now
 from app.services.test_engineer import load_test_inputs
+from app.services.workflow_events import append_event
+from app.services.workflow_jobs import PAUSED_JOB_ERROR, pause_jobs_for_run
 
 logger = logging.getLogger("forgeai")
 
@@ -328,6 +335,15 @@ def continue_requirements(db: Session, user: User, project_id: int) -> Requireme
     status = get_requirements_status(db, user, project_id)
     if not status.run_id:
         raise BusinessException("当前没有可继续的构建")
+    run = db.scalar(select(BuildRun).where(BuildRun.run_id == status.run_id))
+    if run is not None and run.paused_at is not None:
+        locked_run = lock_run(db, user, project_id, status.run_id)
+        if locked_run.paused_at is not None:
+            locked_run.paused_at = None
+            db.commit()
+            return get_requirements_status(db, user, project_id)
+        db.rollback()
+
     if status.state == "retry_available" and not status.retryable:
         raise ConflictException(status.error or "相同错误已达到自动修复上限")
 
@@ -550,6 +566,65 @@ def _resume_engineering_from_retry(
     return get_requirements_status(db, user, project_id)
 
 
+def retry_terminal_engineering(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+) -> RequirementsStatus:
+    """Start one user-requested, bounded repair attempt after an automatic stop-loss."""
+
+    status = get_requirements_status(db, user, project_id)
+    if status.run_id != run_id:
+        raise ConflictException("构建任务不匹配")
+    if (
+        status.state != "retry_available"
+        or status.retryable
+        or not status.task_id
+        or not status.execution_id
+    ):
+        raise ConflictException("当前构建不需要重新分析修复")
+
+    current_task = task_service.get_user_task(db, user, project_id, status.task_id)
+    if current_task.recipient != "Code Engineer":
+        raise ConflictException("当前失败不是代码修复任务")
+    if engineering.is_engineering_active(status.execution_id):
+        raise ConflictException("工程任务仍在收尾，请稍后刷新")
+
+    previous = latest_execution(db, status.task_id, lock=True)
+    if previous is None or previous.execution_id != status.execution_id:
+        raise ConflictException("工程执行状态已变化，请刷新后重试")
+    snapshot = read_frozen_input_snapshot(previous)
+    if snapshot is None:
+        raise ConflictException("工程执行缺少冻结输入快照")
+    prepared = prepare_manual_repair_retry(snapshot)
+
+    task, execution = engineering.claim_code_engineer_task(
+        db,
+        user,
+        project_id,
+        run_id,
+        status.task_id,
+        recovery_execution_id=status.execution_id,
+    )
+    execution.draft = prepared
+    flag_modified(execution, "draft")
+    append_event(
+        db,
+        idempotency_key=f"engineering_manual_retry:{execution.execution_id}",
+        stream_key=f"execution:{execution.execution_id}",
+        event_type="engineering_manual_retry",
+        project_id=project_id,
+        build_run_id=run_id,
+        task_id=task.task_id,
+        execution_id=execution.execution_id,
+        payload={"previous_execution_id": status.execution_id},
+    )
+    db.commit()
+    engineering.start_claimed_engineering(db, user, project_id, run_id, task, execution)
+    return get_requirements_status(db, user, project_id)
+
+
 def _ensure_run_id(
     db: Session,
     user: User,
@@ -606,29 +681,44 @@ def _message_has_plan(db: Session, project_id: int, message_id: int) -> bool:
 def pause_active_execution(
     db: Session, user: User, project_id: int, run_id: str
 ) -> RequirementsStatus:
-    """Fail the current running execution so the user can resume later.
+    """Pause queued or running role work while keeping the BuildRun resumable."""
 
-    Keeps BuildRun / Plan / Task active; status becomes ``retry_available``.
-    """
-    lock_run(db, user, project_id, run_id)
+    run = lock_run(db, user, project_id, run_id)
     status = get_requirements_status(db, user, project_id)
     if status.run_id != run_id:
         raise ConflictException("构建任务不匹配")
-    if status.state not in ("running", "design_running", "engineering_running", "quality_running"):
-        raise ConflictException("当前没有可暂停的执行")
-    if not status.task_id or not status.execution_id:
-        raise ConflictException("当前没有可暂停的执行")
-    paused = fail_execution(
-        db,
-        status.task_id,
-        status.execution_id,
-        error="用户已暂停，可继续处理。",
-    )
-    if not paused:
-        raise ConflictException("执行状态已变化，请刷新后重试")
-    # Persist the fence before changing the process-local marker. The worker will observe the
-    # failed execution at its next checkpoint and cannot publish more progress for this attempt.
-    mark_engineering_inactive(status.execution_id)
+    if run.paused_at is not None:
+        return status
+    if status.state not in {
+        "pending",
+        "running",
+        "design_pending",
+        "design_running",
+        "engineering_pending",
+        "engineering_running",
+        "quality_pending",
+        "quality_running",
+    }:
+        raise ConflictException("当前没有可暂停的构建")
+
+    run.paused_at = utc_now()
+    pause_jobs_for_run(db, run_id, execution_id=status.execution_id)
+    if status.task_id and status.execution_id:
+        paused = fail_execution(
+            db,
+            status.task_id,
+            status.execution_id,
+            error=PAUSED_JOB_ERROR,
+            commit=False,
+        )
+        if not paused:
+            db.rollback()
+            raise ConflictException("执行状态已变化，请刷新后重试")
+        db.commit()
+        # The execution fence is durable before the process-local marker is released.
+        mark_engineering_inactive(status.execution_id)
+    else:
+        db.commit()
     return get_requirements_status(db, user, project_id)
 
 
@@ -869,7 +959,11 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             open_questions=[],
         )
         if plan.status == "pending" and delivery_task.status == "pending":
-            result.state = "quality_pending"
+            if run.paused_at is not None:
+                result.state = "retry_available"
+                result.error = PAUSED_JOB_ERROR
+            else:
+                result.state = "quality_pending"
             return _attach_workspace_status(db, result)
         if plan.status == "running" and delivery_task.status == "running" and run.stage == "qa":
             execution = latest_execution(db, delivery_task.task_id)
@@ -1069,6 +1163,9 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 if delivery_task.recipient == "Architect"
                 else "engineering_pending"
             )
+            if run.paused_at is not None:
+                result.state = "retry_available"
+                result.error = PAUSED_JOB_ERROR
             return _attach_workspace_status(db, result)
 
         if (
@@ -1103,19 +1200,15 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
             and run.stage == "developer"
         ):
             execution = latest_execution(db, delivery_task.task_id)
-            if (
-                execution is None
-                or execution.status != "running"
-                or execution.active_slot != 1
-                or execution.expires_at <= utc_now()
-            ):
-                result.state = "retry_available"
-                if execution is not None:
-                    result.execution_id = execution.execution_id
-                    result.execution_expires_at = execution.expires_at
-                    result.error = execution.error
+            execution_active = bool(
+                execution is not None
+                and execution.status == "running"
+                and execution.active_slot == 1
+                and execution.expires_at > utc_now()
+            )
+            result.state = "engineering_running" if execution_active else "retry_available"
+            if execution is None:
                 return _attach_workspace_status(db, result)
-            result.state = "engineering_running"
             result.execution_id = execution.execution_id
             result.execution_expires_at = execution.expires_at
             result.error = execution.error
@@ -1145,9 +1238,8 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                     or result.error
                     or "构建已暂停，可继续处理。"
                 )
-                reason_code = str(checkpoint.get("blocked_reason_code") or "")
                 result.retryable = not (
-                    reason_code in {"REPEATED_CHECK_FAILURE", "REPAIR_BUDGET_EXHAUSTED"}
+                    is_terminal_engineering_failure(checkpoint)
                     and checkpoint.get("blocked_executor_runtime_version") == EXECUTION_MODE
                 )
                 result.code_ready = _checkpoint_has_written_code(checkpoint)
@@ -1240,7 +1332,11 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
     else:
         execution = latest_execution(db, task.task_id)
         if execution is None:
-            result.state = "pending"
+            if run.paused_at is not None:
+                result.state = "retry_available"
+                result.error = PAUSED_JOB_ERROR
+            else:
+                result.state = "pending"
         else:
             result.execution_id = execution.execution_id
             result.execution_expires_at = execution.expires_at

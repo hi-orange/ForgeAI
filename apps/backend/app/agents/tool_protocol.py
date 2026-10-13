@@ -81,6 +81,7 @@ def run_bounded_tool_loop[AgentOutputT](
     execute_tool: Callable[[ToolCall], tuple[ToolExecutionResult, AgentOutputT | None]],
     model_call: ToolModelCall,
     on_observation: Callable[[ToolExecutionResult], None] | None = None,
+    final_turn_tools: Collection[str] | None = None,
 ) -> AgentOutputT:
     """Run a bounded loop while executing at most one proposed tool per model turn.
 
@@ -91,16 +92,22 @@ def run_bounded_tool_loop[AgentOutputT](
     """
 
     history = list(messages)
-    for _turn in range(max_turns):
+    for turn in range(max_turns):
+        turn_tools = tools
+        turn_allowed_tools = allowed_tools
+        if final_turn_tools is not None and turn == max_turns - 1:
+            final_tool_names = set(final_turn_tools)
+            turn_tools = [tool for tool in tools if tool.name in final_tool_names]
+            turn_allowed_tools = final_tool_names
         result = model_call(
             messages=list(history),
-            tools=tools,
+            tools=turn_tools,
             temperature=temperature,
             max_tokens=max_tokens,
         )
         if not result.tool_calls:
             raise BusinessException(missing_message)
-        invalid = [call.name for call in result.tool_calls if call.name not in allowed_tools]
+        invalid = [call.name for call in result.tool_calls if call.name not in turn_allowed_tools]
         if invalid:
             raise BusinessException(f"{role_name} 无权使用工具：{invalid[0]}")
         call = result.tool_calls[0]

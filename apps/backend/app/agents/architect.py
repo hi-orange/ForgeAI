@@ -22,7 +22,7 @@ from app.tools.architect import (
     execute_architect_tool,
 )
 
-MAX_ARCHITECT_TOOL_TURNS = 10
+MAX_ARCHITECT_TOOL_TURNS = 14
 ARCHITECT_PROFILE = get_role_profile(TaskRecipient.ARCHITECT)
 ALLOWED_ARCHITECT_TOOLS = [
     tool for tool in ARCHITECT_TOOLS if tool.name in ARCHITECT_PROFILE.allowed_tools

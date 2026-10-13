@@ -1,5 +1,6 @@
 import * as api from '@/api/modules/requirements'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 
 export type RequirementPlanItem = {
   id: string
@@ -117,6 +118,12 @@ export function useRequirements(projectId: number) {
       (status.value?.state === 'engineering_running' &&
         (Boolean(status.value.error) || !status.value.activities?.length)),
   )
+  const needsManualRepair = computed(
+    () =>
+      status.value?.state === 'retry_available' &&
+      status.value.retryable === false &&
+      Boolean(status.value.run_id && status.value.task_id && status.value.execution_id),
+  )
   const canRetryStart = computed(
     () =>
       status.value?.state === 'not_started' &&
@@ -125,12 +132,17 @@ export function useRequirements(projectId: number) {
   )
   const canPause = computed(
     () =>
-      Boolean(status.value?.run_id && status.value.task_id && status.value.execution_id) &&
-      (status.value?.state === 'running' ||
-        status.value?.state === 'design_running' ||
-        status.value?.state === 'engineering_running' ||
-        status.value?.state === 'quality_running') &&
-      !status.value.error,
+      Boolean(status.value?.run_id && status.value.task_id) &&
+      [
+        'pending',
+        'running',
+        'design_pending',
+        'design_running',
+        'engineering_pending',
+        'engineering_running',
+        'quality_pending',
+        'quality_running',
+      ].includes(status.value?.state ?? ''),
   )
 
   function schedule() {
@@ -260,38 +272,46 @@ export function useRequirements(projectId: number) {
     })
   }
 
+  async function retryRepair() {
+    const current = status.value
+    if (!current?.run_id || !needsManualRepair.value) return
+    await perform(async () => {
+      status.value = await api.retryTerminalEngineering(projectId, current.run_id!)
+      loadPlan(status.value)
+    })
+  }
+
+  async function stopBuild() {
+    const current = status.value
+    if (!current?.run_id || current.state !== 'retry_available' || busy.value) return
+    await perform(async () => {
+      status.value = await api.cancelBuildRun(projectId, current.run_id!)
+      loadPlan(status.value)
+    })
+  }
+
   async function continueOnce() {
     status.value = await api.continueRequirements(projectId)
     loadPlan(status.value)
   }
 
   async function advanceSavedDelivery() {
-    const advanceable = new Set([
-      'ready_for_delivery',
-      'design_pending',
-      'engineering_pending',
-      'quality_pending',
-    ])
-    let previous = ''
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const current = status.value
-      if (!current?.run_id || !advanceable.has(current.state)) return
-      const identity = [current.state, current.plan_id, current.task_id].join(':')
-      if (identity === previous) return
-      previous = identity
-      await continueOnce()
-    }
+    const current = status.value
+    if (!current?.run_id || current.state !== 'ready_for_delivery') return
+    await continueOnce()
   }
 
-  async function pause() {
+  async function pause(): Promise<boolean> {
     const current = status.value
-    if (!current?.run_id || !canPause.value || pausing.value || disposed) return
+    if (!current?.run_id || !canPause.value || pausing.value || disposed) return false
     mutationVersion += 1
     pausing.value = true
     error.value = ''
+    let paused = false
     try {
       status.value = await api.pauseBuildRun(projectId, current.run_id)
       loadPlan(status.value)
+      paused = true
     } catch (err) {
       if (!disposed) error.value = err instanceof Error ? err.message : '暂停失败，请刷新进度后重试'
     } finally {
@@ -300,6 +320,7 @@ export function useRequirements(projectId: number) {
       if (inFlight) await inFlight
       await refresh()
     }
+    return paused
   }
 
   async function approve() {
@@ -379,19 +400,21 @@ export function useRequirements(projectId: number) {
       lastChallengeRevision = null
     })
   }
+  function pauseOnPageHide() {
+    if (canPause.value && !pausing.value) void pause()
+  }
+
   onMounted(async () => {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pagehide', pauseOnPageHide)
+    }
     try {
       const project = await api.getRequirementsProject(projectId)
       if (disposed) return
       name.value = project.name
       await refresh()
       if (disposed) return
-      if (
-        status.value &&
-        ['ready_for_delivery', 'design_pending', 'engineering_pending', 'quality_pending'].includes(
-          status.value.state,
-        )
-      ) {
+      if (status.value?.state === 'ready_for_delivery') {
         await perform(advanceSavedDelivery)
         return
       }
@@ -404,7 +427,14 @@ export function useRequirements(projectId: number) {
       if (!disposed) error.value = err instanceof Error ? err.message : '读取项目失败'
     }
   })
+  onBeforeRouteLeave(async () => {
+    if (!canPause.value) return true
+    return pause()
+  })
   onBeforeUnmount(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('pagehide', pauseOnPageHide)
+    }
     disposed = true
     clearTimeout(timer)
   })
@@ -430,11 +460,14 @@ export function useRequirements(projectId: number) {
     canWrite,
     canResume,
     canRetryStart,
+    needsManualRepair,
     canPause,
     refresh,
     submit,
     resume,
     retryStart,
+    retryRepair,
+    stopBuild,
     pause,
   }
 }

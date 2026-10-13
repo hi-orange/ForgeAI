@@ -23,12 +23,12 @@ from app.tools.leader import (
     execute_message_classification_tool,
 )
 
-# Graduated tool budgets: classify is 1; simple dispatch stays small; replan may use more.
+# Graduated tool budgets: classify is atomic; management turns leave room for reads and recovery.
 LEADER_CLASSIFY_TURNS = 1
-# read context + classify + create plan + dispatch + finish need five tool calls.
-# Keep one recovery turn so a valid simple route cannot exhaust the budget by design.
-LEADER_SIMPLE_DISPATCH_TURNS = 6
-LEADER_COMPLEX_REPLAN_TURNS = 12
+# A simple approved handoff may read context, intent, plan and prior results
+# before planning, dispatching and finishing.
+LEADER_SIMPLE_DISPATCH_TURNS = 8
+LEADER_COMPLEX_REPLAN_TURNS = 16
 # Backward-compatible alias for the complex budget.
 MAX_LEADER_TOOL_TURNS = LEADER_COMPLEX_REPLAN_TURNS
 # 只保留角色白名单里允许的工具定义，避免多给模型权限。
@@ -138,4 +138,5 @@ def lead_project_turn(
         # 每次模型点工具，都带着同一份 state 去执行。
         execute_tool=lambda call: execute_leader_tool(call, state),
         model_call=chat_with_tools,
+        final_turn_tools={"request_user_input", "finish_turn"},
     )

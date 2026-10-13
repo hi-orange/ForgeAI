@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -96,6 +97,7 @@ def run_test_engineer_task(
     task_id: str,
     *,
     recovery_execution_id: str | None = None,
+    on_execution_started: Callable[[TaskExecution], None] | None = None,
 ) -> ConfigurationItem:
     """Verify code read-only, then publish the immutable quality report."""
 
@@ -107,6 +109,8 @@ def run_test_engineer_task(
         task_id,
         recovery_execution_id=recovery_execution_id,
     )
+    if on_execution_started is not None:
+        on_execution_started(execution)
     _record_quality_activity(
         db,
         execution,

@@ -55,6 +55,9 @@ MAX_CONTEXT_FILES = 160
 MAX_PLAN_HISTORY = 24
 MAX_IDENTICAL_CHECK_FAILURES = 3
 MAX_UNCHANGED_SOURCE_FAILURES = 3
+MAX_REPAIR_CONTEXT_FILES = 8
+MAX_REPAIR_FILE_CHARS = 8_000
+MAX_REPAIR_CONTEXT_CHARS = 32_000
 PROTECTED_ACCEPTANCE_PATHS = (
     "backend/tests/acceptance/",
     "frontend/src/acceptance/",
@@ -157,7 +160,7 @@ def _new_checkpoint() -> dict[str, Any]:
     }
 
 
-def _is_terminal_check_failure(checkpoint: dict[str, Any]) -> bool:
+def is_terminal_engineering_failure(checkpoint: dict[str, Any]) -> bool:
     reason = str(checkpoint.get("blocked_reason") or "")
     reason_code = str(checkpoint.get("blocked_reason_code") or "")
     return reason_code in {
@@ -197,7 +200,7 @@ def _load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
     if previous_mode != EXECUTION_MODE:
         preserve_terminal_failure = checkpoint.get(
             "outcome"
-        ) == "blocked" and _is_terminal_check_failure(checkpoint)
+        ) == "blocked" and is_terminal_engineering_failure(checkpoint)
         # Controller v3 could spend an entire attempt selecting and re-reading files. Preserve
         # real files and completed items, but never replay that observation loop after upgrade.
         checkpoint.update(
@@ -271,12 +274,115 @@ def _seed_repair_from_last_check(checkpoint: dict[str, Any]) -> None:
         return
 
 
+def _repair_source_context(root: Path, repair: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read bounded source for diagnostics and the previous plan's direct contracts."""
+
+    requested: list[tuple[str, int | None]] = []
+    for diagnostic in repair.get("diagnostics") or []:
+        if isinstance(diagnostic, dict) and isinstance(diagnostic.get("path"), str):
+            requested.append((diagnostic["path"], diagnostic.get("line")))
+    previous = repair.get("previous_plan")
+    files = previous.get("files") if isinstance(previous, dict) else None
+    for item in files if isinstance(files, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("path"), str):
+            requested.append((item["path"], None))
+        for path in item.get("context_paths") or []:
+            if isinstance(path, str):
+                requested.append((path, None))
+
+    source: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    remaining = MAX_REPAIR_CONTEXT_CHARS
+    for raw_path, line in requested:
+        path = raw_path.replace("\\", "/").strip()
+        candidates = [path]
+        if not path.startswith(("frontend/", "backend/")):
+            candidates.extend(f"{prefix}/{path}" for prefix in ("frontend", "backend"))
+        for candidate in candidates:
+            if candidate in seen or len(source) >= MAX_REPAIR_CONTEXT_FILES or remaining <= 0:
+                continue
+            try:
+                target = safe_path_under_root(root, candidate, allow_create=True)
+            except ConflictException:
+                continue
+            if not target.is_file() or not is_text_file(target):
+                continue
+            seen.add(candidate)
+            try:
+                full_content = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            limit = min(MAX_REPAIR_FILE_CHARS, remaining)
+            offset = 0
+            if len(full_content) > limit and isinstance(line, int) and line > 0:
+                offset = max(
+                    0,
+                    sum(len(part) for part in full_content.splitlines(keepends=True)[: line - 1])
+                    - limit // 3,
+                )
+            content = full_content[offset : offset + limit]
+            source.append(
+                {
+                    "path": candidate,
+                    "content": content,
+                    "start_offset": offset,
+                    "truncated": len(content) < len(full_content),
+                }
+            )
+            remaining -= len(content)
+            break
+    return source
+
+
+def _repeated_failed_file_set(checkpoint: dict[str, Any], work_item_id: str) -> list[str]:
+    """Only reject an unchanged file set after two checks of identical source fail."""
+
+    history = checkpoint.get("plan_history")
+    if not isinstance(history, list):
+        return []
+    failures: list[tuple[str, str, list[str]]] = []
+    for entry in reversed(history):
+        if not isinstance(entry, dict):
+            continue
+        plan, check = entry.get("plan"), entry.get("check")
+        if not isinstance(plan, dict) or plan.get("work_item_id") != work_item_id:
+            continue
+        if not isinstance(check, dict) or check.get("ok") is True:
+            break
+        data = check.get("data")
+        source_hash = data.get("source_hash") if isinstance(data, dict) else None
+        files = plan.get("files")
+        paths = (
+            sorted(
+                {
+                    item["path"].replace("\\", "/")
+                    for item in files
+                    if isinstance(item, dict) and isinstance(item.get("path"), str)
+                }
+            )
+            if isinstance(files, list)
+            else []
+        )
+        if not isinstance(source_hash, str) or not source_hash or not paths:
+            break
+        try:
+            failure = analyze_check_failure(ToolExecutionResult.model_validate(check))
+        except ValidationError:
+            break
+        failures.append((source_hash, failure.fingerprint, paths))
+        if len(failures) == 2:
+            break
+    return failures[0][2] if len(failures) == 2 and failures[0] == failures[1] else []
+
+
 def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
     """Make an explicit user recovery attempt runnable from its last real evidence."""
 
     if checkpoint.get("outcome") != "blocked":
         return False
-    terminal_check_failure = _is_terminal_check_failure(checkpoint)
+    terminal_check_failure = is_terminal_engineering_failure(checkpoint)
     if terminal_check_failure:
         # Do not let a button click erase identical-failure memory forever. A newer
         # executor version may recover an old checkpoint once; after that the user
@@ -296,6 +402,55 @@ def _resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
     checkpoint.pop("last_error", None)
 
     return True
+
+
+def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Create one bounded, user-requested retry from terminal check evidence.
+
+    Automatic recovery must preserve the stop-loss. This explicit path keeps the
+    frozen inputs and prior activity, but gives the current work item a fresh repair
+    budget and forces replanning from the last failed check.
+    """
+
+    prepared = json.loads(json.dumps(snapshot))
+    checkpoint = _load_checkpoint(prepared)
+    if checkpoint.get("outcome") != "blocked" or not is_terminal_engineering_failure(checkpoint):
+        raise ConflictException("当前工程执行不需要人工重新修复")
+
+    current_item_id = str(checkpoint.get("current_work_item_id") or "")
+    for key in ("failure_streaks", "repair_rounds"):
+        values = checkpoint.get(key)
+        if isinstance(values, dict):
+            values.pop(current_item_id, None)
+    _seed_repair_from_last_check(checkpoint)
+
+    call_budget = prepared.get("call_budget")
+    call_budget = dict(call_budget) if isinstance(call_budget, dict) else {}
+    call_budget["max_model_turns"] = int(checkpoint.get("model_turns") or 0) + int(
+        DEFAULT_CALL_BUDGET["max_model_turns"]
+    )
+    call_budget["max_tool_calls"] = int(checkpoint.get("tool_calls") or 0) + int(
+        DEFAULT_CALL_BUDGET["max_tool_calls"]
+    )
+    call_budget["max_repair_rounds"] = int(DEFAULT_CALL_BUDGET["max_repair_rounds"])
+    prepared["call_budget"] = call_budget
+
+    retry_number = int(checkpoint.get("manual_repair_attempts") or 0) + 1
+    checkpoint["manual_repair_attempts"] = retry_number
+    checkpoint["outcome"] = "running"
+    checkpoint["blocked_reason"] = None
+    checkpoint.pop("blocked_reason_code", None)
+    checkpoint.pop("blocked_check_runtime_version", None)
+    checkpoint.pop("last_error", None)
+    _append_activity(
+        checkpoint,
+        name="manual_repair_retry",
+        label="Retry repair",
+        detail=f"用户要求基于最后一次检查错误重新分析并修复（第 {retry_number} 次）",
+        ok=True,
+    )
+    prepared["checkpoint"] = checkpoint
+    return prepared
 
 
 def _save_snapshot(db: Session, execution_id: str, snapshot: dict[str, Any]) -> None:
@@ -926,6 +1081,12 @@ class _EngineeringNodes:
     ) -> _WorkflowUpdate:
         repair_context = checkpoint.get("repair_context")
         is_repair = isinstance(repair_context, dict)
+        if isinstance(repair_context, dict):
+            repair_context = {
+                **repair_context,
+                "diagnostic_file_context": _repair_source_context(root, repair_context),
+                "repeated_failed_file_set": _repeated_failed_file_set(checkpoint, work_item.id),
+            }
         repair_round = repair_context.get("round") if isinstance(repair_context, dict) else None
         self._persist_waiting(
             state,

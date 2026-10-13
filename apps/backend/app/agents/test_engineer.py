@@ -28,7 +28,7 @@ from app.tools.test_engineer import (
     restore_test_engineer_progress,
 )
 
-MAX_TEST_ENGINEER_TOOL_TURNS = 24
+MAX_TEST_ENGINEER_TOOL_TURNS = 32
 _TRANSIENT_EVIDENCE_ERRORS = frozenset(
     {
         "CHECK_ENVIRONMENT_UNAVAILABLE",

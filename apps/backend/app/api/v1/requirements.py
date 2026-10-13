@@ -23,6 +23,7 @@ from app.services.requirements import (
     get_requirements_status,
     pause_active_execution,
     resolve_quality_challenge,
+    retry_terminal_engineering,
     start_requirements,
     submit_requirements,
 )
@@ -147,6 +148,19 @@ def continue_engineering_route(
     current_user: CurrentUser,
 ) -> dict:
     return success(continue_engineering(db, current_user, project_id, run_id))
+
+
+@router.post(
+    "/build-runs/{run_id}/engineering/retry",
+    response_model=ApiResponse[RequirementsStatus],
+)
+def retry_terminal_engineering_route(
+    project_id: int,
+    run_id: str,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    return success(retry_terminal_engineering(db, current_user, project_id, run_id))
 
 
 @router.get("/requirements", response_model=ApiResponse[RequirementsStatus])

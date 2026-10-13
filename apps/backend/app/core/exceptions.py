@@ -36,6 +36,20 @@ class BusinessException(AppException):
         super().__init__(msg, code=code, status_code=400, data=data)
 
 
+class ProviderException(BusinessException):
+    """External provider failure with an explicit durable-retry disposition."""
+
+    def __init__(self, msg: str, *, retryable: bool, data: Any = None) -> None:
+        self.retryable = retryable
+        super().__init__(msg, data=data)
+
+
+class WorkflowBlockedException(BusinessException):
+    """A persisted checkpoint that requires an explicit user resume."""
+
+    retryable = False
+
+
 class UnauthorizedException(AppException):
     def __init__(self, msg: str = "未登录或登录已过期") -> None:
         super().__init__(msg, code=401, status_code=401)

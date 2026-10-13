@@ -56,6 +56,7 @@ from app.services.requirements import (
     get_requirements_status,
     pause_active_execution,
     resolve_quality_challenge,
+    retry_terminal_engineering,
 )
 
 
@@ -265,6 +266,74 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             self.project.id,
             self.run.run_id,
             "task_quality_retry",
+        )
+
+    def test_user_can_start_one_bounded_retry_after_terminal_engineering_failure(self):
+        blocked = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="retry_available",
+            task_id="task_engineering",
+            execution_id="exec_old",
+            retryable=False,
+        )
+        running = RequirementsStatus(
+            project_id=self.project.id,
+            run_id=self.run.run_id,
+            state="engineering_running",
+            task_id="task_engineering",
+            execution_id="exec_new",
+        )
+        task = SimpleNamespace(task_id="task_engineering", recipient="Code Engineer")
+        previous = SimpleNamespace(execution_id="exec_old")
+        execution = SimpleNamespace(execution_id="exec_new", draft=None)
+        snapshot = {"kind": "engineering_input_snapshot", "checkpoint": {}}
+        prepared = {"kind": "engineering_input_snapshot", "checkpoint": {"outcome": "running"}}
+
+        with (
+            self.session_factory() as db,
+            patch(
+                "app.services.requirements.get_requirements_status",
+                side_effect=[blocked, running],
+            ),
+            patch(
+                "app.services.requirements.task_service.get_user_task",
+                return_value=task,
+            ),
+            patch(
+                "app.services.requirements.engineering.is_engineering_active",
+                return_value=False,
+            ),
+            patch("app.services.requirements.latest_execution", return_value=previous),
+            patch("app.services.requirements.read_frozen_input_snapshot", return_value=snapshot),
+            patch(
+                "app.services.requirements.prepare_manual_repair_retry",
+                return_value=prepared,
+            ) as prepare,
+            patch(
+                "app.services.requirements.engineering.claim_code_engineer_task",
+                return_value=(task, execution),
+            ) as claim,
+            patch("app.services.requirements.flag_modified"),
+            patch("app.services.requirements.append_event") as append_event,
+            patch("app.services.requirements.engineering.start_claimed_engineering") as start,
+        ):
+            result = retry_terminal_engineering(db, self.owner, self.project.id, self.run.run_id)
+
+        self.assertIs(result, running)
+        prepare.assert_called_once_with(snapshot)
+        claim.assert_called_once_with(
+            db,
+            self.owner,
+            self.project.id,
+            self.run.run_id,
+            "task_engineering",
+            recovery_execution_id="exec_old",
+        )
+        self.assertIs(execution.draft, prepared)
+        append_event.assert_called_once()
+        start.assert_called_once_with(
+            db, self.owner, self.project.id, self.run.run_id, task, execution
         )
 
     def test_retry_does_not_supersede_worker_that_is_still_finalizing(self):
@@ -767,6 +836,20 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
         self.assertEqual(paused.state, "retry_available")
         self.assertEqual(paused.execution_id, execution.execution_id)
         self.assertIn("暂停", paused.error or "")
+        with self.session_factory() as db:
+            with self.assertRaisesRegex(ConflictException, "暂停"):
+                task_execution.start_execution(
+                    db,
+                    self.owner,
+                    self.project.id,
+                    self.run.run_id,
+                    pending.task_id,
+                    recovery_execution_id=execution.execution_id,
+                )
+        with self.session_factory() as db:
+            resumed = continue_requirements(db, self.owner, self.project.id)
+        self.assertEqual(resumed.state, "retry_available")
+
         self.chat.return_value = prd_turn(valid_spec())
         result = self._run(recovery_execution_id=execution.execution_id)
         self.assertEqual(result.outcome, "awaiting_approval")

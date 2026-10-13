@@ -222,6 +222,31 @@
             </button>
           </div>
         </section>
+        <section v-if="needsManualRepair" class="terminal-recovery" role="alert">
+          <strong>自动修复已停止，等待你选择下一步</strong>
+          <p>
+            系统不会继续调用模型。当前代码和进度已经保留，你可以让 AI
+            换个思路再修一轮，或结束本次构建。
+          </p>
+          <details v-if="status?.error" class="recovery-error">
+            <summary>查看最后一次错误</summary>
+            <p>{{ status.error }}</p>
+          </details>
+          <div class="recovery-actions">
+            <button class="primary" type="button" :disabled="busy" @click="retryRepair">
+              {{ busy ? '正在启动…' : '重新分析并修复' }}
+            </button>
+            <button
+              class="secondary danger"
+              type="button"
+              :disabled="busy"
+              @click="confirmStopBuild"
+            >
+              结束本次构建
+            </button>
+          </div>
+          <small>每次点击只启动一轮有上限的修复，不会自动无限重试。</small>
+        </section>
         <div v-if="canResume" class="resume-card">
           <p>
             {{
@@ -393,6 +418,7 @@ const {
   canWrite,
   canResume,
   canRetryStart,
+  needsManualRepair,
   canPause,
   canApprove,
   planGoal,
@@ -405,6 +431,8 @@ const {
   submit,
   resume,
   retryStart,
+  retryRepair,
+  stopBuild,
   pause,
   approve,
   resolveChallenge,
@@ -469,7 +497,7 @@ const labels = {
   needs_user_input: '补充一个想法',
   awaiting_approval: '构建计划已准备好',
   ready_for_delivery: '计划已批准',
-  design_pending: '计划已批准，正在开始构建',
+  design_pending: '等待 Architect 开始系统设计',
   design_running: 'Architect 正在设计系统',
   engineering_pending: '等待 Code Engineer 开始实现',
   engineering_running: '正在根据获批需求编写代码',
@@ -531,12 +559,15 @@ const stateLabel = computed(() => {
   if (understandingFirstTurn.value) return '正在理解…'
   if (busy.value) return '正在处理…'
   if (awaitingIdeaAfterReply.value) return '等待你的描述'
+  if (needsManualRepair.value) return '自动修复已停止，等待你的选择'
   if (canRetryStart.value) return llmRetryTitle.value
   return status.value ? labels[status.value.state] : '正在加载项目…'
 })
 const agentText = computed(() => {
   if (awaitingIdeaAfterReply.value) return ''
   if (understandingFirstTurn.value) return '我在理解你刚才说的话。'
+  if (needsManualRepair.value)
+    return '连续修复没有解决检查错误，系统已经停止，不会继续调用模型。请选择重新分析修复或结束本次构建。'
   if (canRetryStart.value) {
     const message = error.value || ''
     if (message.includes('余额不足')) {
@@ -589,10 +620,16 @@ const agentText = computed(() => {
         ? '计划已批准。自动分派下一步没有完成，可以继续处理。'
         : '计划已批准，正在启动后续构建。'
     }
-    if (status.value?.state === 'design_pending' || status.value?.state === 'engineering_pending') {
-      return '计划已批准，正在开始构建应用。'
+    if (status.value?.state === 'design_pending') {
+      return '系统设计任务已进入队列，等待 Architect 领取。'
+    }
+    if (status.value?.state === 'engineering_pending') {
+      return '系统设计已完成，实现任务已进入队列，等待 Code Engineer 领取。'
     }
     return '计划已批准，正在开始构建应用。'
+  }
+  if (status.value?.state === 'retry_available') {
+    return status.value.error || '构建已暂停，点击继续处理后会从已保存进度恢复。'
   }
   if (busy.value || status.value?.state === 'running')
     return '我正在把你的想法整理成可选择的功能和页面。'
@@ -601,6 +638,8 @@ const agentText = computed(() => {
 const composerHint = computed(() => {
   if (pausing.value) return '正在暂停，当前进度会被保留'
   if (canPause.value) return '构建运行中，点击右侧按钮可暂停'
+  if (needsManualRepair.value) return '自动修复已停止，请在上方选择下一步'
+  if (canResume.value) return '构建已暂停，点击继续处理可从已保存进度恢复'
   return canApprove.value ? '也可以直接在上方勾选并批准' : '从一个想法开始'
 })
 const canvasLabel = computed(() => {
@@ -619,6 +658,11 @@ const placeholderDescription = computed(() => {
   return 'Terminal 等工具入口将放在这里。'
 })
 
+function confirmStopBuild() {
+  if (window.confirm('结束后本次构建不会再继续，已生成的代码和历史记录仍会保留。确定结束吗？')) {
+    void stopBuild()
+  }
+}
 function setWorkspaceView(view: WorkspaceView) {
   workspaceView.value = view
 }
@@ -1219,6 +1263,47 @@ summary:focus-visible {
   display: grid;
   gap: 8px;
   margin-top: 12px;
+}
+.terminal-recovery {
+  padding: 16px;
+  border: 1px solid #f0c987;
+  border-radius: 14px;
+  margin: 14px 0;
+  background: #fffaf0;
+  color: #4f4939;
+  line-height: 1.7;
+
+  > p {
+    margin: 6px 0 10px;
+  }
+
+  small {
+    display: block;
+    margin-top: 10px;
+    color: #80765f;
+  }
+}
+.recovery-error {
+  margin: 10px 0;
+  color: #9d4f47;
+
+  summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+
+  p {
+    overflow-wrap: anywhere;
+  }
+}
+.recovery-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  .danger {
+    color: #a83f3a;
+  }
 }
 .resume-card,
 .clarification {

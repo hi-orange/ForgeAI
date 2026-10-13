@@ -9,7 +9,7 @@ import threading
 import time
 from uuid import uuid4
 
-from app.core.exceptions import ConflictException
+from app.core.exceptions import AppException, ConflictException, WorkflowBlockedException
 from app.core.settings import settings
 from app.db.database import SessionLocal
 from app.models.configuration_item import ConfigurationItem
@@ -84,10 +84,10 @@ def _handle_product_manager(job: WorkflowJob, worker_id: str) -> None:
             run_id,
             message_id,
             recovery_execution_id=recovery_id,
+            on_execution_started=lambda execution: attach_execution(
+                db, job.job_id, worker_id, execution
+            ),
         )
-        execution = latest_execution(db, task_id)
-        if execution is not None:
-            attach_execution(db, job.job_id, worker_id, execution)
 
 
 def _handle_architect(job: WorkflowJob, worker_id: str) -> None:
@@ -120,10 +120,10 @@ def _handle_architect(job: WorkflowJob, worker_id: str) -> None:
             run_id,
             task_id,
             recovery_execution_id=recovery_id,
+            on_execution_started=lambda execution: attach_execution(
+                db, job.job_id, worker_id, execution
+            ),
         )
-        execution = latest_execution(db, task_id)
-        if execution is not None:
-            attach_execution(db, job.job_id, worker_id, execution)
 
 
 def _enqueue_quality_for_code(
@@ -189,7 +189,7 @@ def _handle_engineering(job: WorkflowJob, worker_id: str) -> None:
                 recovery_execution_id=recovery_id,
             )
             attach_execution(db, job.job_id, worker_id, execution)
-        _run_and_publish(
+        result = _run_and_publish(
             db,
             user,
             project_id,
@@ -198,6 +198,9 @@ def _handle_engineering(job: WorkflowJob, worker_id: str) -> None:
             execution.execution_id,
             enqueue_quality=True,
         )
+        outcome = str(result.get("outcome") or "unknown")
+        if outcome != "generated":
+            raise WorkflowBlockedException(f"Code Engineer 已暂停（{outcome}），等待用户显式继续")
 
 
 def _handle_quality(job: WorkflowJob, worker_id: str) -> None:
@@ -225,10 +228,10 @@ def _handle_quality(job: WorkflowJob, worker_id: str) -> None:
             run_id,
             task_id,
             recovery_execution_id=recovery_id,
+            on_execution_started=lambda execution: attach_execution(
+                db, job.job_id, worker_id, execution
+            ),
         )
-        execution = latest_execution(db, task_id)
-        if execution is not None:
-            attach_execution(db, job.job_id, worker_id, execution)
 
 
 def _handle_security(job: WorkflowJob, _worker_id: str) -> None:
@@ -344,7 +347,10 @@ class DurableWorker:
             with SessionLocal() as db:
                 complete_job(db, job_id, self.worker_id)
         except Exception as exc:
-            logger.exception("workflow job failed job_id=%s", job_id)
+            if isinstance(exc, AppException):
+                logger.warning("workflow job stopped job_id=%s error=%s", job_id, exc)
+            else:
+                logger.exception("workflow job failed job_id=%s", job_id)
             with SessionLocal() as db:
                 fail_job(db, job_id, self.worker_id, exc)
         finally:
@@ -353,15 +359,33 @@ class DurableWorker:
         return True
 
 
-_embedded_worker = DurableWorker(worker_id=f"embedded-{os.getpid()}-{uuid4().hex[:8]}")
+_embedded_workers: list[DurableWorker] = []
+_embedded_workers_lock = threading.Lock()
 
 
 def start_embedded_worker() -> None:
-    _embedded_worker.start()
+    with _embedded_workers_lock:
+        if _embedded_workers:
+            return
+        concurrency = max(1, min(settings.workflow_embedded_worker_concurrency, 8))
+        workers = [
+            DurableWorker(worker_id=f"embedded-{os.getpid()}-{index + 1}-{uuid4().hex[:8]}")
+            for index in range(concurrency)
+        ]
+        for worker in workers:
+            worker.start()
+        _embedded_workers.extend(workers)
+        logger.info("durable worker pool started concurrency=%s", concurrency)
 
 
 def stop_embedded_worker() -> None:
-    _embedded_worker.stop()
+    with _embedded_workers_lock:
+        workers = list(_embedded_workers)
+        _embedded_workers.clear()
+    for worker in workers:
+        worker.stop()
+    if workers:
+        logger.info("durable worker pool stopped concurrency=%s", len(workers))
 
 
 def main() -> None:

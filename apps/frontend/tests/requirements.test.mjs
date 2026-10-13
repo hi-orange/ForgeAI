@@ -269,6 +269,7 @@ test('removing part of a joint criterion requests acceptance for the remaining f
 
 async function fixture(state = progress()) {
   const mounted = [],
+    leaving = [],
     unmounted = [],
     timers = new Set()
   const messages = []
@@ -320,6 +321,18 @@ async function fixture(state = progress()) {
       }
       return structuredClone(state)
     }),
+    retryTerminalEngineering: mock.fn(async () => {
+      state = progress('engineering_running', {
+        task_id: state.task_id,
+        execution_id: 'exec-retry',
+        activities: [{ id: 'manual-retry', name: 'manual_repair_retry', ok: true }],
+      })
+      return structuredClone(state)
+    }),
+    cancelBuildRun: mock.fn(async () => {
+      state = progress('stopped', { run_id: state.run_id })
+      return structuredClone(state)
+    }),
     approveRequirements: mock.fn(async () => {
       state = progress('design_pending')
       return structuredClone(state)
@@ -343,6 +356,7 @@ async function fixture(state = progress()) {
         onBeforeUnmount: (fn) => unmounted.push(fn),
       },
       '@/api/modules/requirements': api,
+      'vue-router': { onBeforeRouteLeave: (fn) => leaving.push(fn) },
     },
     {
       setTimeout: (fn) => {
@@ -362,6 +376,13 @@ async function fixture(state = progress()) {
     },
     unmount: () => {
       for (const fn of unmounted) fn()
+    },
+    leave: async () => {
+      let allowed = true
+      for (const fn of leaving) {
+        if ((await fn()) === false) allowed = false
+      }
+      return allowed
     },
     setState: (value) => {
       state = value
@@ -532,6 +553,45 @@ test('explicit recovery uses continue', async () => {
   f.unmount()
 })
 
+test('terminal engineering failure offers an explicit bounded repair retry', async () => {
+  const f = await fixture(
+    progress('retry_available', {
+      task_id: 'task-engineering',
+      execution_id: 'exec-terminal',
+      retryable: false,
+      error: '相同检查错误已连续出现 3 次',
+    }),
+  )
+  await f.mount()
+  assert.equal(f.view.canResume.value, false)
+  assert.equal(f.view.needsManualRepair.value, true)
+  assert.equal(f.timers.size, 0)
+
+  await f.view.retryRepair()
+
+  assert.deepEqual(Array.from(f.api.retryTerminalEngineering.mock.calls[0].arguments), [7, 'run-1'])
+  assert.equal(f.view.status.value.state, 'engineering_running')
+  assert.equal(f.view.canPause.value, true)
+  f.unmount()
+})
+
+test('terminal engineering failure can be ended while preserving a stopped status', async () => {
+  const f = await fixture(
+    progress('retry_available', {
+      task_id: 'task-engineering',
+      execution_id: 'exec-terminal',
+      retryable: false,
+    }),
+  )
+  await f.mount()
+
+  await f.view.stopBuild()
+
+  assert.deepEqual(Array.from(f.api.cancelBuildRun.mock.calls[0].arguments), [7, 'run-1'])
+  assert.equal(f.view.status.value.state, 'stopped')
+  f.unmount()
+})
+
 test('polling clears a stale continue error after quality validation has started', async () => {
   const f = await fixture(
     progress('retry_available', {
@@ -600,13 +660,14 @@ test('ready requirements automatically dispatch and start without posting a new 
   const f = await fixture(progress('ready_for_delivery', { message_id: 45 }))
   await f.mount()
   assert.equal(f.view.canResume.value, false)
-  assert.equal(f.api.continueRequirements.mock.callCount(), 2)
+  assert.equal(f.api.continueRequirements.mock.callCount(), 1)
   assert.equal(f.api.submitRequirements.mock.callCount(), 0)
-  assert.equal(f.view.status.value.state, 'engineering_running')
+  assert.equal(f.view.status.value.state, 'design_pending')
+  assert.equal(f.timers.size, 1)
   f.unmount()
 })
 
-test('mounting a pending design assignment automatically starts engineering', async () => {
+test('mounting a pending design assignment polls without starting it synchronously', async () => {
   const f = await fixture(
     progress('design_pending', {
       task_id: 'task-design',
@@ -618,13 +679,23 @@ test('mounting a pending design assignment automatically starts engineering', as
   )
   await f.mount()
   assert.equal(f.view.canWrite.value, false)
-  assert.equal(f.api.continueRequirements.mock.callCount(), 1)
-  assert.equal(f.view.status.value.state, 'engineering_running')
+  assert.equal(f.api.continueRequirements.mock.callCount(), 0)
+  assert.equal(f.view.status.value.state, 'design_pending')
   assert.equal(f.view.canResume.value, false)
   assert.equal(f.timers.size, 1)
   f.unmount()
 })
 
+test('leaving a queued project pauses it before navigation completes', async () => {
+  const f = await fixture(progress('design_pending', { task_id: 'task-design' }))
+  await f.mount()
+  assert.equal(f.view.canPause.value, true)
+  assert.equal(await f.leave(), true)
+  assert.deepEqual(Array.from(f.api.pauseBuildRun.mock.calls[0].arguments), [7, 'run-1'])
+  assert.equal(f.view.status.value.state, 'retry_available')
+  assert.equal(f.timers.size, 0)
+  f.unmount()
+})
 test('blocked engineering resumes the saved run without a new requirement message', async () => {
   const f = await fixture(progress('engineering_running', { error: '工程执行已暂停' }))
   await f.mount()
@@ -729,6 +800,9 @@ test('HTTP wrappers post coarse actions without embedding tokens', async () => {
   await api.submitRequirements(7, 'CSV', 'key-2')
   await api.startRequirements(7, 33)
   await api.continueRequirements(7)
+  await api.retryTerminalEngineering(7, 'run-1')
+  await api.pauseBuildRun(7, 'run-1')
+  await api.cancelBuildRun(7, 'run-1')
   const calls = JSON.parse(JSON.stringify(request.mock.calls.map((call) => call.arguments)))
   assert.deepEqual(calls, [
     [
@@ -737,6 +811,9 @@ test('HTTP wrappers post coarse actions without embedding tokens', async () => {
     ],
     ['/api/v1/projects/7/requirements/start', { method: 'POST', body: { message_id: 33 } }],
     ['/api/v1/projects/7/requirements/continue', { method: 'POST' }],
+    ['/api/v1/projects/7/build-runs/run-1/engineering/retry', { method: 'POST' }],
+    ['/api/v1/projects/7/build-runs/run-1/pause', { method: 'POST', keepalive: true }],
+    ['/api/v1/projects/7/build-runs/run-1/cancel', { method: 'POST' }],
   ])
 })
 

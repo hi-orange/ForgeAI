@@ -6,12 +6,15 @@ artifact and decides the next assignment.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from sqlalchemy.orm import Session
 
 from app.agents.architect import generate_system_design
 from app.core.settings import settings
 from app.generation.workspace import default_workspace_path
 from app.models.configuration_item import ConfigurationItem
+from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.services import architect as architect_service
 from app.services.engineering import load_approved_app_spec
@@ -27,6 +30,7 @@ def run_architecture_task(
     task_id: str,
     *,
     recovery_execution_id: str | None = None,
+    on_execution_started: Callable[[TaskExecution], None] | None = None,
 ) -> ConfigurationItem:
     """Execute the exact assignment and report the immutable design artifact."""
 
@@ -38,6 +42,8 @@ def run_architecture_task(
         task_id,
         recovery_execution_id=recovery_execution_id,
     )
+    if on_execution_started is not None:
+        on_execution_started(execution)
     with Session(bind=db.get_bind(), autoflush=False) as reader:
         app_spec_item_id = task.input_configuration_item_ids[0]
         _, _, _, spec = load_approved_app_spec(reader, project_id, run_id, app_spec_item_id)

@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from app.core.exceptions import BusinessException
+from app.core.exceptions import BusinessException, ProviderException
 from app.core.llm_response import CompletionContentKind, normalize_completion_content
 from app.core.settings import settings
 from app.schemas.agent_action import ChatWithToolsResult, TokenUsage, ToolCall, ToolDefinition
@@ -50,10 +50,28 @@ def _http_error_message(response: httpx.Response | None) -> str:
     return "大模型调用失败，请稍后重试"
 
 
+def _http_error_retryable(response: httpx.Response | None) -> bool:
+    """Return whether replaying the identical provider request may recover."""
+
+    status = response.status_code if response is not None else None
+    body = (response.text if response is not None else "") or ""
+    lowered = body.lower()
+
+    if status in {401, 402} or "invalid api key" in lowered or "authentication" in lowered:
+        return False
+    if "insufficient balance" in lowered or "insufficient_balance" in lowered:
+        return False
+    if "quota" in lowered and ("exceed" in lowered or "exhausted" in lowered):
+        return False
+    if status is None:
+        return True
+    return status == 429 or status >= 500
+
+
 def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
     """向 DeepSeek chat/completions 发请求，统一处理超时与 HTTP 错误。"""
     if not settings.deepseek_api_key:
-        raise BusinessException("未配置 DEEPSEEK_API_KEY，无法调用大模型")
+        raise ProviderException("未配置 DEEPSEEK_API_KEY，无法调用大模型", retryable=False)
 
     url = f"{settings.deepseek_base_url.rstrip('/')}/v1/chat/completions"
     headers = {
@@ -66,15 +84,25 @@ def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
             response.raise_for_status()
             data = response.json()
     except httpx.TimeoutException as exc:
-        logger.exception("LLM request timed out")
-        raise BusinessException("大模型请求超时，请稍后重试") from exc
+        logger.warning("LLM request timed out")
+        raise ProviderException(
+            "大模型请求超时，请稍后重试",
+            retryable=True,
+        ) from exc
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:300] if exc.response is not None else str(exc)
-        logger.exception("LLM HTTP error: %s", detail)
-        raise BusinessException(_http_error_message(exc.response)) from exc
+        status = exc.response.status_code if exc.response is not None else None
+        logger.warning("LLM HTTP error status=%s: %s", status, detail)
+        raise ProviderException(
+            _http_error_message(exc.response),
+            retryable=_http_error_retryable(exc.response),
+        ) from exc
     except httpx.HTTPError as exc:
-        logger.exception("LLM network error")
-        raise BusinessException("无法连接大模型服务，请检查网络或代理设置后重试") from exc
+        logger.warning("LLM network error: %s", exc)
+        raise ProviderException(
+            "无法连接大模型服务，请检查网络或代理设置后重试",
+            retryable=True,
+        ) from exc
     if not isinstance(data, dict):
         raise BusinessException("大模型返回格式异常")
     return data

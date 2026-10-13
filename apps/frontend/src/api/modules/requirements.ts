@@ -159,9 +159,16 @@ export function continueRequirements(id: number) {
   })
 }
 
+export function retryTerminalEngineering(id: number, runId: string) {
+  return apiRequest<RequirementsStatus>(
+    `/api/v1/projects/${id}/build-runs/${runId}/engineering/retry`,
+    { method: 'POST' },
+  )
+}
 export function pauseBuildRun(id: number, runId: string) {
   return apiRequest<RequirementsStatus>(`/api/v1/projects/${id}/build-runs/${runId}/pause`, {
     method: 'POST',
+    keepalive: true,
   })
 }
 

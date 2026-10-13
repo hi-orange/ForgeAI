@@ -27,7 +27,11 @@ from app.services import plan as plan_service
 from app.services import task as task_service
 from app.services.app_spec import approve_requirements
 from app.services.engineering import APPROVAL_VERSION
-from app.services.requirements import get_requirements_status
+from app.services.requirements import (
+    continue_requirements,
+    get_requirements_status,
+    pause_active_execution,
+)
 from app.services.task_execution import utc_now
 
 
@@ -165,6 +169,29 @@ class DesignHandoffTests(ProductManagerWorkflowFixture):
         self.assertEqual((progress.plan_id, progress.task_id), (assigned.plan_id, assigned.task_id))
         self.assertEqual(progress.result.configuration_item_id, result.item_id)
         self.assertEqual(progress.app_spec.model_dump(), valid_spec())
+
+    def test_pending_architect_pauses_and_resumes_without_starting_work(self):
+        result = self._publish_only()
+        assigned = self._assign(result.item_id)
+        with self.session_factory() as db:
+            paused = pause_active_execution(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+            )
+            self.assertEqual(paused.state, "retry_available")
+            self.assertEqual(paused.task_id, assigned.task_id)
+            self.assertIn("暂停", paused.error or "")
+            run = db.get(BuildRun, self.run.id)
+            self.assertIsNotNone(run.paused_at)
+
+        with self.session_factory() as db:
+            resumed = continue_requirements(db, self.owner, self.project.id)
+            self.assertEqual(resumed.state, "design_pending")
+            run = db.get(BuildRun, self.run.id)
+            self.assertIsNone(run.paused_at)
+        self.assertEqual(self._count(TaskExecution), 0)
 
     def test_questions_never_create_a_design_plan(self):
         self.chat.return_value = prd_turn(valid_spec(open_questions=["导出格式？"]))

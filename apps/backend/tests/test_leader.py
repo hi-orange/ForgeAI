@@ -312,6 +312,39 @@ class LeaderTests(unittest.TestCase):
             [2, 4, 6, 8, 10],
         )
 
+    def test_simple_dispatch_reserves_its_last_turn_for_completion(self):
+        actions = [
+            ToolCall(id="context", name="read_project_context", arguments={}),
+            ToolCall(id="intent", name="classify_intent", arguments={"intent": intent()}),
+            ToolCall(id="read_1", name="read_plan", arguments={}),
+            ToolCall(id="read_2", name="read_plan", arguments={}),
+            ToolCall(id="read_3", name="read_plan", arguments={}),
+            ToolCall(id="plan", name="create_plan", arguments={"plan": product_plan()}),
+            ToolCall(
+                id="dispatch",
+                name="dispatch_task",
+                arguments={"task_key": "requirements"},
+            ),
+            ToolCall(
+                id="finish",
+                name="finish_turn",
+                arguments={"action": "dispatch", "summary": "Start requirements."},
+            ),
+        ]
+        turns = [ChatWithToolsResult(tool_calls=[action]) for action in actions]
+        with patch.object(leader_agent, "chat_with_tools", side_effect=turns) as chat:
+            outcome = leader_agent.lead_project_turn(
+                leader_context(),
+                max_turns=leader_agent.LEADER_SIMPLE_DISPATCH_TURNS,
+            )
+
+        self.assertEqual(outcome.action, "dispatch")
+        self.assertEqual(chat.call_count, leader_agent.LEADER_SIMPLE_DISPATCH_TURNS)
+        self.assertEqual(
+            {tool.name for tool in chat.call_args_list[-1].kwargs["tools"]},
+            {"request_user_input", "finish_turn"},
+        )
+
     def test_agent_rejects_tools_outside_leader_role(self):
         with patch.object(
             leader_agent,

@@ -5,7 +5,7 @@ from datetime import timedelta
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from app.services.task_execution import EXECUTION_LEASE, utc_now
 from app.services.workflow_events import append_event, sync_checkpoint_activity_events
 
 ACTIVE_JOB_STATUSES = ("queued", "running", "retry_wait")
+PAUSED_JOB_ERROR = "用户离开项目页面，构建已暂停。"
 ROLE_JOB_TYPES = {
     TaskRecipient.PRODUCT_MANAGER.value: "product_manager",
     TaskRecipient.ARCHITECT.value: "architect",
@@ -101,9 +102,11 @@ def claim_next_job(db: Session, worker_id: str) -> WorkflowJob | None:
     candidate_ids = list(
         db.scalars(
             select(WorkflowJob.job_id)
+            .outerjoin(BuildRun, BuildRun.run_id == WorkflowJob.build_run_id)
             .where(
                 WorkflowJob.status.in_(("queued", "retry_wait")),
                 WorkflowJob.available_at <= now,
+                BuildRun.paused_at.is_(None),
             )
             .order_by(WorkflowJob.available_at, WorkflowJob.created_at)
             .limit(8)
@@ -118,6 +121,12 @@ def claim_next_job(db: Session, worker_id: str) -> WorkflowJob | None:
                     WorkflowJob.job_id == job_id,
                     WorkflowJob.status.in_(("queued", "retry_wait")),
                     WorkflowJob.available_at <= now,
+                    or_(
+                        WorkflowJob.build_run_id.is_(None),
+                        WorkflowJob.build_run_id.in_(
+                            select(BuildRun.run_id).where(BuildRun.paused_at.is_(None))
+                        ),
+                    ),
                 )
                 .values(
                     status="running",
@@ -264,7 +273,8 @@ def fail_job(db: Session, job_id: str, worker_id: str, error: Exception) -> None
             payload["recovery_execution_id"] = execution.execution_id
             job.payload = payload
             job.execution_id = execution.execution_id
-    terminal = job.attempt >= job.max_attempts
+    retryable = getattr(error, "retryable", True) is not False
+    terminal = not retryable or job.attempt >= job.max_attempts
     job.status = "failed" if terminal else "retry_wait"
     job.available_at = utc_now() + timedelta(seconds=min(60, 2**job.attempt))
     job.finished_at = utc_now() if terminal else None
@@ -281,7 +291,7 @@ def fail_job(db: Session, job_id: str, worker_id: str, error: Exception) -> None
         task_id=job.task_id,
         execution_id=execution_id,
         job_id=job.job_id,
-        payload={"attempt": job.attempt, "error": message},
+        payload={"attempt": job.attempt, "error": message, "retryable": retryable},
     )
     db.commit()
 
@@ -362,10 +372,12 @@ def recover_orphaned_work(db: Session) -> int:
         .join(Task, Task.task_id == TaskExecution.task_id)
         .join(Plan, Plan.plan_id == Task.plan_id)
         .join(Project, Project.id == Plan.project_id)
+        .join(BuildRun, BuildRun.run_id == Plan.build_run_id)
         .where(
             TaskExecution.status == "running",
             TaskExecution.active_slot == 1,
             TaskExecution.expires_at <= now,
+            BuildRun.paused_at.is_(None),
         )
         .with_for_update()
     ).all()
@@ -377,6 +389,33 @@ def recover_orphaned_work(db: Session) -> int:
             )
         )
         if active is not None:
+            continue
+        draft = execution.draft if isinstance(execution.draft, dict) else {}
+        checkpoint = draft.get("checkpoint")
+        if isinstance(checkpoint, dict) and checkpoint.get("outcome") == "blocked":
+            reason = str(checkpoint.get("blocked_reason") or "").strip()
+            if not reason:
+                reason = "执行已阻塞，等待用户显式继续。"
+            sync_checkpoint_activity_events(db, execution)
+            execution.status = "failed"
+            execution.active_slot = None
+            execution.finished_at = now
+            execution.error = reason[:500]
+            append_event(
+                db,
+                idempotency_key=f"execution:{execution.execution_id}:blocked",
+                stream_key=f"execution:{execution.execution_id}",
+                event_type="execution_blocked",
+                project_id=plan.project_id,
+                build_run_id=plan.build_run_id,
+                task_id=task.task_id,
+                execution_id=execution.execution_id,
+                payload={
+                    "reason": reason[:500],
+                    "recovery_skipped": True,
+                },
+            )
+            recovered += 1
             continue
         job_type = ROLE_JOB_TYPES.get(task.recipient)
         if job_type is None:
@@ -417,6 +456,7 @@ def recover_orphaned_work(db: Session) -> int:
             Plan.status == "running",
             BuildRun.status == "running",
             BuildRun.active_slot == 1,
+            BuildRun.paused_at.is_(None),
         )
         .with_for_update()
     ).all()
@@ -537,6 +577,56 @@ def recover_unapplied_decisions(db: Session) -> int:
             continue
         recovered += 1
     return recovered
+
+
+def pause_jobs_for_run(
+    db: Session,
+    build_run_id: str,
+    *,
+    execution_id: str | None = None,
+    commit: bool = False,
+) -> int:
+    """Release running leases while keeping jobs resumable behind a paused BuildRun."""
+
+    now = utc_now()
+    jobs = list(
+        db.scalars(
+            select(WorkflowJob)
+            .where(
+                WorkflowJob.build_run_id == build_run_id,
+                WorkflowJob.status.in_(ACTIVE_JOB_STATUSES),
+            )
+            .with_for_update()
+        ).all()
+    )
+    for job in jobs:
+        if job.status == "running":
+            job.status = "retry_wait"
+            job.available_at = now
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.finished_at = None
+        job.error = PAUSED_JOB_ERROR
+        if execution_id is not None and job.task_id is not None:
+            payload = dict(job.payload)
+            payload["recovery_execution_id"] = execution_id
+            job.payload = payload
+            job.execution_id = execution_id
+        append_event(
+            db,
+            idempotency_key=f"job:{job.job_id}:attempt:{job.attempt}:paused",
+            stream_key=f"job:{job.job_id}",
+            event_type="job_paused",
+            project_id=job.project_id,
+            build_run_id=job.build_run_id,
+            task_id=job.task_id,
+            execution_id=job.execution_id,
+            job_id=job.job_id,
+            payload={"attempt": job.attempt},
+        )
+    if commit:
+        db.commit()
+    return len(jobs)
 
 
 def cancel_jobs_for_run(db: Session, build_run_id: str, *, commit: bool = False) -> int:

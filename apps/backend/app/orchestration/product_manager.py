@@ -21,6 +21,7 @@ from app.models.configuration_item import ConfigurationItemState, ConfigurationI
 from app.models.plan import Plan, PlanStatus
 from app.models.requirement_clarification import RequirementClarification
 from app.models.task import Task, TaskRecipient, TaskStatus
+from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.schemas.app_spec import AppSpec
 from app.schemas.product_manager import ProductManagerResult
@@ -75,8 +76,13 @@ def _validated_app_spec(payload: object) -> AppSpec:
 class _ProductManagerWorkflow:
     """Sequential PM steps; each method opens its own short DB session."""
 
-    def __init__(self, session_factory: SessionFactory) -> None:
+    def __init__(
+        self,
+        session_factory: SessionFactory,
+        on_execution_started: Callable[[TaskExecution], None] | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._on_execution_started = on_execution_started
 
     def ensure_plan(self, state: WorkflowState) -> dict[str, object]:
         """Find clarification / Leader-authored PM plan, or create Plan v1."""
@@ -151,6 +157,8 @@ class _ProductManagerWorkflow:
                 state["task_id"],
                 recovery_execution_id=state.get("recovery_execution_id"),
             )
+            if self._on_execution_started is not None:
+                self._on_execution_started(execution)
             return {"execution_id": execution.execution_id, "saved_draft": execution.draft}
 
     def _fail_execution(self, state: WorkflowState) -> None:
@@ -346,6 +354,7 @@ def run_product_manager_workflow(
     message_id: int,
     *,
     recovery_execution_id: str | None = None,
+    on_execution_started: Callable[[TaskExecution], None] | None = None,
 ) -> ProductManagerWorkflowResult:
     """执行或从 SQL 业务边界恢复本轮 Product Manager 工作流。"""
 
@@ -376,4 +385,4 @@ def run_product_manager_workflow(
         "cause_message_id": payload.cause_message_id,
         "recovery_execution_id": payload.recovery_execution_id,
     }
-    return _ProductManagerWorkflow(factory).run(state)
+    return _ProductManagerWorkflow(factory, on_execution_started).run(state)

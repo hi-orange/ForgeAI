@@ -91,6 +91,8 @@ def start_execution(
 ) -> TaskExecution:
     try:
         run = lock_run(db, user, project_id, run_id)
+        if run.paused_at is not None:
+            raise ConflictException("构建已暂停，请先继续处理")
         row = db.execute(
             select(Task, Plan)
             .join(Plan, Task.plan_id == Plan.plan_id)
@@ -173,6 +175,7 @@ def fail_execution(
     execution_id: str,
     *,
     error: str = "任务未完成，可重试恢复；已保存的成果不受影响。",
+    commit: bool = True,
 ) -> bool:
     # 只结束自己的执行；旧执行的异常不能把恢复后的执行标记为失败。
     updated = cast(
@@ -193,5 +196,6 @@ def fail_execution(
             )
         ),
     )
-    db.commit()
+    if commit:
+        db.commit()
     return updated.rowcount == 1

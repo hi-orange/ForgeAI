@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.models.task import Task
+from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.orchestration.architect import run_architecture_task
 from app.services import leader as leader_service
@@ -70,6 +72,7 @@ def run_architect_and_continue(
     task_id: str,
     *,
     recovery_execution_id: str | None = None,
+    on_execution_started: Callable[[TaskExecution], None] | None = None,
 ) -> Task:
     """Run Architect, receive its result, then let Leader assign Code Engineer."""
 
@@ -80,6 +83,7 @@ def run_architect_and_continue(
         run_id,
         task_id,
         recovery_execution_id=recovery_execution_id,
+        on_execution_started=on_execution_started,
     )
     delivery = leader_service.dispatch_completed_design(
         db, user, project_id, run_id, design_item.item_id

@@ -267,7 +267,16 @@ def plan_work_item_files(
             json_output=True,
         )
         try:
-            return _validate_implementation_plan(raw, work_item=work_item)
+            batch = _validate_implementation_plan(raw, work_item=work_item)
+            repeated = repair_context.get("repeated_failed_file_set") if repair_context else None
+            if isinstance(repeated, list) and repeated:
+                planned = sorted(item.path.replace("\\", "/") for item in batch.plan.files)
+                if planned == sorted(repeated):
+                    raise BusinessException(
+                        "相同源码的检查已多次证明这组目标文件无效；请结合真实源码定位"
+                        "遗漏的集成文件，并调整 files，不要只修改 summary 或 description"
+                    )
+            return batch
         except BusinessException as exc:
             last_error = exc
             if attempt == 2:
@@ -279,7 +288,7 @@ def plan_work_item_files(
                 {
                     "role": "user",
                     "content": (
-                        "上一次输出不是符合 output_schema 的单个 JSON 对象。"
+                        "上一次文件计划未通过验证。"
                         f"具体校验结果：{last_error}。"
                         f"work_item_id 必须是 {work_item.id}，files 为 1 到 "
                         f"{MAX_FILES_PER_WORK_ITEM} 个（更少更好）；"

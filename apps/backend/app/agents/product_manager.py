@@ -20,7 +20,7 @@ from app.tools.product_manager import (
     execute_product_manager_tool,
 )
 
-MAX_PRODUCT_MANAGER_TOOL_TURNS = 8
+MAX_PRODUCT_MANAGER_TOOL_TURNS = 12
 PRODUCT_MANAGER_PROFILE = get_role_profile(TaskRecipient.PRODUCT_MANAGER)
 ALLOWED_PRODUCT_MANAGER_TOOLS = [
     tool for tool in PRODUCT_MANAGER_TOOLS if tool.name in PRODUCT_MANAGER_PROFILE.allowed_tools

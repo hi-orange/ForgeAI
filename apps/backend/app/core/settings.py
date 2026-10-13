@@ -70,9 +70,10 @@ class Settings(BaseSettings):
     preview_container_pids_limit: int = 256
     dependency_runtime_image: str = "forgeai-checks:fullstack-react-v1"
 
-    # Database-backed role/deployment queue. Development embeds one worker in the
-    # API process; production can disable it and run ``python -m app.worker``.
+    # Database-backed role/deployment queue. Development embeds a bounded worker
+    # pool; production can disable it and run ``python -m app.worker`` processes.
     workflow_embedded_worker: bool = True
+    workflow_embedded_worker_concurrency: int = 2
     workflow_poll_interval_seconds: float = 1.0
     workflow_recovery_interval_seconds: float = 15.0
     workflow_orphan_grace_seconds: int = 30

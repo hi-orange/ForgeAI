@@ -6,7 +6,7 @@ import unittest
 
 import httpx
 
-from app.core.llm import _http_error_message
+from app.core.llm import _http_error_message, _http_error_retryable
 from app.core.llm_response import CompletionContentError, normalize_completion_content
 
 
@@ -36,6 +36,15 @@ class LlmHttpErrorMessageTests(unittest.TestCase):
     def test_maps_generic_client_error(self) -> None:
         message = _http_error_message(_response(400, "bad request"))
         self.assertEqual(message, "大模型调用失败，请稍后重试")
+
+    def test_permanent_provider_errors_are_not_retryable(self) -> None:
+        self.assertFalse(_http_error_retryable(_response(402, "Insufficient Balance")))
+        self.assertFalse(_http_error_retryable(_response(401, "Invalid API key")))
+        self.assertFalse(_http_error_retryable(_response(400, "bad request")))
+
+    def test_transient_provider_errors_remain_retryable(self) -> None:
+        self.assertTrue(_http_error_retryable(_response(429, "Rate limit exceeded")))
+        self.assertTrue(_http_error_retryable(_response(503, "unavailable")))
 
     def test_provider_adapter_removes_outer_final_envelope(self) -> None:
         self.assertEqual(

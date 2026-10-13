@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,7 +34,10 @@ from app.orchestration.code_engineer import (
     _load_checkpoint,
     _normalize_plan,
     _platform_file_context,
+    _repair_source_context,
+    _repeated_failed_file_set,
     _resume_blocked_checkpoint,
+    prepare_manual_repair_retry,
     run_engineering_workflow,
 )
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
@@ -42,6 +46,7 @@ from app.schemas.code_artifact import CodeArtifact
 from app.schemas.system_design import SystemDesign
 from app.services.engineering import read_frozen_input_snapshot
 from app.services.engineering.completion import complete_code_engineer_task
+from app.services.requirements import get_requirements_status
 from app.tools.check_diagnostics import analyze_check_failure, check_output_excerpt
 from app.tools.checks import CHECK_RUNTIME_VERSION, source_snapshot
 
@@ -247,6 +252,120 @@ class EngineeringLoopTests(EngineeringClaimTests):
             )
         self.assertEqual(batch.plan.summary, "实现职位列表页")
         self.assertTrue(chat.call_args.kwargs["json_output"])
+
+    def test_repair_source_context_includes_failing_file_and_direct_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            failing = root / "frontend/src/view.tsx"
+            dependency = root / "frontend/src/integration.tsx"
+            failing.parent.mkdir(parents=True)
+            failing.write_text('import { route } from "./integration";\n', encoding="utf-8")
+            dependency.write_text('export const route = "/view";\n', encoding="utf-8")
+            repair = {
+                "diagnostics": [{"path": "src/view.tsx", "line": 1}],
+                "previous_plan": {
+                    "files": [
+                        {
+                            "path": "frontend/src/view.tsx",
+                            "context_paths": ["frontend/src/integration.tsx", "../outside.tsx"],
+                        }
+                    ]
+                },
+            }
+
+            context = _repair_source_context(root, repair)
+
+        self.assertEqual(
+            [item["path"] for item in context],
+            [
+                "frontend/src/view.tsx",
+                "frontend/src/integration.tsx",
+            ],
+        )
+        self.assertIn("export const route", context[1]["content"])
+
+    def test_repair_planner_rejects_repeated_ineffective_file_set(self):
+        spec = AppSpec.model_validate(valid_spec())
+        work_item = plan_delivery(spec)[0]
+        old_plan = {
+            "summary": "rewrite view",
+            "files": [
+                {"path": "frontend/src/view.tsx", "description": "rewrite", "context_paths": []}
+            ],
+        }
+        corrected_plan = {
+            "summary": "update integration",
+            "files": [
+                *old_plan["files"],
+                {
+                    "path": "frontend/src/integration.tsx",
+                    "description": "connect view",
+                    "context_paths": [],
+                },
+            ],
+        }
+        with patch(
+            "app.agents.code_engineer.chat_completion",
+            side_effect=[json.dumps(old_plan), json.dumps(corrected_plan)],
+        ) as chat:
+            batch = plan_work_item_files(
+                spec=spec,
+                work_item=work_item,
+                workspace_file_index={"paths": []},
+                system_design=None,
+                repair_context={
+                    "repeated_failed_file_set": ["frontend/src/view.tsx"],
+                    "diagnostic_file_context": [
+                        {"path": "frontend/src/integration.tsx", "content": "existing code"}
+                    ],
+                },
+            )
+        self.assertEqual(len(chat.call_args_list), 2)
+        self.assertEqual(
+            [item.path for item in batch.plan.files],
+            [
+                "frontend/src/view.tsx",
+                "frontend/src/integration.tsx",
+            ],
+        )
+        self.assertIn("相同源码", chat.call_args_list[1].kwargs["messages"][-1]["content"])
+
+    def test_repeated_failed_file_set_requires_same_source_and_targets(self):
+        plan = {
+            "work_item_id": "feature",
+            "files": [{"path": "frontend/src/view.tsx"}],
+        }
+        checkpoint = {
+            "plan_history": [
+                {
+                    "plan": plan,
+                    "check": {
+                        "tool_call_id": "check",
+                        "name": "run_check",
+                        "ok": False,
+                        "summary": "failed",
+                        "error_code": "CHECK_FAILED",
+                        "data": {"source_hash": "same", "output": "error TS2322: wrong type"},
+                    },
+                },
+                {
+                    "plan": plan,
+                    "check": {
+                        "tool_call_id": "check",
+                        "name": "run_check",
+                        "ok": False,
+                        "summary": "failed",
+                        "error_code": "CHECK_FAILED",
+                        "data": {"source_hash": "same", "output": "error TS2322: wrong type"},
+                    },
+                },
+            ]
+        }
+        self.assertEqual(
+            _repeated_failed_file_set(checkpoint, "feature"), ["frontend/src/view.tsx"]
+        )
+        checkpoint["plan_history"][-1]["check"]["data"]["source_hash"] = "changed"
+        self.assertEqual(_repeated_failed_file_set(checkpoint, "feature"), [])
 
     def test_environment_preflight_blocks_before_planner_or_writer(self):
         published = self._publish_only()
@@ -542,6 +661,10 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertIsNotNone(repair_contexts[1])
         assert repair_contexts[1] is not None
         self.assertIn("syntax error", repair_contexts[1]["failed_check"]["data"]["output"])
+        self.assertIn(
+            "generated/feat_records.py",
+            [item["path"] for item in repair_contexts[1]["diagnostic_file_context"]],
+        )
         with self.session_factory() as db:
             saved = db.get(TaskExecution, execution.execution_id)
             snapshot = read_frozen_input_snapshot(saved)
@@ -963,6 +1086,92 @@ class EngineeringLoopTests(EngineeringClaimTests):
             self.assertEqual(checkpoint["outcome"], "running")
             self.assertNotIn("feat_records", checkpoint["repair_rounds"])
             self.assertNotIn("feat_records", checkpoint["failure_streaks"])
+
+    def test_inactive_terminal_checkpoint_remains_non_retryable_in_project_status(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        task, execution = self._claim(delivery.task_id)
+        with self.session_factory() as db:
+            saved = db.get(TaskExecution, execution.execution_id)
+            snapshot = read_frozen_input_snapshot(saved)
+            assert saved is not None and snapshot is not None
+            snapshot["checkpoint"] = {
+                "kind": "engineering_checkpoint",
+                "schema_version": 9,
+                "execution_mode": EXECUTION_MODE,
+                "outcome": "blocked",
+                "blocked_reason": "相同检查错误已连续出现 3 次",
+                "blocked_reason_code": "REPEATED_CHECK_FAILURE",
+                "blocked_executor_runtime_version": EXECUTION_MODE,
+                "modified_files": ["frontend/src/App.tsx"],
+                "activity": [],
+            }
+            saved.draft = snapshot
+            saved.status = "failed"
+            saved.active_slot = None
+            saved.finished_at = saved.started_at
+            saved.error = "Code Engineer 已暂停"
+            flag_modified(saved, "draft")
+            db.commit()
+
+        with self.session_factory() as db:
+            status = get_requirements_status(db, self.owner, self.project.id)
+
+        self.assertEqual(status.state, "retry_available")
+        self.assertFalse(status.retryable)
+        self.assertTrue(status.code_ready)
+        self.assertIn("相同检查错误", status.error or "")
+
+    def test_manual_retry_resets_terminal_failure_with_a_fresh_bounded_budget(self):
+        checkpoint = {
+            "kind": "engineering_checkpoint",
+            "schema_version": 9,
+            "execution_mode": EXECUTION_MODE,
+            "outcome": "blocked",
+            "blocked_reason": "相同检查错误已连续出现 3 次",
+            "blocked_reason_code": "REPEATED_CHECK_FAILURE",
+            "blocked_executor_runtime_version": EXECUTION_MODE,
+            "current_work_item_id": "feat_records",
+            "repair_rounds": {"feat_records": 3},
+            "failure_streaks": {"feat_records": {"count": 3}},
+            "model_turns": 17,
+            "tool_calls": 41,
+            "activity": [],
+            "plan_history": [
+                {
+                    "check": {
+                        "tool_call_id": "quick_feat_records",
+                        "name": "run_check",
+                        "ok": False,
+                        "error_code": "COMMAND_FAILED",
+                        "summary": "快速检查失败",
+                        "data": {"check_id": "quick", "output": "TS2322: wrong route"},
+                    }
+                }
+            ],
+        }
+        snapshot = {
+            "checkpoint": checkpoint,
+            "call_budget": {
+                "max_model_turns": 40,
+                "max_tool_calls": 120,
+                "max_repair_rounds": 3,
+            },
+        }
+
+        prepared = prepare_manual_repair_retry(snapshot)
+
+        self.assertEqual(snapshot["checkpoint"]["outcome"], "blocked")
+        resumed = prepared["checkpoint"]
+        self.assertEqual(resumed["outcome"], "running")
+        self.assertEqual(resumed["manual_repair_attempts"], 1)
+        self.assertNotIn("feat_records", resumed["repair_rounds"])
+        self.assertNotIn("feat_records", resumed["failure_streaks"])
+        self.assertEqual(resumed["repair_context"]["round"], 1)
+        self.assertEqual(prepared["call_budget"]["max_model_turns"], 57)
+        self.assertEqual(prepared["call_budget"]["max_tool_calls"], 161)
+        self.assertEqual(prepared["call_budget"]["max_repair_rounds"], 3)
+        self.assertEqual(resumed["activity"][-1]["name"], "manual_repair_retry")
 
     def test_resume_after_budget_exhaustion_replans_from_last_check(self):
         checkpoint = {

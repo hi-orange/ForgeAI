@@ -1,13 +1,15 @@
 import time
 import unittest
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.pool import StaticPool
 
+from app import worker as worker_module
+from app.core.exceptions import WorkflowBlockedException
 from app.db.database import Base
 from app.models.build_run import BuildRun
 from app.models.plan import Plan
@@ -27,6 +29,7 @@ from app.services.workflow_jobs import (
     claim_next_job,
     enqueue_job,
     fail_job,
+    pause_jobs_for_run,
     recover_expired_jobs,
     recover_orphaned_work,
     recover_unapplied_decisions,
@@ -185,6 +188,56 @@ class DurableWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(event_types, ["job_queued", "job_claimed"])
 
+    def test_paused_run_is_not_claimed_until_resumed(self) -> None:
+        with self.sessions() as db:
+            run, task, execution = self._execution_graph(db, "paused_claim")
+            enqueue_job(
+                db,
+                job_type="engineering",
+                idempotency_key="engineering:paused_claim",
+                project_id=self.project_id,
+                build_run_id=run.run_id,
+                task_id=task.task_id,
+                execution_id=execution.execution_id,
+                payload={"user_id": self.user_id},
+            )
+            run.paused_at = utc_now()
+            db.commit()
+            self.assertIsNone(claim_next_job(db, "worker-paused"))
+            run.paused_at = None
+            db.commit()
+            claimed = claim_next_job(db, "worker-resumed")
+            self.assertIsNotNone(claimed)
+
+    def test_pausing_running_job_releases_lease_for_recovery(self) -> None:
+        with self.sessions() as db:
+            run, task, execution = self._execution_graph(db, "pause_lease")
+            job = enqueue_job(
+                db,
+                job_type="engineering",
+                idempotency_key="engineering:pause_lease",
+                project_id=self.project_id,
+                build_run_id=run.run_id,
+                task_id=task.task_id,
+                execution_id=execution.execution_id,
+                payload={"user_id": self.user_id},
+            )
+            claimed = claim_next_job(db, "worker-active")
+            self.assertIsNotNone(claimed)
+            pause_jobs_for_run(db, run.run_id, execution_id=execution.execution_id, commit=True)
+            db.refresh(job)
+            self.assertEqual(job.status, "retry_wait")
+            self.assertIsNone(job.lease_owner)
+            self.assertEqual(job.payload["recovery_execution_id"], execution.execution_id)
+            event_types = list(
+                db.scalars(
+                    select(WorkflowEvent.event_type)
+                    .where(WorkflowEvent.job_id == job.job_id)
+                    .order_by(WorkflowEvent.sequence)
+                )
+            )
+            self.assertEqual(event_types[-1], "job_paused")
+
     def test_worker_claims_executes_and_completes_persisted_job(self) -> None:
         with self.sessions() as db:
             run, task, execution = self._execution_graph(db, "worker")
@@ -212,6 +265,91 @@ class DurableWorkflowTests(unittest.TestCase):
             assert completed is not None
             self.assertEqual(completed.status, "succeeded")
             self.assertIsNone(completed.lease_owner)
+
+    def test_architect_job_attaches_execution_before_role_work(self) -> None:
+        worker_id = "worker-architect"
+        with self.sessions() as db:
+            run, task, execution = self._execution_graph(
+                db,
+                "architect_attach",
+                recipient="Architect",
+            )
+            job = enqueue_job(
+                db,
+                job_type="architect",
+                idempotency_key="architect:architect_attach",
+                project_id=self.project_id,
+                build_run_id=run.run_id,
+                task_id=task.task_id,
+                payload={
+                    "user_id": self.user_id,
+                    "project_id": self.project_id,
+                    "run_id": run.run_id,
+                    "task_id": task.task_id,
+                },
+            )
+            claimed = claim_next_job(db, worker_id)
+            self.assertIsNotNone(claimed)
+            assert claimed is not None
+            db.expunge(claimed)
+
+        def run_role(
+            _db,
+            _user,
+            _project_id,
+            _run_id,
+            _task_id,
+            *,
+            recovery_execution_id=None,
+            on_execution_started=None,
+        ):
+            self.assertEqual(recovery_execution_id, execution.execution_id)
+            self.assertIsNotNone(on_execution_started)
+            with self.sessions() as db:
+                claimed_execution = db.get(TaskExecution, execution.execution_id)
+                self.assertIsNotNone(claimed_execution)
+                assert claimed_execution is not None
+                db.expunge(claimed_execution)
+            on_execution_started(claimed_execution)
+            with self.sessions() as db:
+                attached = db.get(WorkflowJob, job.job_id)
+                self.assertIsNotNone(attached)
+                assert attached is not None
+                self.assertEqual(attached.execution_id, execution.execution_id)
+
+        with (
+            patch("app.worker.SessionLocal", self.sessions),
+            patch(
+                "app.orchestration.leader.run_architect_and_continue",
+                side_effect=run_role,
+            ),
+        ):
+            worker_module._handle_architect(claimed, worker_id)
+
+        with self.sessions() as db:
+            event = db.scalar(
+                select(WorkflowEvent).where(
+                    WorkflowEvent.job_id == job.job_id,
+                    WorkflowEvent.event_type == "execution_attached",
+                )
+            )
+            self.assertIsNotNone(event)
+
+    def test_embedded_worker_pool_starts_configured_workers_once(self) -> None:
+        workers = [MagicMock(), MagicMock()]
+        worker_module.stop_embedded_worker()
+        with (
+            patch.object(worker_module.settings, "workflow_embedded_worker_concurrency", 2),
+            patch.object(worker_module, "DurableWorker", side_effect=workers) as worker_type,
+        ):
+            worker_module.start_embedded_worker()
+            worker_module.start_embedded_worker()
+            self.assertEqual(worker_type.call_count, 2)
+            for worker in workers:
+                worker.start.assert_called_once_with()
+            worker_module.stop_embedded_worker()
+            for worker in workers:
+                worker.stop.assert_called_once_with()
 
     def test_cancelling_run_jobs_appends_cancellation_fact(self) -> None:
         with self.sessions() as db:
@@ -272,6 +410,33 @@ class DurableWorkflowTests(unittest.TestCase):
                 "activity",
             )
 
+    def test_non_retryable_job_failure_stops_after_first_attempt(self) -> None:
+        with self.sessions() as db:
+            run, task, execution = self._execution_graph(db, "non_retryable")
+            job = enqueue_job(
+                db,
+                job_type="engineering",
+                idempotency_key="engineering:non_retryable",
+                project_id=self.project_id,
+                build_run_id=run.run_id,
+                task_id=task.task_id,
+                execution_id=execution.execution_id,
+                payload={"user_id": self.user_id},
+            )
+            claim_next_job(db, "worker-a")
+            fail_job(
+                db,
+                job.job_id,
+                "worker-a",
+                WorkflowBlockedException("等待用户显式继续"),
+            )
+            db.refresh(job)
+            db.refresh(execution)
+            self.assertEqual(job.status, "failed")
+            self.assertEqual(job.attempt, 1)
+            self.assertEqual(execution.status, "failed")
+            self.assertIsNone(claim_next_job(db, "worker-b"))
+
     def test_expired_job_becomes_claimable_recovery(self) -> None:
         with self.sessions() as db:
             run, task, execution = self._execution_graph(db, "lease")
@@ -311,6 +476,36 @@ class DurableWorkflowTests(unittest.TestCase):
             self.assertEqual(job.status, "queued")
             self.assertEqual(job.build_run_id, run.run_id)
             self.assertEqual(job.payload["recovery_execution_id"], execution.execution_id)
+
+    def test_recovery_fences_blocked_execution_without_requeue(self) -> None:
+        with self.sessions() as db:
+            _, task, execution = self._execution_graph(db, "blocked_orphan", expired=True)
+            draft = dict(execution.draft or {})
+            checkpoint = dict(draft["checkpoint"])
+            checkpoint["outcome"] = "blocked"
+            checkpoint["blocked_reason"] = "provider account unavailable"
+            draft["checkpoint"] = checkpoint
+            execution.draft = draft
+            flag_modified(execution, "draft")
+            db.commit()
+
+            self.assertEqual(recover_orphaned_work(db), 1)
+            db.refresh(execution)
+            self.assertEqual(execution.status, "failed")
+            self.assertIsNone(execution.active_slot)
+            self.assertEqual(execution.error, "provider account unavailable")
+            self.assertIsNone(
+                db.scalar(select(WorkflowJob).where(WorkflowJob.task_id == task.task_id))
+            )
+            event = db.scalar(
+                select(WorkflowEvent).where(
+                    WorkflowEvent.execution_id == execution.execution_id,
+                    WorkflowEvent.event_type == "execution_blocked",
+                )
+            )
+            self.assertIsNotNone(event)
+            assert event is not None
+            self.assertTrue(event.payload["recovery_skipped"])
 
     def test_recovery_scan_covers_product_manager_execution(self) -> None:
         with self.sessions() as db:
