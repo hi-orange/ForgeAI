@@ -75,6 +75,7 @@ def valid_design() -> dict:
             }
         ],
         "constraints": ["所有查询按当前用户过滤。"],
+        "implementation_dependencies": [],
     }
 
 
@@ -227,6 +228,9 @@ class ArchitectTests(unittest.TestCase):
     def test_agent_edits_then_submits_validated_system_design(self):
         turns = [
             ChatWithToolsResult(
+                tool_calls=[ToolCall(id="intent", name="read_artifact", arguments={})]
+            ),
+            ChatWithToolsResult(
                 tool_calls=[
                     ToolCall(
                         id="edit",
@@ -252,7 +256,7 @@ class ArchitectTests(unittest.TestCase):
                 )
 
         self.assertEqual(result.model_dump(), valid_design())
-        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(chat.call_count, 3)
         self.assertEqual(
             {tool.name for tool in chat.call_args_list[0].kwargs["tools"]},
             architect_agent.ARCHITECT_PROFILE.allowed_tools,

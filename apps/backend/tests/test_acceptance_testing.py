@@ -10,8 +10,6 @@ from alembic.operations import Operations
 from sqlalchemy import create_engine
 from test_architect import valid_spec
 
-from app.core.exceptions import BusinessException
-from app.generation.delivery import FileTask, ImplementationPlan
 from app.schemas.agent_action import ToolCall, ToolExecutionResult
 from app.services.acceptance_testing import build_acceptance_test_plan
 from app.tools.test_engineer import TestEngineerToolState, execute_test_engineer_tool
@@ -67,24 +65,24 @@ class AcceptanceTestingTests(unittest.TestCase):
         self.assertTrue(all("run_check" in test.command for test in plan.tests))
         self.assertEqual(plan.protected_paths, [])
 
-    def test_code_engineer_cannot_plan_changes_to_frozen_test_assets(self):
-        from app.orchestration.code_engineer import _normalize_plan
+    def test_code_engineer_cannot_write_frozen_test_assets(self):
+        from app.generation.engineering.actions import prepare_action
 
         with TemporaryDirectory(prefix="forgeai-protected-tests-") as directory:
-            plan = ImplementationPlan(
-                work_item_id="feature",
-                summary="try to weaken acceptance",
-                files=[
-                    FileTask(
-                        id="weaken_test",
-                        path="backend/tests/acceptance/test_contract.py",
-                        description="remove failing assertion",
-                    )
-                ],
+            action = prepare_action(
+                ToolCall(
+                    id="weaken_test",
+                    name="write_file",
+                    arguments={
+                        "path": "backend/tests/acceptance/test_contract.py",
+                        "content": "pass",
+                    },
+                ),
+                Path(directory),
+                {},
             )
-
-            with self.assertRaisesRegex(BusinessException, "不能修改平台冻结"):
-                _normalize_plan(Path(directory), plan)
+            self.assertFalse(action.result.ok)
+            self.assertIn("不能修改冻结", action.result.summary)
 
     def test_report_is_bound_to_frozen_test_hash_and_test_ids(self):
         spec = valid_spec()

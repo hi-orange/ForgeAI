@@ -1,1491 +1,547 @@
-"""The planned-file engineering executor writes real files and repairs failed checks."""
-
-from __future__ import annotations
+"""Integration tests for the durable evidence-driven engineering executor."""
 
 import json
-import tempfile
-from pathlib import Path
 from unittest.mock import patch
 
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
-from test_architect import valid_design
 from test_engineering_claim import EngineeringClaimTests
 from test_product_manager_workflow import valid_spec
 
-from app.agents.code_engineer import (
-    CODE_ENGINEER_PROFILE,
-    CODE_ENGINEER_TOOLS,
-    PlannedFileBatch,
-    _normalize_source_candidate,
-    build_code_engineer_messages,
-    decide_next_action,
-    plan_work_item_files,
-)
+from app.agents.code_engineer import CODE_ENGINEER_PROFILE, CODE_ENGINEER_TOOLS, decide_next_action
 from app.core.exceptions import BusinessException
-from app.core.settings import settings
-from app.generation.delivery import FileTask, ImplementationPlan, plan_delivery
+from app.generation.delivery import planning_item
+from app.generation.engineering.checkpoint import (
+    EXECUTION_MODE,
+    load_checkpoint,
+    new_checkpoint,
+    prepare_manual_repair_retry,
+    resume_blocked_checkpoint,
+)
 from app.generation.workspace import default_workspace_path
-from app.models.source_artifact import SourceArtifact
 from app.models.task_execution import TaskExecution
 from app.models.workflow_event import WorkflowEvent
-from app.orchestration.code_engineer import (
-    EXECUTION_MODE,
-    _load_checkpoint,
-    _normalize_plan,
-    _platform_file_context,
-    _repair_source_context,
-    _repeated_failed_file_set,
-    _resume_blocked_checkpoint,
-    prepare_manual_repair_retry,
-    run_engineering_workflow,
-)
+from app.orchestration.code_engineer import run_engineering_workflow
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
 from app.schemas.app_spec import AppSpec
-from app.schemas.code_artifact import CodeArtifact
-from app.schemas.system_design import SystemDesign
 from app.services.engineering import read_frozen_input_snapshot
 from app.services.engineering.completion import complete_code_engineer_task
-from app.services.requirements import get_requirements_status
-from app.tools.check_diagnostics import analyze_check_failure, check_output_excerpt
-from app.tools.checks import CHECK_RUNTIME_VERSION, source_snapshot
+from app.tools.checks import source_snapshot
+
+
+def turn(name, **arguments):
+    return ChatWithToolsResult(tool_calls=[ToolCall(id="action", name=name, arguments=arguments)])
 
 
 class EngineeringLoopTests(EngineeringClaimTests):
-    def setUp(self) -> None:
+    def setUp(self):
         super().setUp()
-        self.environment_check = self.enterContext(
+        self.enterContext(
             patch(
                 "app.orchestration.code_engineer.check_tools.check_environment",
                 return_value=ToolExecutionResult(
-                    tool_call_id="check_environment",
-                    name="check_environment",
-                    ok=True,
-                    summary="隔离检查环境已就绪",
-                    data={"image": "forgeai-checks:fullstack-react-v1"},
+                    tool_call_id="environment", name="check_environment", ok=True, summary="ready"
                 ),
             )
         )
-
-    def _set_call_budget(self, execution_id: str, **updates: int) -> None:
-        with self.session_factory() as db:
-            execution = db.get(TaskExecution, execution_id)
-            snapshot = read_frozen_input_snapshot(execution)
-            assert snapshot is not None
-            snapshot["call_budget"] = {**snapshot["call_budget"], **updates}
-            execution.draft = snapshot
-            flag_modified(execution, "draft")
-            db.commit()
-
-    @staticmethod
-    def _file_plan(work_item_id: str, *, suffix: str = "") -> PlannedFileBatch:
-        return PlannedFileBatch(
-            plan=ImplementationPlan(
-                work_item_id=work_item_id,
-                summary=f"实现 {work_item_id}",
-                files=[
-                    FileTask(
-                        id=f"write_{work_item_id}{suffix}",
-                        path=f"generated/{work_item_id}.py",
-                        description="实现当前功能的完整模块",
-                        context_paths=["backend/app/main.py"],
-                    )
-                ],
+        self.model = self.enterContext(
+            patch(
+                "app.orchestration.code_engineer.decide_next_action",
+                side_effect=self._implement,
+            )
+        )
+        self.checks = self.enterContext(
+            patch(
+                "app.orchestration.code_engineer.check_tools.run_check",
+                side_effect=self._passing_check,
             )
         )
 
     @staticmethod
-    def _passing_check(root: Path, *, check_id: str, tool_call_id: str) -> ToolExecutionResult:
+    def _passing_check(root, *, check_id, tool_call_id):
         return ToolExecutionResult(
             tool_call_id=tool_call_id,
             name="run_check",
             ok=True,
-            summary="all 检查通过",
-            data={"check_id": check_id, "source_hash": source_snapshot(root)[1]},
+            summary="passed",
+            data={"source_hash": source_snapshot(root)[1], "check_id": check_id},
         )
 
-    def test_plan_delivery_covers_each_feature_once(self):
-        spec = AppSpec.model_validate(valid_spec())
-        items = plan_delivery(spec)
-        self.assertEqual([item.id for item in items], [feature.id for feature in spec.features])
-
-    def test_code_engineer_receives_only_role_allowed_tools(self):
-        self.assertEqual(CODE_ENGINEER_PROFILE.display_name, "Code Engineer")
-        self.assertEqual(
-            {tool.name for tool in CODE_ENGINEER_TOOLS},
-            CODE_ENGINEER_PROFILE.allowed_tools,
-        )
-
-    def test_legacy_controller_history_remains_parseable_but_is_not_the_executor(self):
-        spec = AppSpec.model_validate(valid_spec())
-        messages = build_code_engineer_messages(
-            spec=spec,
-            work_item=plan_delivery(spec)[0],
-            engineering_context={"workspace_file_index": {"paths": ["frontend/src/App.tsx"]}},
-            observations=[
-                ToolExecutionResult(
-                    tool_call_id="call_read",
-                    name="read_file",
-                    ok=True,
-                    summary="ok",
-                    arguments={"path": "frontend/src/App.tsx"},
-                )
-            ],
-            system_design=SystemDesign.model_validate(valid_design()),
-        )
-        self.assertEqual(
-            [item["role"] for item in messages],
-            ["system", "user", "assistant", "tool"],
-        )
-        self.assertEqual(messages[2]["tool_calls"][0]["id"], "call_read")
-
-    def test_legacy_controller_still_rejects_unoffered_tools(self):
-        spec = AppSpec.model_validate(valid_spec())
-        read_only = [tool for tool in CODE_ENGINEER_TOOLS if tool.name == "read_file"]
-        with patch(
-            "app.agents.code_engineer.chat_with_tools",
-            return_value=ChatWithToolsResult(
-                tool_calls=[
-                    ToolCall(
-                        id="write",
-                        name="write_new_code",
-                        arguments={"path": "backend/app/main.py"},
-                    )
-                ]
-            ),
-        ):
-            with self.assertRaisesRegex(BusinessException, "无权使用工具"):
-                decide_next_action(
-                    spec=spec,
-                    work_item=plan_delivery(spec)[0],
-                    engineering_context={"workspace_file_index": {"paths": []}},
-                    observations=[],
-                    system_design=None,
-                    tools=read_only,
-                )
-
-    def test_file_planner_accepts_workspace_root_configuration(self):
-        spec = AppSpec.model_validate(valid_spec())
-        work_item = plan_delivery(spec)[0]
-        payload = {
-            "work_item_id": work_item.id,
-            "summary": "更新根目录构建配置",
-            "files": [
-                {
-                    "id": "build_config",
-                    "path": "build.config.json",
-                    "description": "配置应用构建入口",
-                    "context_paths": ["frontend/package.json"],
-                }
-            ],
-        }
-        with patch("app.agents.code_engineer.chat_completion", return_value=json.dumps(payload)):
-            batch = plan_work_item_files(
-                spec=spec,
-                work_item=work_item,
-                workspace_file_index={"paths": ["frontend/package.json"]},
-                system_design=None,
-            )
-        root = default_workspace_path(self.workspace_root, self.project.id, self.run.run_id)
-        root.mkdir(parents=True, exist_ok=True)
-        normalized = _normalize_plan(root, batch.plan)
-        self.assertEqual(normalized.files[0].path, "build.config.json")
-        self.assertEqual(batch.deferred_files, ())
-
-    def test_plan_work_item_files_forces_json_and_retries_invalid_output(self):
-        spec = AppSpec.model_validate(valid_spec())
-        work_item = plan_delivery(spec)[0]
-        payload = {
-            "work_item_id": work_item.id,
-            "summary": "实现职位列表页",
-            "files": [
-                {
-                    "id": "job_list",
-                    "path": "frontend/src/views/Jobs.tsx",
-                    "description": "展示已发布职位",
-                    "context_paths": ["frontend/src/App.tsx"],
-                }
-            ],
-        }
-        calls: list[dict] = []
-
-        def fake_chat(*, messages, json_output=False, **_kwargs):
-            calls.append({"json_output": json_output, "messages": messages})
-            if len(calls) == 1:
-                return "这里先说明一下计划\n```json\nnot-json\n```"
-            return "备注：\n" + json.dumps(payload)
-
-        with patch("app.agents.code_engineer.chat_completion", side_effect=fake_chat):
-            batch = plan_work_item_files(
-                spec=spec,
-                work_item=work_item,
-                workspace_file_index={"paths": ["frontend/src/App.tsx"]},
-                system_design=None,
-            )
-        self.assertEqual(batch.plan.files[0].path, "frontend/src/views/Jobs.tsx")
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(all(call["json_output"] is True for call in calls))
-        self.assertIn("只重新输出完整 JSON", calls[1]["messages"][-1]["content"])
-
-    def test_plan_work_item_files_accepts_fenced_json_on_first_try(self):
-        spec = AppSpec.model_validate(valid_spec())
-        work_item = plan_delivery(spec)[0]
-        payload = {
-            "work_item_id": work_item.id,
-            "summary": "实现职位列表页",
-            "files": [
-                {
-                    "id": "job_list",
-                    "path": "frontend/src/views/Jobs.tsx",
-                    "description": "展示已发布职位",
-                    "context_paths": [],
-                }
-            ],
-        }
-        fenced = f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```"
-        with patch("app.agents.code_engineer.chat_completion", return_value=fenced) as chat:
-            batch = plan_work_item_files(
-                spec=spec,
-                work_item=work_item,
-                workspace_file_index={"paths": []},
-                system_design=None,
-            )
-        self.assertEqual(batch.plan.summary, "实现职位列表页")
-        self.assertTrue(chat.call_args.kwargs["json_output"])
-
-    def test_repair_source_context_includes_failing_file_and_direct_contract(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            failing = root / "frontend/src/view.tsx"
-            dependency = root / "frontend/src/integration.tsx"
-            failing.parent.mkdir(parents=True)
-            failing.write_text('import { route } from "./integration";\n', encoding="utf-8")
-            dependency.write_text('export const route = "/view";\n', encoding="utf-8")
-            repair = {
-                "diagnostics": [{"path": "src/view.tsx", "line": 1}],
-                "previous_plan": {
-                    "files": [
+    @staticmethod
+    def _implement(*, work_item, observations, **kwargs):
+        if work_item.id == "engineering_plan":
+            features = valid_spec()["features"]
+            return turn(
+                "update_delivery_plan",
+                reason="Shared visual foundation precedes feature UI",
+                items=[
+                    {
+                        "id": "visual",
+                        "title": "Visual foundation",
+                        "kind": "visual_foundation",
+                        "requirement_ids": [item["id"] for item in features],
+                    },
+                    *[
                         {
-                            "path": "frontend/src/view.tsx",
-                            "context_paths": ["frontend/src/integration.tsx", "../outside.tsx"],
+                            "id": item["id"],
+                            "title": item["text"],
+                            "requirement_ids": [item["id"]],
+                            "depends_on": ["visual"],
                         }
-                    ]
-                },
-            }
-
-            context = _repair_source_context(root, repair)
-
-        self.assertEqual(
-            [item["path"] for item in context],
-            [
-                "frontend/src/view.tsx",
-                "frontend/src/integration.tsx",
-            ],
-        )
-        self.assertIn("export const route", context[1]["content"])
-
-    def test_repair_planner_rejects_repeated_ineffective_file_set(self):
-        spec = AppSpec.model_validate(valid_spec())
-        work_item = plan_delivery(spec)[0]
-        old_plan = {
-            "summary": "rewrite view",
-            "files": [
-                {"path": "frontend/src/view.tsx", "description": "rewrite", "context_paths": []}
-            ],
-        }
-        corrected_plan = {
-            "summary": "update integration",
-            "files": [
-                *old_plan["files"],
-                {
-                    "path": "frontend/src/integration.tsx",
-                    "description": "connect view",
-                    "context_paths": [],
-                },
-            ],
-        }
-        with patch(
-            "app.agents.code_engineer.chat_completion",
-            side_effect=[json.dumps(old_plan), json.dumps(corrected_plan)],
-        ) as chat:
-            batch = plan_work_item_files(
-                spec=spec,
-                work_item=work_item,
-                workspace_file_index={"paths": []},
-                system_design=None,
-                repair_context={
-                    "repeated_failed_file_set": ["frontend/src/view.tsx"],
-                    "diagnostic_file_context": [
-                        {"path": "frontend/src/integration.tsx", "content": "existing code"}
+                        for item in features
                     ],
-                },
+                ],
             )
-        self.assertEqual(len(chat.call_args_list), 2)
-        self.assertEqual(
-            [item.path for item in batch.plan.files],
-            [
-                "frontend/src/view.tsx",
-                "frontend/src/integration.tsx",
-            ],
-        )
-        self.assertIn("相同源码", chat.call_args_list[1].kwargs["messages"][-1]["content"])
+        path = f"generated/{work_item.id}.py"
+        if not any(
+            o.ok and o.name == "write_file" and o.arguments.get("path") == path
+            for o in observations
+        ):
+            return turn("write_file", path=path, content="VALUE = 1\n")
+        return turn("complete_work_item", work_item_id=work_item.id, summary="Implemented feature")
 
-    def test_repeated_failed_file_set_requires_same_source_and_targets(self):
-        plan = {
-            "work_item_id": "feature",
-            "files": [{"path": "frontend/src/view.tsx"}],
-        }
-        checkpoint = {
-            "plan_history": [
-                {
-                    "plan": plan,
-                    "check": {
-                        "tool_call_id": "check",
-                        "name": "run_check",
-                        "ok": False,
-                        "summary": "failed",
-                        "error_code": "CHECK_FAILED",
-                        "data": {"source_hash": "same", "output": "error TS2322: wrong type"},
-                    },
-                },
-                {
-                    "plan": plan,
-                    "check": {
-                        "tool_call_id": "check",
-                        "name": "run_check",
-                        "ok": False,
-                        "summary": "failed",
-                        "error_code": "CHECK_FAILED",
-                        "data": {"source_hash": "same", "output": "error TS2322: wrong type"},
-                    },
-                },
-            ]
-        }
-        self.assertEqual(
-            _repeated_failed_file_set(checkpoint, "feature"), ["frontend/src/view.tsx"]
-        )
-        checkpoint["plan_history"][-1]["check"]["data"]["source_hash"] = "changed"
-        self.assertEqual(_repeated_failed_file_set(checkpoint, "feature"), [])
-
-    def test_environment_preflight_blocks_before_planner_or_writer(self):
+    def _start(self):
         published = self._publish_only()
         delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        unavailable = ToolExecutionResult(
-            tool_call_id="check_environment",
-            name="check_environment",
-            ok=False,
-            error_code="CHECK_ENVIRONMENT_UNAVAILABLE",
-            summary="隔离检查环境未就绪：Docker daemon 不可用",
-        )
-        with (
-            patch(
-                "app.orchestration.code_engineer.check_tools.check_environment",
-                return_value=unavailable,
-            ),
-            patch("app.orchestration.code_engineer.plan_work_item_files") as planner,
-            patch("app.orchestration.code_engineer.generate_file_content") as writer,
-        ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
-        self.assertEqual(result["outcome"], "blocked")
-        planner.assert_not_called()
-        writer.assert_not_called()
+        self.task, self.execution = self._claim(delivery.task_id)
+        self.root = default_workspace_path(self.workspace_root, self.project.id, self.run.run_id)
 
-    def test_planned_executor_auto_loads_context_writes_files_and_checks(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        contexts: list[dict] = []
-
-        def plan(*, work_item, **_kwargs):
-            return self._file_plan(work_item.id)
-
-        def write(*, engineering_context, work_item, **_kwargs):
-            contexts.append(engineering_context)
-            return f"FEATURE = {work_item.id!r}\n", 1
-
-        with (
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
-            patch("app.orchestration.code_engineer.generate_file_content", side_effect=write),
-            patch(
-                "app.orchestration.code_engineer.check_tools.run_check",
-                side_effect=self._passing_check,
-            ) as checks,
-        ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
-
-        self.assertEqual(result["outcome"], "generated")
-        self.assertEqual(checks.call_count, len(valid_spec()["features"]) + 1)
-        self.assertEqual(
-            [call.kwargs["check_id"] for call in checks.call_args_list],
-            ["quick", "quick", "all"],
-        )
-        self.assertEqual(len(contexts), len(valid_spec()["features"]))
-        for context in contexts:
-            files = context["platform_file_context"]["files"]
-            self.assertEqual(files[0]["role"], "target")
-            self.assertFalse(files[0]["exists"])
-            self.assertEqual(files[1]["path"], "backend/app/main.py")
-            self.assertIn("content", files[1])
-
-        workspace = default_workspace_path(self.workspace_root, self.project.id, self.run.run_id)
-        self.assertTrue((workspace / "generated/feat_records.py").is_file())
-        self.assertTrue((workspace / "generated/feat_export.py").is_file())
+    def _run(self):
         with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            checkpoint = snapshot["checkpoint"]
-            self.assertEqual(checkpoint["execution_mode"], EXECUTION_MODE)
-            self.assertEqual(checkpoint["planner_model_calls"], 2)
-            self.assertEqual(checkpoint["writer_model_calls"], 2)
-            self.assertEqual(checkpoint["outcome"], "generated")
-            labels = [item["label"] for item in checkpoint["activity"]]
-            self.assertIn("Plan files", labels)
-            self.assertIn("File plan ready", labels)
-            self.assertIn("Generate file", labels)
-            self.assertIn("File written", labels)
-            self.assertIn("Run quick checks", labels)
-            self.assertIn("Quick checks passed", labels)
-            self.assertIn("Run final checks", labels)
-            code_item = complete_code_engineer_task(
+            return run_engineering_workflow(
                 db,
                 self.owner,
                 self.project.id,
                 self.run.run_id,
-                task.task_id,
-                execution.execution_id,
+                self.task.task_id,
+                self.execution.execution_id,
+                session_factory=self.session_factory,
             )
-            artifact = CodeArtifact.model_validate(code_item.payload)
-            self.assertIsNotNone(artifact.source_artifact_id)
-            stored = db.get(SourceArtifact, artifact.source_artifact_id)
-            self.assertIsNotNone(stored)
-            assert stored is not None
-            self.assertEqual(stored.source_hash, artifact.source_hash)
-            self.assertEqual(stored.size_bytes, artifact.artifact_size_bytes)
 
-    def test_platform_file_context_keeps_image_deps_as_binary_metadata(self):
-        root = Path(self.workspace_root) / "binary-context"
-        image = root / "frontend/public/images/cafe-hero.jpg"
-        api = root / "frontend/src/lib/api.ts"
-        image.parent.mkdir(parents=True, exist_ok=True)
-        api.parent.mkdir(parents=True, exist_ok=True)
-        image.write_bytes(b"\xff\xd8\xfffake-jpeg")
-        api.write_text("export const ok = true\n", encoding="utf-8")
-        task = FileTask(
-            id="file_home",
-            kind="source",
-            path="frontend/src/pages/HomePage.tsx",
-            description="首页",
-            context_paths=[
-                "frontend/src/lib/api.ts",
-                "frontend/public/images/cafe-hero.jpg",
-            ],
+    def _checkpoint(self):
+        with self.session_factory() as db:
+            saved = db.get(TaskExecution, self.execution.execution_id)
+            return read_frozen_input_snapshot(saved)["checkpoint"]
+
+    def test_decisions_write_sources_and_platform_checks_before_publish(self):
+        self._start()
+        result = self._run()
+        self.assertEqual(result["outcome"], "generated")
+        self.assertEqual(
+            [c.kwargs["check_id"] for c in self.checks.call_args_list],
+            ["quick", "quick", "quick", "all"],
         )
-
-        context, expected_hash, read_count = _platform_file_context(root, task)
-
-        self.assertIsNone(expected_hash)
-        self.assertEqual(read_count, 1)
-        by_path = {item["path"]: item for item in context["files"]}
-        self.assertFalse(by_path["frontend/src/pages/HomePage.tsx"]["exists"])
-        self.assertIn("content", by_path["frontend/src/lib/api.ts"])
-        image_meta = by_path["frontend/public/images/cafe-hero.jpg"]
-        self.assertTrue(image_meta["exists"])
-        self.assertTrue(image_meta["binary"])
-        self.assertNotIn("content", image_meta)
-        self.assertEqual(image_meta["bytes"], len(b"\xff\xd8\xfffake-jpeg"))
-
-    def test_writer_normalizes_source_without_provider_protocol_rules(self):
-        content = _normalize_source_candidate(
-            "```ts\nexport const value = 1\n```", path="frontend/src/value.ts"
-        )
-        self.assertEqual(content, "export const value = 1\n")
-
-    def test_normalize_plan_routes_image_suffix_through_image_generator(self):
-        root = default_workspace_path(settings.runtime_data_root, self.project.id, self.run.run_id)
-        root.mkdir(parents=True, exist_ok=True)
-        plan = ImplementationPlan(
-            work_item_id="feat_visual",
-            summary="生成首页图",
-            files=[
-                FileTask(
-                    id="hero",
-                    kind="source",
-                    path="frontend/public/images/hero.jpg",
-                    description="首页主视觉",
-                )
-            ],
-        )
-        with patch.object(settings, "ark_api_key", "secret"):
-            normalized = _normalize_plan(root, plan)
-        self.assertEqual(normalized.files[0].kind, "image")
-
-    def test_planned_executor_generates_image_tasks_before_checks(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-
-        def plan(*, work_item, **_kwargs):
-            return PlannedFileBatch(
-                plan=ImplementationPlan(
-                    work_item_id=work_item.id,
-                    summary=f"生成 {work_item.id} 配图",
-                    files=[
-                        FileTask(
-                            id=f"image_{work_item.id}",
-                            kind="image",
-                            path=f"frontend/public/assets/{work_item.id}.png",
-                            description=f"{work_item.title} 的业务插画",
-                        )
-                    ],
+        self.assertEqual(result["model_turns"], 7)
+        for feature in valid_spec()["features"]:
+            self.assertEqual(
+                (self.root / f"generated/{feature['id']}.py").read_text(), "VALUE = 1\n"
+            )
+        checkpoint = self._checkpoint()
+        self.assertEqual(checkpoint["execution_mode"], EXECUTION_MODE)
+        self.assertEqual(checkpoint["completed_source_hash"], source_snapshot(self.root)[1])
+        with self.session_factory() as db:
+            events = list(
+                db.scalars(
+                    select(WorkflowEvent).where(
+                        WorkflowEvent.build_run_id == self.run.run_id,
+                        WorkflowEvent.event_type == "preview_revision_published",
+                    )
                 )
             )
-
-        def generate(root, *, path, tool_call_id, **_kwargs):
-            actual = path.removesuffix(".png") + ".jpg"
-            target = root / actual
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"\xff\xd8\xffgenerated")
-            return ToolExecutionResult(
-                tool_call_id=tool_call_id,
-                name="generate_image",
-                ok=True,
-                summary=f"已生成本地图片 {actual}",
-                data={"path": actual, "content_hash": "image-hash", "media_type": "image/jpeg"},
+            self.assertEqual(len(events), 3)
+            artifact = complete_code_engineer_task(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                self.task.task_id,
+                self.execution.execution_id,
             )
+            self.assertEqual(artifact.payload["source_hash"], checkpoint["completed_source_hash"])
+
+    def test_login_last_in_prd_runs_before_protected_business_feature(self):
+        from test_delivery_dependencies import dependency_design, dependency_items, dependency_spec
 
         with (
-            patch.object(settings, "ark_api_key", "secret"),
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
+            patch("test_engineering_claim.valid_spec", return_value=dependency_spec().model_dump()),
             patch(
-                "app.orchestration.code_engineer.image_tools.generate_project_image",
-                side_effect=generate,
-            ) as image_generator,
-            patch("app.orchestration.code_engineer.generate_file_content") as writer,
-            patch(
-                "app.orchestration.code_engineer.check_tools.run_check",
-                side_effect=self._passing_check,
+                "test_engineering_claim.valid_design", return_value=dependency_design().model_dump()
             ),
         ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
+            self._start()
+
+        def decide(*, work_item, observations, **kwargs):
+            if work_item.id == "engineering_plan":
+                return turn(
+                    "update_delivery_plan",
+                    reason="Respect authentication contract",
+                    items=[item.model_dump() for item in dependency_items()],
                 )
+            return self._implement(work_item=work_item, observations=observations)
 
-        self.assertEqual(result["outcome"], "generated")
-        self.assertEqual(image_generator.call_count, len(valid_spec()["features"]))
-        writer.assert_not_called()
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        selected = [call.kwargs["work_item"].id for call in self.model.call_args_list]
+        self.assertEqual(
+            selected, ["engineering_plan", "theme", "theme", "auth", "auth", "projects", "projects"]
+        )
+        checkpoint = self._checkpoint()
+        self.assertEqual(checkpoint["delivery_plan_version"], 1)
+        self.assertEqual(len(checkpoint["delivery_plan_history"]), 1)
+
+    def test_no_source_write_before_valid_dependency_plan(self):
+        self._start()
+        self.model.side_effect = None
+        self.model.return_value = turn(
+            "write_file", path="generated/premature.py", content="BAD = True"
+        )
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertFalse((self.root / "generated/premature.py").exists())
+        self.assertTrue(self._checkpoint()["needs_delivery_plan"])
+        self.assertTrue(
+            all("依赖计划" in row["summary"] for row in self._checkpoint()["observations"])
+        )
+
+    def test_replanning_inserts_prerequisite_without_resetting_progress(self):
+        self._start()
+        revised = False
+
+        def decide(*, work_item, observations, engineering_context, **kwargs):
+            nonlocal revised
+            if work_item.id == "feat_records" and not revised:
+                revised = True
+                items = [
+                    {key: value for key, value in row.items() if key not in {"status", "summary"}}
+                    for row in engineering_context["delivery_plan"]
+                ]
+                items[1]["depends_on"].append("records_data")
+                items.insert(
+                    1,
+                    {
+                        "id": "records_data",
+                        "title": "Shared records schema",
+                        "kind": "foundation",
+                        "requirement_ids": ["feat_records"],
+                        "depends_on": ["visual"],
+                    },
+                )
+                return turn(
+                    "update_delivery_plan", items=items, reason="Observed missing data prerequisite"
+                )
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        checkpoint = self._checkpoint()
+        self.assertEqual(len(checkpoint["delivery_plan_history"]), 2)
+        self.assertEqual(checkpoint["model_turns"], 10)
+        self.assertEqual(checkpoint["work_items"][0]["status"], "completed")
+        ids = [call.kwargs["work_item"].id for call in self.model.call_args_list]
+        self.assertEqual(ids.count("visual"), 2)
+        self.assertLess(ids.index("records_data"), len(ids) - 4)
+
+    def test_resume_keeps_graph_completed_nodes_and_counters(self):
+        self._start()
         with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            labels = [item["label"] for item in snapshot["checkpoint"]["activity"]]
-            self.assertIn("Generate image", labels)
-            self.assertIn("Image generated", labels)
+            row = db.get(TaskExecution, self.execution.execution_id)
+            payload = read_frozen_input_snapshot(row)
+            payload["call_budget"]["max_model_turns"] = 3
+            row.draft = payload
+            flag_modified(row, "draft")
+            db.commit()
+        self.assertEqual(self._run()["outcome"], "blocked")
+        first = self._checkpoint()
+        self.assertEqual(first["work_items"][0]["status"], "completed")
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, self.execution.execution_id)
+            payload = read_frozen_input_snapshot(row)
+            payload["call_budget"]["max_model_turns"] = 80
+            payload["checkpoint"]["outcome"] = "running"
+            payload["checkpoint"]["blocked_reason"] = None
+            row.draft = payload
+            flag_modified(row, "draft")
+            db.commit()
+        self.model.reset_mock()
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(self.model.call_args_list[0].kwargs["work_item"].id, "feat_records")
+        self.assertEqual(self._checkpoint()["model_turns"], 7)
+        self.assertEqual(len(self._checkpoint()["delivery_plan_history"]), 1)
 
-    def test_failed_check_creates_repair_plan_then_rechecks(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        repair_contexts: list[dict | None] = []
-        check_calls = {"count": 0}
+    def test_legacy_feature_queue_must_be_replanned_before_writes(self):
+        from app.generation.delivery import WorkItem
 
-        def plan(*, work_item, repair_context=None, **_kwargs):
-            repair_contexts.append(repair_context)
-            suffix = "_repair" if repair_context else ""
-            return self._file_plan(work_item.id, suffix=suffix)
+        self._start()
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, self.execution.execution_id)
+            payload = read_frozen_input_snapshot(row)
+            checkpoint = new_checkpoint()
+            checkpoint["model_turns"] = 4
+            checkpoint["work_items"] = [
+                WorkItem(
+                    id=feature["id"], title=feature["text"], requirement_ids=[feature["id"]]
+                ).model_dump()
+                for feature in valid_spec()["features"]
+            ]
+            payload["checkpoint"] = checkpoint
+            row.draft = payload
+            flag_modified(row, "draft")
+            db.commit()
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(self.model.call_args_list[0].kwargs["work_item"].id, "engineering_plan")
+        self.assertEqual(self._checkpoint()["model_turns"], 11)
+
+    def test_model_sees_real_write_and_failed_check_then_repairs(self):
+        self._start()
+        failures = 0
+        repaired = False
 
         def check(root, *, check_id, tool_call_id):
-            check_calls["count"] += 1
-            if check_calls["count"] == 1:
+            nonlocal failures
+            if failures == 0:
+                failures += 1
                 return ToolExecutionResult(
                     tool_call_id=tool_call_id,
                     name="run_check",
                     ok=False,
+                    summary="invalid feature",
                     error_code="CHECK_FAILED",
-                    summary="all 检查失败",
-                    data={
-                        "check_id": check_id,
-                        "source_hash": source_snapshot(root)[1],
-                        "output": "generated/feat_records.py:1: syntax error",
-                    },
+                    data={"source_hash": source_snapshot(root)[1], "output": "VALUE must be 2"},
                 )
             return self._passing_check(root, check_id=check_id, tool_call_id=tool_call_id)
 
-        with (
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
-            patch(
-                "app.orchestration.code_engineer.generate_file_content",
-                return_value=("VALUE = 'fixed'\n", 1),
-            ),
-            patch("app.orchestration.code_engineer.check_tools.run_check", side_effect=check),
-        ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
+        def decide(*, work_item, observations, engineering_context, **kwargs):
+            nonlocal repaired
+            if engineering_context["repair_context"] and not repaired:
+                self.assertTrue(
+                    any(not o.ok and "invalid feature" in o.summary for o in observations)
                 )
+                evidence = next(
+                    o for o in reversed(observations) if o.name == "write_file" and o.ok
+                )
+                repaired = True
+                return turn(
+                    "edit_file_by_replace",
+                    path=evidence.arguments["path"],
+                    old_text="VALUE = 1",
+                    new_text="VALUE = 2",
+                    expected_hash=evidence.data["content_hash"],
+                )
+            return self._implement(work_item=work_item, observations=observations)
 
-        self.assertEqual(result["outcome"], "generated")
-        self.assertIsNone(repair_contexts[0])
-        self.assertIsNotNone(repair_contexts[1])
-        assert repair_contexts[1] is not None
-        self.assertIn("syntax error", repair_contexts[1]["failed_check"]["data"]["output"])
-        self.assertIn(
-            "generated/feat_records.py",
-            [item["path"] for item in repair_contexts[1]["diagnostic_file_context"]],
-        )
-        with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            checkpoint = snapshot["checkpoint"]
-            self.assertEqual(checkpoint["repair_rounds"]["feat_records"], 1)
-            self.assertTrue(any(item["kind"] == "repair" for item in checkpoint["plan_history"]))
+        self.checks.side_effect = check
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertTrue(repaired)
+        self.assertIn("VALUE = 2", (self.root / "generated/visual.py").read_text())
 
-    def test_failure_signature_uses_normalized_full_output(self):
-        template = (
-            "运行: alembic check\n"
-            "FAILED: New upgrade operations detected: "
-            "[('remove_index', Index('ix_signature_drink_sort_order', "
-            "Column('sort_order', INTEGER(), table=<signature_drink>))]\n"
-            "Traceback (most recent call last):\n"
-            '  File "/opt/forgeai/check.py", line {line}, in check_database\n'
-            "subprocess.CalledProcessError: Command '['alembic', 'check']' "
-            "returned non-zero exit status 255.\n"
-        )
-        output_a = template.format(line=194)
-        output_b = template.format(line=208)
-        different = (
-            "运行: alembic check\n"
-            "FAILED: New upgrade operations detected: "
-            "[('add_column', Column('note', TEXT()))]\n"
-            "subprocess.CalledProcessError: Command '['alembic', 'check']' "
-            "returned non-zero exit status 255.\n"
-        )
-        excerpt = check_output_excerpt(output_a, summary="all 检查失败")
-        self.assertIn("ix_signature_drink_sort_order", excerpt)
-        self.assertIn("FAILED:", excerpt)
-        self.assertNotIn("CalledProcessError", excerpt)
-        typescript_excerpt = check_output_excerpt(
-            "src/lib/api.ts(90,2): error TS1110: Type expected.\n"
-            + "Traceback noise\n" * 80
-            + "subprocess.CalledProcessError: tsc failed",
-            summary="all 检查失败",
-        )
-        self.assertIn("src/lib/api.ts(90,2): error TS1110", typescript_excerpt)
-
-        result_a = ToolExecutionResult(
-            tool_call_id="check",
+    def test_repeated_failed_completion_is_bounded(self):
+        self._start()
+        self.checks.side_effect = lambda root, **kwargs: ToolExecutionResult(
+            tool_call_id=kwargs["tool_call_id"],
             name="run_check",
             ok=False,
+            summary="same failure",
             error_code="CHECK_FAILED",
-            summary="all 检查失败",
-            data={"output": output_a},
+            data={"source_hash": source_snapshot(root)[1], "output": "same error"},
         )
-        result_b = result_a.model_copy(update={"data": {"output": output_b}})
-        result_c = result_a.model_copy(update={"data": {"output": different}})
-        analysis_a = analyze_check_failure(result_a)
-        analysis_b = analyze_check_failure(result_b)
-        analysis_c = analyze_check_failure(result_c)
-        self.assertEqual(analysis_a.fingerprint, analysis_b.fingerprint)
-        self.assertNotEqual(analysis_a.fingerprint, analysis_c.fingerprint)
-        self.assertIn("ix_signature_drink_sort_order", analysis_a.excerpt)
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertEqual(self.checks.call_count, 1)
+        self.assertEqual(self._checkpoint()["repair_rounds"]["visual"], 3)
+        self.assertEqual(self._checkpoint()["blocked_reason_code"], "REPEATED_CHECK_FAILURE")
 
-        typescript = analyze_check_failure(
-            result_a.model_copy(
-                update={"data": {"output": "src/lib/api.ts(90,2): error TS1110: Type expected."}}
-            )
-        )
-        self.assertEqual(typescript.diagnostics[0].kind, "typescript")
-        self.assertEqual(typescript.diagnostics[0].path, "src/lib/api.ts")
-        self.assertEqual(typescript.diagnostics[0].line, 90)
-        self.assertEqual(typescript.diagnostics[0].code, "TS1110")
-
-        same_typescript_with_runtime_noise = analyze_check_failure(
-            result_a.model_copy(
-                update={
-                    "data": {
-                        "output": (
-                            "INFO: Started server process [981]\n"
-                            "INFO: 127.0.0.1:54321 - GET /health 200\n"
-                            "src/lib/api.ts(90,2): error TS1110: Type expected.\n"
-                            "subprocess.CalledProcessError: tsc failed"
-                        )
-                    }
-                }
-            )
-        )
-        self.assertEqual(typescript.fingerprint, same_typescript_with_runtime_noise.fingerprint)
-
-        browser = analyze_check_failure(
-            result_a.model_copy(
-                update={
-                    "data": {
-                        "output": (
-                            "BROWSER_CHECK_FAILED hours_status /: TimeoutError: "
-                            "waiting for getByText('营业中') to be visible\n"
-                            "subprocess.CalledProcessError: probe.mjs failed"
-                        )
-                    }
-                }
-            )
-        )
-        self.assertEqual(browser.diagnostics[0].kind, "browser")
-        self.assertEqual(browser.diagnostics[0].code, "hours_status")
-        self.assertIn("waiting for getByText('营业中')", browser.excerpt)
-
-        import_output = (
-            "INFO: Started server process [120]\n"
-            '  File "/workspace/backend/app/api/router.py", line 4, in <module>\n'
-            "    from app.api import jobs\n"
-            "ModuleNotFoundError: No module named 'app.api.jobs'\n"
-            "RuntimeError: 后端启动失败，请查看上方日志\n"
-            "subprocess.CalledProcessError: Command '['python', '/opt/forgeai/check.py', "
-            "'backend']' returned non-zero exit status 1.\n"
-        )
-        import_failure = analyze_check_failure(
-            result_a.model_copy(update={"data": {"output": import_output}})
-        )
-        self.assertEqual(import_failure.diagnostics[0].kind, "python")
-        self.assertEqual(import_failure.diagnostics[0].code, "ModuleNotFoundError")
-        self.assertEqual(import_failure.diagnostics[0].path, "backend/app/api/router.py")
-        self.assertEqual(import_failure.diagnostics[0].line, 4)
-        self.assertIn("ModuleNotFoundError", import_failure.excerpt)
-        self.assertIn("app.api.jobs", import_failure.excerpt)
-        self.assertNotIn("CalledProcessError", import_failure.excerpt)
-
-        cannot_import = analyze_check_failure(
-            result_a.model_copy(
-                update={
-                    "data": {
-                        "output": (
-                            "ImportError: cannot import name 'JobOut' from 'app.schemas.job'\n"
-                            "subprocess.CalledProcessError: uvicorn failed"
-                        )
-                    }
-                }
-            )
-        )
-        self.assertEqual(cannot_import.diagnostics[0].code, "ImportError")
-        self.assertIn("cannot import name 'JobOut'", cannot_import.excerpt)
-
-        sandbox_import = analyze_check_failure(
-            result_a.model_copy(
-                update={
-                    "data": {
-                        "output": (
-                            "  File "
-                            '"/tmp/app/backend/app/schemas/__init__.py", line 141, in <module>\n'
-                            "    class AuthRegister(BaseModel):\n"
-                            "  File "
-                            '"/usr/local/lib/python3.13/site-packages/pydantic/networks.py", '
-                            "line 1042, in import_email_validator\n"
-                            '    raise ImportError("email-validator is not installed") from e\n'
-                            "ImportError: email-validator is not installed, run `pip install "
-                            "'pydantic[email]'`\n"
-                            "RuntimeError: 后端启动失败，请查看上方日志\n"
-                        )
-                    }
-                }
-            )
-        )
-        self.assertEqual(sandbox_import.diagnostics[0].path, "backend/app/schemas/__init__.py")
-        self.assertEqual(sandbox_import.diagnostics[0].line, 141)
-        self.assertIn("email-validator", sandbox_import.excerpt)
-        self.assertNotIn("RuntimeError", sandbox_import.excerpt)
-        self.assertNotIn("app/backend/", sandbox_import.diagnostics[0].path or "")
-
-        missing_export = analyze_check_failure(
-            result_a.model_copy(
-                update={
-                    "data": {
-                        "output": (
-                            '  File "/tmp/app/backend/app/api/jobs.py", line 18, in <module>\n'
-                            "    from app.schemas import (\n"
-                            "ImportError: cannot import name 'JobType' from 'app.schemas' "
-                            "(/tmp/app/backend/app/schemas/__init__.py)\n"
-                            "RuntimeError: 后端启动失败，请查看上方日志\n"
-                        )
-                    }
-                }
-            )
-        )
-        self.assertEqual(missing_export.diagnostics[0].path, "backend/app/api/jobs.py")
-        self.assertEqual(missing_export.diagnostics[0].line, 18)
-        self.assertIn("cannot import name 'JobType'", missing_export.excerpt)
-
-        pydantic_schema = analyze_check_failure(
-            result_a.model_copy(
-                update={
-                    "data": {
-                        "output": (
-                            "  File "
-                            '"/tmp/app/backend/app/schemas/__init__.py", line 73, in <module>\n'
-                            "    class JobListItem(BaseModel):\n"
-                            "pydantic.errors.PydanticSchemaGenerationError: Unable to generate "
-                            "pydantic-core schema for <class 'app.models.job.JobType'>.\n"
-                            "RuntimeError: 后端启动失败，请查看上方日志\n"
-                        )
-                    }
-                }
-            )
-        )
-        self.assertEqual(pydantic_schema.diagnostics[0].code, "PydanticSchemaGenerationError")
-        self.assertEqual(pydantic_schema.diagnostics[0].path, "backend/app/schemas/__init__.py")
-        self.assertIn("JobType", pydantic_schema.excerpt)
-        self.assertNotIn("RuntimeError", pydantic_schema.excerpt)
-
-    def test_workflow_batches_source_files_and_publishes_preview_revisions(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-
-        def plan(*, work_item, **_kwargs):
-            return PlannedFileBatch(
-                plan=ImplementationPlan(
-                    work_item_id=work_item.id,
-                    summary=f"批量实现 {work_item.id}",
-                    files=[
-                        FileTask(
-                            id="file_01",
-                            path=f"generated/{work_item.id}_model.py",
-                            description="领域模型",
-                        ),
-                        FileTask(
-                            id="file_02",
-                            path=f"generated/{work_item.id}_service.py",
-                            description="领域服务",
-                            context_paths=[f"generated/{work_item.id}_model.py"],
-                        ),
-                    ],
-                )
-            )
-
-        def generate(*, tasks, **_kwargs):
-            return (
-                {item.path: f"VALUE = {item.path!r}\n" for item in tasks},
-                1,
-            )
-
-        with (
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
-            patch(
-                "app.orchestration.code_engineer.generate_file_batch",
-                side_effect=generate,
-            ) as batch_writer,
-            patch("app.orchestration.code_engineer.generate_file_content") as single_writer,
-            patch(
-                "app.orchestration.code_engineer.check_tools.run_check",
-                side_effect=self._passing_check,
-            ) as checks,
-        ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
-
-        feature_count = len(valid_spec()["features"])
-        self.assertEqual(result["outcome"], "generated")
-        self.assertEqual(batch_writer.call_count, feature_count)
-        single_writer.assert_not_called()
-        self.assertEqual(
-            [call.kwargs["check_id"] for call in checks.call_args_list],
-            ["quick"] * feature_count + ["all"],
-        )
-        with self.session_factory() as db:
-            events = list(
-                db.scalars(
-                    select(WorkflowEvent)
-                    .where(
-                        WorkflowEvent.build_run_id == self.run.run_id,
-                        WorkflowEvent.event_type == "preview_revision_published",
-                    )
-                    .order_by(WorkflowEvent.sequence)
-                )
-            )
-            self.assertEqual(
-                [event.sequence for event in events], list(range(1, feature_count + 1))
-            )
-            self.assertEqual(len({event.payload["source_hash"] for event in events}), feature_count)
-            for event in events:
-                artifact = db.get(SourceArtifact, event.payload["source_artifact_id"])
-                self.assertIsNotNone(artifact)
-                self.assertEqual(artifact.source_hash, event.payload["source_hash"])
-
-    def test_deferred_batches_write_before_full_check(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        written: list[str] = []
-
-        def plan(*, work_item, **_kwargs):
-            return PlannedFileBatch(
-                plan=ImplementationPlan(
-                    work_item_id=work_item.id,
-                    summary=f"首批 {work_item.id}",
-                    files=[
-                        FileTask(
-                            id="file_01",
-                            path=f"generated/{work_item.id}_a.py",
-                            description="首批模块",
-                            context_paths=["backend/app/main.py"],
-                        )
-                    ],
-                ),
-                deferred_files=(
-                    FileTask(
-                        id="deferred_01",
-                        path=f"generated/{work_item.id}_b.py",
-                        description="续写模块",
-                        context_paths=["backend/app/main.py"],
-                    ),
-                ),
-            )
-
-        def write(*, path, **_kwargs):
-            written.append(path)
-            return f"VALUE = {path!r}\n", 1
-
-        with (
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
-            patch("app.orchestration.code_engineer.generate_file_content", side_effect=write),
-            patch(
-                "app.orchestration.code_engineer.check_tools.run_check",
-                side_effect=self._passing_check,
-            ) as checks,
-        ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
-
-        self.assertEqual(result["outcome"], "generated")
-        # One quick check per work item after all deferred files, plus one final full check.
-        self.assertEqual(checks.call_count, len(valid_spec()["features"]) + 1)
-        self.assertEqual(
-            [call.kwargs["check_id"] for call in checks.call_args_list],
-            ["quick", "quick", "all"],
-        )
-        self.assertEqual(len(written), len(valid_spec()["features"]) * 2)
-        with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            labels = [item["label"] for item in snapshot["checkpoint"]["activity"]]
-            self.assertIn("Continue file batch", labels)
-            first_check = labels.index("Run quick checks")
-            self.assertLess(labels.index("Continue file batch"), first_check)
-
-    def test_repeated_identical_check_failure_stops_after_three_checks(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-
-        def plan(*, work_item, repair_context=None, **_kwargs):
-            return self._file_plan(work_item.id, suffix="_repair" if repair_context else "")
-
-        def same_failure(root, *, check_id, tool_call_id):
-            return ToolExecutionResult(
-                tool_call_id=tool_call_id,
-                name="run_check",
+    def test_environment_failure_does_not_spend_model_budget(self):
+        self._start()
+        with patch(
+            "app.orchestration.code_engineer.check_tools.check_environment",
+            return_value=ToolExecutionResult(
+                tool_call_id="environment",
+                name="check_environment",
                 ok=False,
-                error_code="CHECK_FAILED",
-                summary="all 检查失败",
-                data={
-                    "check_id": check_id,
-                    "source_hash": source_snapshot(root)[1],
-                    "output": (
-                        "Traceback (most recent call last):\n"
-                        "ValueError: 响应缺少 JSON 路径：$[0].name"
-                    ),
-                },
-            )
-
-        with (
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
-            patch(
-                "app.orchestration.code_engineer.generate_file_content",
-                return_value=("VALUE = 'still-broken'\n", 1),
+                summary="Docker unavailable",
+                error_code="CHECK_ENVIRONMENT_UNAVAILABLE",
             ),
-            patch(
-                "app.orchestration.code_engineer.check_tools.run_check",
-                side_effect=same_failure,
-            ) as checks,
         ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
+            self.assertEqual(self._run()["outcome"], "blocked")
+        self.model.assert_not_called()
+        self.assertEqual(self._checkpoint()["repair_rounds"], {})
 
-        self.assertEqual(result["outcome"], "blocked")
-        self.assertEqual(checks.call_count, 3)
+    def test_model_budget_counts_decisions_before_external_call(self):
+        self._start()
         with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            checkpoint = snapshot["checkpoint"]
-            self.assertEqual(checkpoint["blocked_reason_code"], "REPEATED_CHECK_FAILURE")
-            self.assertEqual(
-                checkpoint["blocked_check_runtime_version"],
-                CHECK_RUNTIME_VERSION,
-            )
-            self.assertEqual(checkpoint["repair_rounds"]["feat_records"], 3)
-            self.assertEqual(checkpoint["failure_streaks"]["feat_records"]["count"], 3)
-            self.assertFalse(_resume_blocked_checkpoint(checkpoint))
-            checkpoint["blocked_executor_runtime_version"] = "planned_files_v1"
-            self.assertTrue(_resume_blocked_checkpoint(checkpoint))
-            self.assertEqual(checkpoint["outcome"], "running")
-            self.assertNotIn("feat_records", checkpoint["repair_rounds"])
-            self.assertNotIn("feat_records", checkpoint["failure_streaks"])
-
-    def test_inactive_terminal_checkpoint_remains_non_retryable_in_project_status(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert saved is not None and snapshot is not None
-            snapshot["checkpoint"] = {
-                "kind": "engineering_checkpoint",
-                "schema_version": 9,
-                "execution_mode": EXECUTION_MODE,
-                "outcome": "blocked",
-                "blocked_reason": "相同检查错误已连续出现 3 次",
-                "blocked_reason_code": "REPEATED_CHECK_FAILURE",
-                "blocked_executor_runtime_version": EXECUTION_MODE,
-                "modified_files": ["frontend/src/App.tsx"],
-                "activity": [],
-            }
-            saved.draft = snapshot
-            saved.status = "failed"
-            saved.active_slot = None
-            saved.finished_at = saved.started_at
-            saved.error = "Code Engineer 已暂停"
-            flag_modified(saved, "draft")
+            row = db.get(TaskExecution, self.execution.execution_id)
+            payload = read_frozen_input_snapshot(row)
+            payload["call_budget"]["max_model_turns"] = 1
+            row.draft = payload
+            flag_modified(row, "draft")
             db.commit()
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertEqual(self.model.call_count, 1)
+        self.assertEqual(self._checkpoint()["model_turns"], 1)
 
-        with self.session_factory() as db:
-            status = get_requirements_status(db, self.owner, self.project.id)
+    def test_pause_during_model_call_discards_late_write(self):
+        self._start()
 
-        self.assertEqual(status.state, "retry_available")
-        self.assertFalse(status.retryable)
-        self.assertTrue(status.code_ready)
-        self.assertIn("相同检查错误", status.error or "")
-
-    def test_manual_retry_resets_terminal_failure_with_a_fresh_bounded_budget(self):
-        checkpoint = {
-            "kind": "engineering_checkpoint",
-            "schema_version": 9,
-            "execution_mode": EXECUTION_MODE,
-            "outcome": "blocked",
-            "blocked_reason": "相同检查错误已连续出现 3 次",
-            "blocked_reason_code": "REPEATED_CHECK_FAILURE",
-            "blocked_executor_runtime_version": EXECUTION_MODE,
-            "current_work_item_id": "feat_records",
-            "repair_rounds": {"feat_records": 3},
-            "failure_streaks": {"feat_records": {"count": 3}},
-            "model_turns": 17,
-            "tool_calls": 41,
-            "activity": [],
-            "plan_history": [
-                {
-                    "check": {
-                        "tool_call_id": "quick_feat_records",
-                        "name": "run_check",
-                        "ok": False,
-                        "error_code": "COMMAND_FAILED",
-                        "summary": "快速检查失败",
-                        "data": {"check_id": "quick", "output": "TS2322: wrong route"},
-                    }
-                }
-            ],
-        }
-        snapshot = {
-            "checkpoint": checkpoint,
-            "call_budget": {
-                "max_model_turns": 40,
-                "max_tool_calls": 120,
-                "max_repair_rounds": 3,
-            },
-        }
-
-        prepared = prepare_manual_repair_retry(snapshot)
-
-        self.assertEqual(snapshot["checkpoint"]["outcome"], "blocked")
-        resumed = prepared["checkpoint"]
-        self.assertEqual(resumed["outcome"], "running")
-        self.assertEqual(resumed["manual_repair_attempts"], 1)
-        self.assertNotIn("feat_records", resumed["repair_rounds"])
-        self.assertNotIn("feat_records", resumed["failure_streaks"])
-        self.assertEqual(resumed["repair_context"]["round"], 1)
-        self.assertEqual(prepared["call_budget"]["max_model_turns"], 57)
-        self.assertEqual(prepared["call_budget"]["max_tool_calls"], 161)
-        self.assertEqual(prepared["call_budget"]["max_repair_rounds"], 3)
-        self.assertEqual(resumed["activity"][-1]["name"], "manual_repair_retry")
-
-    def test_resume_after_budget_exhaustion_replans_from_last_check(self):
-        checkpoint = {
-            "kind": "engineering_checkpoint",
-            "schema_version": 7,
-            "execution_mode": "planned_files_v5",
-            "outcome": "blocked",
-            "blocked_reason": "自动修复轮次已用尽，完整检查仍未通过",
-            "blocked_reason_code": "REPAIR_BUDGET_EXHAUSTED",
-            "blocked_executor_runtime_version": "planned_files_v5",
-            "current_work_item_id": "feat_foundation",
-            "repair_rounds": {"feat_foundation": 9},
-            "failure_streaks": {"feat_foundation": {"count": 1, "excerpt": "RuntimeError"}},
-            "deferred_file_plan": [
-                {
-                    "id": "stale_file",
-                    "path": "frontend/src/stale.ts",
-                    "description": "旧执行器遗留批次",
-                }
-            ],
-            "active_file_plan": {
-                "work_item_id": "feat_foundation",
-                "summary": "补 email-validator",
-                "files": [
-                    {
-                        "id": "file_01",
-                        "path": "backend/pyproject.toml",
-                        "description": "声明依赖",
-                        "status": "completed",
-                    }
-                ],
-            },
-            "active_plan_kind": "repair",
-            "modified_files": ["backend/pyproject.toml"],
-            "plan_history": [
-                {
-                    "kind": "repair",
-                    "plan": {
-                        "work_item_id": "feat_foundation",
-                        "summary": "补 email-validator",
-                        "files": [],
-                    },
-                    "check": {
-                        "tool_call_id": "check_1",
-                        "name": "run_check",
-                        "ok": False,
-                        "error_code": "CHECK_FAILED",
-                        "summary": "all 检查失败",
-                        "data": {
-                            "output": (
-                                '  File "/tmp/app/backend/app/api/jobs.py", line 18, in <module>\n'
-                                "    from app.schemas import (\n"
-                                "ImportError: cannot import name 'JobType' from 'app.schemas'\n"
-                                "RuntimeError: 后端启动失败，请查看上方日志\n"
-                            )
-                        },
-                    },
-                }
-            ],
-        }
-
-        checkpoint = _load_checkpoint({"checkpoint": checkpoint})
-        self.assertEqual(checkpoint["outcome"], "blocked")
-        self.assertEqual(checkpoint["execution_mode"], EXECUTION_MODE)
-        self.assertEqual(checkpoint["deferred_file_plan"], [])
-        self.assertNotEqual(checkpoint["blocked_executor_runtime_version"], EXECUTION_MODE)
-        self.assertTrue(_resume_blocked_checkpoint(checkpoint))
-        self.assertEqual(checkpoint["outcome"], "running")
-        self.assertIsNone(checkpoint["active_file_plan"])
-        self.assertNotIn("feat_foundation", checkpoint["repair_rounds"])
-        repair = checkpoint["repair_context"]
-        self.assertIn("cannot import name 'JobType'", repair["excerpt"])
-        self.assertEqual(repair["diagnostics"][0]["path"], "backend/app/api/jobs.py")
-        self.assertEqual(repair["diagnostics"][0]["line"], 18)
-        self.assertEqual(repair["modified_files"], ["backend/pyproject.toml"])
-
-    def test_unchanged_source_stops_even_when_failure_logs_vary(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        check_calls = {"count": 0}
-
-        def plan(*, work_item, repair_context=None, **_kwargs):
-            return self._file_plan(work_item.id, suffix="_repair" if repair_context else "")
-
-        def varying_failure(root, *, check_id, tool_call_id):
-            check_calls["count"] += 1
-            return ToolExecutionResult(
-                tool_call_id=tool_call_id,
-                name="run_check",
-                ok=False,
-                error_code="CHECK_FAILED",
-                summary="all 检查失败",
-                data={
-                    "check_id": check_id,
-                    "source_hash": source_snapshot(root)[1],
-                    "output": f"transient runtime nonce {check_calls['count']}",
-                },
-            )
-
-        with (
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
-            patch(
-                "app.orchestration.code_engineer.generate_file_content",
-                return_value=("VALUE = 'unchanged'\n", 1),
-            ),
-            patch(
-                "app.orchestration.code_engineer.check_tools.run_check",
-                side_effect=varying_failure,
-            ) as checks,
-        ):
+        def paused(**kwargs):
             with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
+                row = db.get(TaskExecution, self.execution.execution_id)
+                row.status = "failed"
+                row.active_slot = None
+                db.commit()
+            return turn("write_file", path="generated/late.py", content="LATE = True\n")
 
-        self.assertEqual(result["outcome"], "blocked")
-        self.assertEqual(checks.call_count, 3)
-        with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            checkpoint = snapshot["checkpoint"]
-            self.assertEqual(checkpoint["blocked_reason_code"], "NO_SOURCE_PROGRESS")
-            streak = checkpoint["failure_streaks"]["feat_records"]
-            self.assertEqual(streak["count"], 1)
-            self.assertEqual(streak["unchanged_source_count"], 3)
+        self.model.side_effect = paused
+        self.assertEqual(self._run()["outcome"], "paused")
+        self.assertFalse((self.root / "generated/late.py").exists())
 
-    def test_model_budget_counts_planner_and_writer(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        self._set_call_budget(execution.execution_id, max_model_turns=1)
-        with (
-            patch(
-                "app.orchestration.code_engineer.plan_work_item_files",
-                side_effect=lambda *, work_item, **_kwargs: self._file_plan(work_item.id),
-            ),
-            patch("app.orchestration.code_engineer.generate_file_content") as writer,
-        ):
+    def test_pause_after_tool_staging_discards_prepared_output(self):
+        from app.generation.engineering.actions import prepare_action
+
+        self._start()
+
+        def stage_then_pause(call, root, hashes):
+            action = prepare_action(call, root, hashes)
+            self.assertTrue(action.updates)
             with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
-        self.assertEqual(result["outcome"], "blocked")
-        writer.assert_not_called()
-        with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            self.assertEqual(snapshot["checkpoint"]["blocked_reason"], "模型调用预算已用尽")
+                row = db.get(TaskExecution, self.execution.execution_id)
+                row.status = "failed"
+                row.active_slot = None
+                db.commit()
+            return action
 
-    def test_writer_validation_failure_queues_repair_instead_of_blocking(self):
-        published = self._publish_only()
-        delivery = self._assign(published.item_id)
-        task, execution = self._claim(delivery.task_id)
-        from app.agents.code_engineer import FileGenerationError
+        with patch("app.orchestration.code_engineer.prepare_action", side_effect=stage_then_pause):
+            self.assertEqual(self._run()["outcome"], "paused")
+        self.assertFalse((self.root / "generated/visual.py").exists())
 
-        write_calls = {"count": 0}
-        repair_contexts: list[dict | None] = []
+    def test_listing_files_is_read_only_evidence_not_a_write_result(self):
+        self._start()
 
-        def plan(*, work_item, repair_context=None, **_kwargs):
-            repair_contexts.append(repair_context)
-            suffix = "_repair" if repair_context else ""
-            return self._file_plan(work_item.id, suffix=suffix)
+        def inspect_then_implement(*, observations, **kwargs):
+            if not observations:
+                return turn("list_files")
+            return self._implement(observations=observations, **kwargs)
 
-        def write(**_kwargs):
-            write_calls["count"] += 1
-            if write_calls["count"] == 1:
-                raise FileGenerationError(
-                    "写码模型返回的 generated/feat_records.py 语法无效（第 1 行）：invalid syntax",
-                    model_calls=3,
-                )
-            return "VALUE = 'ok'\n", 1
+        self.model.side_effect = inspect_then_implement
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(len(self._checkpoint()["modified_files"]), 3)
 
-        with (
-            patch("app.orchestration.code_engineer.plan_work_item_files", side_effect=plan),
-            patch("app.orchestration.code_engineer.generate_file_content", side_effect=write),
-            patch(
-                "app.orchestration.code_engineer.check_tools.run_check",
-                side_effect=self._passing_check,
-            ),
-        ):
-            with self.session_factory() as db:
-                result = run_engineering_workflow(
-                    db,
-                    self.owner,
-                    self.project.id,
-                    self.run.run_id,
-                    task.task_id,
-                    execution.execution_id,
-                    session_factory=self.session_factory,
-                )
+    def test_frozen_acceptance_write_is_rejected_at_runtime(self):
+        self._start()
 
-        self.assertEqual(result["outcome"], "generated")
-        self.assertGreaterEqual(write_calls["count"], 2)
-        self.assertIsNone(repair_contexts[0])
-        self.assertIsNotNone(repair_contexts[1])
-        assert repair_contexts[1] is not None
-        self.assertEqual(repair_contexts[1]["failed_check"]["error_code"], "GENERATION_INVALID")
-        with self.session_factory() as db:
-            saved = db.get(TaskExecution, execution.execution_id)
-            snapshot = read_frozen_input_snapshot(saved)
-            assert snapshot is not None
-            labels = [item["label"] for item in snapshot["checkpoint"]["activity"]]
-            self.assertIn("Generation rejected", labels)
-            self.assertIn("Plan repair", labels)
+        def decide(*, work_item, observations, **kwargs):
+            if work_item.id == "engineering_plan":
+                return self._implement(work_item=work_item, observations=observations)
+            return turn("write_file", path="frontend/e2e/escape.ts", content="skip()")
 
-    def test_generate_file_content_retries_syntax_then_succeeds(self):
-        from app.agents.code_engineer import MAX_WRITER_ATTEMPTS, generate_file_content
-        from app.generation.delivery import WorkItem
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertFalse(self._checkpoint()["needs_delivery_plan"])
+        self.assertFalse((self.root / "frontend/e2e/escape.ts").exists())
+        self.assertEqual(self._checkpoint()["blocked_reason_code"], "NO_SOURCE_PROGRESS")
 
-        responses = [
-            "def broken(\n",
-            "VALUE = 1\n",
-        ]
-        with patch("app.agents.code_engineer.chat_completion", side_effect=responses) as chat:
-            content, calls = generate_file_content(
-                spec=AppSpec.model_validate(valid_spec()),
-                work_item=WorkItem(
-                    id="feat_records",
-                    requirement_ids=["feat_records"],
-                    title="记录",
-                    summary="实现记录",
-                ),
-                path="generated/feat_records.py",
-                file_description="实现模块",
-                engineering_context={"platform_file_context": {"files": []}},
-                observations=[],
-                system_design=None,
-            )
-        self.assertEqual(content, "VALUE = 1\n")
-        self.assertEqual(calls, 2)
-        self.assertEqual(chat.call_count, 2)
-        self.assertTrue(
-            all(call.kwargs["content_kind"] == "source" for call in chat.call_args_list)
+    def test_completion_cannot_select_another_work_item(self):
+        self._start()
+
+        def decide(*, work_item, observations, **kwargs):
+            if work_item.id == "engineering_plan":
+                return self._implement(work_item=work_item, observations=observations)
+            return turn("complete_work_item", work_item_id="invented", summary="done")
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.checks.assert_not_called()
+        self.assertEqual(len(self._checkpoint()["work_items"]), 3)
+        self.assertTrue(all(row["status"] == "pending" for row in self._checkpoint()["work_items"]))
+
+    def test_final_hash_mismatch_cannot_mark_generated(self):
+        self._start()
+
+        def mismatched(root, *, check_id, tool_call_id):
+            result = self._passing_check(root, check_id=check_id, tool_call_id=tool_call_id)
+            if check_id == "all":
+                result.data["source_hash"] = "wrong-version"
+            return result
+
+        self.checks.side_effect = mismatched
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertNotIn("completed_source_hash", self._checkpoint())
+
+    def test_block_report_never_marks_complete(self):
+        self._start()
+        self.model.side_effect = None
+        self.model.return_value = turn("report_blocked", reason="missing approved API contract")
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertIn("missing approved", self._checkpoint()["blocked_reason"])
+
+    def test_role_only_offers_implemented_tools(self):
+        self.assertEqual(
+            {tool.name for tool in CODE_ENGINEER_TOOLS}, CODE_ENGINEER_PROFILE.allowed_tools
         )
-        self.assertLessEqual(calls, MAX_WRITER_ATTEMPTS)
+        self.assertNotIn("write_new_code", CODE_ENGINEER_PROFILE.allowed_tools)
 
-    def test_generate_file_batch_returns_exact_validated_paths_in_one_call(self):
-        from app.agents.code_engineer import generate_file_batch
-        from app.generation.delivery import WorkItem
+    def test_empty_tool_allowlist_is_not_replaced_by_default_permissions(self):
+        spec = AppSpec.model_validate(valid_spec())
+        with patch(
+            "app.agents.code_engineer.chat_with_tools",
+            return_value=turn(
+                "write_file",
+                path="bad.py",
+                content="bad",
+            ),
+        ):
+            with self.assertRaisesRegex(BusinessException, "无权"):
+                decide_next_action(
+                    spec=spec,
+                    work_item=planning_item(spec),
+                    engineering_context={},
+                    observations=[],
+                    system_design=None,
+                    tools=[],
+                )
 
-        tasks = [
-            FileTask(id="file_01", path="generated/model.py", description="模型"),
-            FileTask(id="file_02", path="generated/service.py", description="服务"),
-        ]
-        response = json.dumps(
-            {
-                "files": [
-                    {"path": "generated/model.py", "content": "VALUE = 1"},
-                    {
-                        "path": "generated/service.py",
-                        "content": "from .model import VALUE\nRESULT = VALUE",
-                    },
-                ]
-            },
-            ensure_ascii=False,
+    def test_old_checkpoint_migrates_without_replaying_writes_or_resetting_stop_loss(self):
+        checkpoint = new_checkpoint()
+        checkpoint.update(
+            execution_mode="planned_files_v7",
+            outcome="blocked",
+            blocked_reason_code="NO_SOURCE_PROGRESS",
+            model_turns=25,
+            active_file_plan={"files": [{"path": "old.py"}]},
+            work_items=[{"id": "done", "status": "completed"}],
+            observations=[{"not": "new protocol"}],
         )
-        with patch("app.agents.code_engineer.chat_completion", return_value=response) as chat:
-            contents, calls = generate_file_batch(
-                spec=AppSpec.model_validate(valid_spec()),
-                work_item=WorkItem(
-                    id="feat_records",
-                    requirement_ids=["feat_records"],
-                    title="记录",
-                    summary="实现记录",
-                ),
-                tasks=tasks,
-                engineering_contexts={
-                    task.path: {"platform_file_context": {"files": []}} for task in tasks
-                },
-                system_design=None,
-            )
-        self.assertEqual(calls, 1)
-        self.assertEqual(chat.call_count, 1)
-        self.assertEqual(set(contents), {task.path for task in tasks})
-        self.assertTrue(all(content.endswith("\n") for content in contents.values()))
-        self.assertTrue(chat.call_args.kwargs["json_output"])
+        migrated = load_checkpoint({"checkpoint": checkpoint})
+        self.assertEqual(migrated["execution_mode"], EXECUTION_MODE)
+        self.assertEqual(migrated["model_turns"], 25)
+        self.assertEqual(migrated["outcome"], "blocked")
+        self.assertEqual(migrated["observations"], [])
+        self.assertIsNone(migrated["active_file_plan"])
+        self.assertEqual(migrated["work_items"][0]["status"], "completed")
+        self.assertFalse(resume_blocked_checkpoint(migrated))
+        retried = prepare_manual_repair_retry({"checkpoint": migrated})
+        self.assertEqual(retried["checkpoint"]["outcome"], "running")
+        self.assertEqual(migrated["outcome"], "blocked")
 
-    def test_controller_checkpoint_migrates_without_replaying_observations(self):
-        snapshot = {
-            "checkpoint": {
-                "kind": "engineering_checkpoint",
-                "schema_version": 3,
-                "outcome": "blocked",
-                "blocked_reason": "工程执行停滞",
-                "model_turns": 40,
-                "tool_calls": 40,
-                "observations": [{"name": "read_file"}],
-                "failure_streaks": {"feat_home": {"unchanged_source_count": 3}},
-                "repair_rounds": {"feat_home": 9},
-                "work_items": [],
-                "activity": [],
-            }
-        }
-        checkpoint = _load_checkpoint(snapshot)
-        self.assertEqual(checkpoint["execution_mode"], EXECUTION_MODE)
-        self.assertEqual(checkpoint["outcome"], "running")
-        self.assertEqual(checkpoint["model_turns"], 0)
-        self.assertEqual(checkpoint["tool_calls"], 0)
-        self.assertEqual(checkpoint["observations"], [])
-        self.assertEqual(checkpoint["failure_streaks"], {})
-        self.assertEqual(checkpoint["repair_rounds"], {})
-        self.assertTrue(checkpoint["migrated_from_controller"])
+    def test_tool_message_json_remains_valid_when_large_results_are_compacted(self):
+        from app.agents.code_engineer import build_code_engineer_messages
+
+        spec = AppSpec.model_validate(valid_spec())
+        messages = build_code_engineer_messages(
+            spec=spec,
+            work_item=planning_item(spec),
+            engineering_context={},
+            system_design=None,
+            observations=[
+                ToolExecutionResult(
+                    tool_call_id="read",
+                    name="read_file",
+                    ok=True,
+                    summary="source",
+                    data={"content": "x" * 30000},
+                    arguments={"path": "source.py"},
+                )
+            ],
+        )
+        self.assertEqual(
+            [message["role"] for message in messages], ["system", "user", "assistant", "tool"]
+        )
+        self.assertIn("已截断", json.loads(messages[-1]["content"])["data"]["content"])

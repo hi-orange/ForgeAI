@@ -17,6 +17,23 @@ from app.schemas.agent_action import (
 MAX_TOOL_RESULT_CHARS = 20_000
 
 
+def tool_observation_json(observation: ToolExecutionResult) -> str:
+    """Bound context without cutting through JSON syntax or pretending evidence is complete."""
+    payload = observation.model_dump(mode="json")
+    serialized = json.dumps(payload, ensure_ascii=False)
+    if len(serialized) <= MAX_TOOL_RESULT_CHARS:
+        return serialized
+    excerpt = json.dumps(payload["data"], ensure_ascii=False)
+    payload.update(arguments={}, summary=observation.summary[:1000], truncated=True)
+    limit = MAX_TOOL_RESULT_CHARS // 2
+    while True:
+        payload["data"] = {"excerpt": excerpt[:limit], "notice": "工具结果已截断，必要时定向重读"}
+        serialized = json.dumps(payload, ensure_ascii=False)
+        if len(serialized) <= MAX_TOOL_RESULT_CHARS:
+            return serialized
+        limit //= 2
+
+
 class ToolModelCall(Protocol):
     def __call__(
         self,
@@ -59,9 +76,7 @@ def append_tool_batch_exchange(
             "role": "tool",
             "tool_call_id": observation.tool_call_id,
             "name": observation.name,
-            "content": json.dumps(observation.model_dump(mode="json"), ensure_ascii=False)[
-                :MAX_TOOL_RESULT_CHARS
-            ],
+            "content": tool_observation_json(observation),
         }
         for observation in observations
     )

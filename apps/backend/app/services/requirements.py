@@ -9,6 +9,11 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.exceptions import BusinessException, ConflictException
 from app.core.settings import settings
+from app.generation.engineering.checkpoint import (
+    EXECUTION_MODE,
+    is_terminal_engineering_failure,
+    prepare_manual_repair_retry,
+)
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
@@ -20,11 +25,6 @@ from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
-from app.orchestration.code_engineer import (
-    EXECUTION_MODE,
-    is_terminal_engineering_failure,
-    prepare_manual_repair_retry,
-)
 from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.orchestration.test_engineer import run_test_engineer_task

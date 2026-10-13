@@ -60,11 +60,17 @@ class TaskCompletionTests(unittest.TestCase):
         spec = {
             "goal": "记录阅读进度",
             "target_users": ["个人读者"],
-            "features": ["记录书名和阅读进度"],
+            "features": [{"id": "reading", "text": "记录书名和阅读进度"}],
             "data_requirements": ["书名、阅读进度"],
             "interface_requirements": [],
             "constraints": [],
-            "acceptance_criteria": ["保存后能查看书名和阅读进度"],
+            "acceptance_criteria": [
+                {
+                    "id": "reading_saved",
+                    "text": "保存后能查看书名和阅读进度",
+                    "source_ids": ["reading"],
+                }
+            ],
             "open_questions": [],
         }
         self.chat = self.enterContext(

@@ -33,7 +33,7 @@ def _initial_messages(spec: AppSpec) -> list[dict[str, Any]]:
     return [
         {
             "role": "system",
-            "content": f"{ARCHITECT_SYSTEM_PROMPT}\n角色目标：{ARCHITECT_PROFILE.goal}",
+            "content": f"{ARCHITECT_SYSTEM_PROMPT}\n{ARCHITECT_PROFILE.contract}",
         },
         {
             "role": "user",

@@ -147,6 +147,10 @@ def load_engineering_source(
     app_item, app_task, app_plan, spec = load_approved_app_spec(
         db, project_id, run_id, item.upstream_item_ids[0], lock=lock
     )
+    try:
+        design.validate_requirement_dependencies(spec)
+    except ValueError as exc:
+        raise ConflictException("系统设计依赖与获批需求不一致") from exc
     return EngineeringSource(
         input_item=item,
         source_task=task,

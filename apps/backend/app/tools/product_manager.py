@@ -115,7 +115,27 @@ def _search_context(payload: ProductManagerInput, query: str) -> list[dict[str, 
 
 def _prd_from_call(call: ToolCall) -> AppSpec:
     try:
-        return AppSpec.model_validate(call.arguments.get("prd"))
+        raw = call.arguments.get("prd")
+        spec = AppSpec.model_validate(raw)
+        # Read legacy artifacts permissively, but never invent evidence for new submissions.
+        if isinstance(raw, dict):
+            feature_ids = {feature.id for feature in spec.features}
+            covered: set[str] = set()
+            for criterion in raw.get("acceptance_criteria", []):
+                sources = criterion.get("source_ids") if isinstance(criterion, dict) else None
+                if (
+                    not isinstance(sources, list)
+                    or not sources
+                    or any(
+                        not isinstance(source, str) or source not in feature_ids
+                        for source in sources
+                    )
+                ):
+                    raise BusinessException("每条验收条件必须显式引用功能 source_ids，不能猜测来源")
+                covered.update(sources)
+            if not spec.open_questions and feature_ids - covered:
+                raise BusinessException("每项功能必须有验收条件；未明确之处列入 open_questions")
+        return spec
     except ValidationError as exc:
         raise BusinessException("PRD 不符合 app_spec 结构或缺少可观察验收条件") from exc
 

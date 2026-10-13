@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
+from app.generation.engineering.budget import DEFAULT_CALL_BUDGET as DEFAULT_CALL_BUDGET
 from app.generation.template_registry import DEFAULT_TEMPLATE_VERSION, load_template_metadata
 from app.models.build_run import BuildRun, BuildRunStage
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
@@ -34,15 +35,7 @@ from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_n
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
 INPUT_SNAPSHOT_SCHEMA_VERSION = 4
 SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
-TOOL_STRATEGY_VERSION = "planned_files_v1"
-
-DEFAULT_CALL_BUDGET: dict[str, int] = {
-    "max_model_turns": 40,
-    "max_tool_calls": 120,
-    # Cascading first-error failures burn rounds quickly; keep a small hard cap
-    # and rely on identical-failure / no-progress stop-loss for the rest.
-    "max_repair_rounds": 3,
-}
+TOOL_STRATEGY_VERSION = "evidence_tool_loop_v1"
 
 
 def _sha256_text(value: str) -> str:

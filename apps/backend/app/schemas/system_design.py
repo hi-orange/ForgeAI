@@ -6,6 +6,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from app.schemas.app_spec import AppSpec, RequirementId
+
 DesignText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
@@ -53,6 +55,14 @@ class TechnologyChoice(BaseModel):
     rationale: DesignText
 
 
+class ImplementationDependency(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    prerequisite_requirement_id: RequirementId
+    dependent_requirement_id: RequirementId
+    reason: DesignText
+
+
 class SystemDesign(BaseModel):
     """A concise but implementation-ready design derived from one approved app_spec."""
 
@@ -65,3 +75,21 @@ class SystemDesign(BaseModel):
     data_structures: list[DataStructureDesign] = Field(min_length=1, max_length=100)
     technology_choices: list[TechnologyChoice] = Field(min_length=1, max_length=30)
     constraints: list[DesignText] = Field(default_factory=list, max_length=50)
+    implementation_dependencies: list[ImplementationDependency] = Field(
+        default_factory=list, max_length=100
+    )
+
+    def validate_requirement_dependencies(self, spec: AppSpec) -> None:
+        ids = {item.id for item in spec.features}
+        edges: dict[str, set[str]] = {key: set() for key in ids}
+        for dependency in self.implementation_dependencies:
+            before = dependency.prerequisite_requirement_id
+            after = dependency.dependent_requirement_id
+            if before not in ids or after not in ids or before == after:
+                raise ValueError("设计依赖必须关联不同的获批功能 id")
+            edges[after].add(before)
+        while edges:
+            ready = {key for key, deps in edges.items() if not deps}
+            if not ready:
+                raise ValueError("设计包含循环工程依赖")
+            edges = {key: deps - ready for key, deps in edges.items() if key not in ready}

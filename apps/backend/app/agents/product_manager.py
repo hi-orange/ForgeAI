@@ -31,7 +31,7 @@ def _initial_messages(payload: ProductManagerInput) -> list[dict[str, Any]]:
     return [
         {
             "role": "system",
-            "content": (f"{APP_SPEC_SYSTEM_PROMPT}\n角色目标：{PRODUCT_MANAGER_PROFILE.goal}"),
+            "content": (f"{APP_SPEC_SYSTEM_PROMPT}\n{PRODUCT_MANAGER_PROFILE.contract}"),
         },
         {"role": "user", "content": payload.model_dump_json()},
     ]

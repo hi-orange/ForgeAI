@@ -99,7 +99,7 @@ def verify_code(
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": f"{TEST_ENGINEER_SYSTEM_PROMPT}\n角色目标：{TEST_ENGINEER_PROFILE.goal}",
+            "content": f"{TEST_ENGINEER_SYSTEM_PROMPT}\n{TEST_ENGINEER_PROFILE.contract}",
         },
         {
             "role": "user",

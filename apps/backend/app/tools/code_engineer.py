@@ -1,326 +1,181 @@
-"""Engineering tool registry. The model proposes calls; this module executes them."""
+"""Typed, bounded tools for the engineering decision loop.
+
+Mutating tools run on a staging workspace. Only the orchestration layer may
+commit their bytes after rechecking the execution lease and original hashes.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Literal
 
-from app.core.exceptions import BusinessException, ConflictException
-from app.schemas.agent_action import ToolCall, ToolDefinition, ToolExecutionResult
-from app.tools import checks as check_tools
-from app.tools import files as file_tools
-from app.tools import images as image_tools
-from app.tools import project_deps
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-CODE_ENGINEER_TOOLS: list[ToolDefinition] = [
-    ToolDefinition(
-        name="list_files",
-        description="列出当前生成应用工作区内的文本文件。path 为相对目录，默认根目录。",
-        parameters={
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "additionalProperties": False,
-        },
+from app.core.exceptions import AppException
+from app.generation.delivery import PlannedWorkItem
+from app.schemas.agent_action import (
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionResult,
+    inline_model_json_schema,
+)
+from app.tools import checks, files, images, project_deps
+
+
+class _Arguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _List(_Arguments):
+    path: str = "."
+
+
+class _Read(_Arguments):
+    path: str = Field(min_length=1)
+    start_line: int = Field(default=1, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+
+
+class _Search(_Arguments):
+    query: str = Field(min_length=1, max_length=500)
+    path_filter: str | None = None
+
+
+class _Write(_Arguments):
+    path: str = Field(min_length=1)
+    content: str = Field(min_length=1, max_length=262144)
+    expected_hash: str | None = None
+
+
+class _Edit(_Arguments):
+    path: str = Field(min_length=1)
+    old_text: str = Field(min_length=1)
+    new_text: str
+    expected_hash: str = Field(min_length=1)
+
+
+class _Image(_Arguments):
+    path: str = Field(min_length=1)
+    prompt: str = Field(min_length=1, max_length=4000)
+    size: Literal["1K", "2K", "4K"] = "2K"
+    watermark: bool = True
+
+
+class _Dependency(_Arguments):
+    manager: Literal["npm", "uv"]
+    action: Literal["add", "remove"]
+    packages: list[str] = Field(min_length=1, max_length=8)
+    target: Literal["frontend", "backend"]
+
+
+class _Check(_Arguments):
+    check_id: Literal["quick", "database", "backend", "frontend", "all"]
+
+
+class _Complete(_Arguments):
+    work_item_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1, max_length=2000)
+
+
+class _Blocked(_Arguments):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class _Plan(_Arguments):
+    items: list[PlannedWorkItem] = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+_TOOL_ARGUMENTS: dict[str, type[_Arguments]] = {
+    "update_delivery_plan": _Plan,
+    "list_files": _List,
+    "read_file": _Read,
+    "search_code": _Search,
+    "write_file": _Write,
+    "edit_file_by_replace": _Edit,
+    "generate_image": _Image,
+    "install_project_dependency": _Dependency,
+    "run_check": _Check,
+    "complete_work_item": _Complete,
+    "report_blocked": _Blocked,
+}
+_DESCRIPTIONS = {
+    "update_delivery_plan": (
+        "提交完整工程依赖图或调整剩余计划；先建立/验证视觉基础，再依赖它实现功能。"
+        "需求可拆分，基础可共用；保留已完成项的全部定义，不提交 status/summary。"
+        "平台校验覆盖、依赖及完成记录后，只执行依赖已满足的任务。"
     ),
-    ToolDefinition(
-        name="read_file",
-        description="读取工作区文本文件的指定行范围，并返回 content_hash。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "start_line": {"type": "integer", "minimum": 1},
-                "end_line": {"type": "integer", "minimum": 1},
-            },
-            "required": ["path"],
-            "additionalProperties": False,
-        },
+    "list_files": "列出生成工作区文件；仅在不知道路径时使用。",
+    "read_file": "读取真实源码及 content_hash；修改已有文件之前必须读取。",
+    "search_code": "按准确符号或错误文本定位源码，返回路径和行号。",
+    "write_file": (
+        "创建文件或必要的整体重写；直接提供完整源码 content，已有文件必"
+        "须提供读取时的 expected_hash。"
     ),
-    ToolDefinition(
-        name="search_code",
-        description="在工作区中按字符串搜索代码，可选 path_filter 限制路径子串。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "path_filter": {"type": "string"},
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
+    "edit_file_by_replace": (
+        "局部修改：old_text 必须唯一匹配，expected_hash 必须来自读取；冲突后重新读取。"
     ),
-    ToolDefinition(
-        name="retrieve_code_context",
-        description=(
-            "RAG 兜底检索：仅当不知道代码位置且已做过精确 search_code 后，"
-            "从当前工作区召回带路径、行范围和 hash 的候选片段；命中后仍需 read_file。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "minLength": 2, "maxLength": 500},
-                "path_filter": {"type": "string", "maxLength": 500},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 8},
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
+    "generate_image": ("生成图片到 frontend/public/；返回实际路径，只有配置图片服务时可用。"),
+    "install_project_dependency": (
+        "在隔离容器解析 npm/uv 项目依赖，更新清单和锁文件；禁止系统安装。"
     ),
-    ToolDefinition(
-        name="edit_file_by_replace",
-        description=(
-            "局部修改已有文件：old_text 必须在读取版本中精确且唯一匹配；"
-            "必须提供读取时的 expected_hash，冲突或多处命中时重新读取。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string", "minLength": 1},
-                "new_text": {"type": "string"},
-                "expected_hash": {"type": "string"},
-            },
-            "required": ["path", "old_text", "new_text", "expected_hash"],
-            "additionalProperties": False,
-        },
+    "run_check": "运行隔离检查获取证据；检查不等于完成任务，源码变化后旧证据失效。",
+    "complete_work_item": (
+        "请求平台校验并完成当前工作项；平台自动执行 quick，最后一项还执行"
+        " all，失败返回证据继续修复。"
     ),
+    "report_blocked": "缺少必要信息或当前约束无法满足时报告事实；不能伪造完成。",
+}
+CODE_ENGINEER_TOOLS = [
     ToolDefinition(
-        name="write_new_code",
-        description=(
-            "创建新文件或在明确需要时整体重写一个文件。平台会在事务外调用专门写码模型；"
-            "已有文件必须提供读取时的 expected_hash。局部修改优先使用 edit_file_by_replace。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "file_description": {"type": "string", "minLength": 1, "maxLength": 1000},
-                "expected_hash": {"type": "string"},
-            },
-            "required": ["path", "file_description"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolDefinition(
-        name="record_engineering_memory",
-        description="记录一条有已读取或已写入文件证据的长期工程事实，供后续工作单元和恢复执行使用。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "subject": {"type": "string", "minLength": 1, "maxLength": 120},
-                "fact": {"type": "string", "minLength": 1, "maxLength": 600},
-                "evidence_paths": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 1,
-                    "maxItems": 8,
-                },
-            },
-            "required": ["subject", "fact", "evidence_paths"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolDefinition(
-        name="generate_image",
-        description=(
-            "通过已配置的 Ark Seedream 模型生成图片并保存为 frontend/public/ 下的本地资产；"
-            "未配置 ARK_API_KEY 时不可用。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "prompt": {"type": "string", "minLength": 1, "maxLength": 4000},
-                "size": {"type": "string", "enum": ["1K", "2K", "4K"]},
-                "watermark": {"type": "boolean"},
-            },
-            "required": ["path", "prompt"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolDefinition(
-        name="install_project_dependency",
-        description=(
-            "在隔离容器内解析并更新项目依赖清单（frontend/npm、backend/uv）。"
-            "禁止 apt 等系统安装；Runtime 基线由平台提供。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "manager": {
-                    "type": "string",
-                    "enum": ["npm", "uv"],
-                },
-                "action": {"type": "string", "enum": ["add", "remove"]},
-                "packages": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 120},
-                    "minItems": 1,
-                    "maxItems": 8,
-                },
-                "target": {
-                    "type": "string",
-                    "enum": ["frontend", "backend"],
-                    "description": "npm→frontend；uv→backend",
-                },
-            },
-            "required": ["manager", "action", "packages", "target"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolDefinition(
-        name="run_check",
-        description=(
-            "在隔离环境中检查数据库迁移、后端启动和前端构建"
-            "（可按生成清单安装依赖）；完成前使用 all。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "check_id": {
-                    "type": "string",
-                    "enum": ["database", "backend", "frontend", "all"],
-                }
-            },
-            "required": ["check_id"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolDefinition(
-        name="complete_work_item",
-        description="当前工作单元的代码已写入工作区。不能把整个工程任务标为用户可用，也不能跳过未实现的需求。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "work_item_id": {"type": "string"},
-                "summary": {"type": "string"},
-            },
-            "required": ["work_item_id"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolDefinition(
-        name="report_blocked",
-        description="获批需求无法在当前栈内实现，或缺少必要信息。不要伪造功能。",
-        parameters={
-            "type": "object",
-            "properties": {"reason": {"type": "string"}},
-            "required": ["reason"],
-            "additionalProperties": False,
-        },
-    ),
+        name=name, description=_DESCRIPTIONS[name], parameters=inline_model_json_schema(model)
+    )
+    for name, model in _TOOL_ARGUMENTS.items()
 ]
+ALLOWED_TOOL_NAMES = frozenset(_TOOL_ARGUMENTS)
+MUTATING_TOOLS = frozenset(
+    {"write_file", "edit_file_by_replace", "generate_image", "install_project_dependency"}
+)
 
-ALLOWED_TOOL_NAMES = {tool.name for tool in CODE_ENGINEER_TOOLS}
+
+def validate_tool_call(call: ToolCall) -> ToolCall:
+    model = _TOOL_ARGUMENTS.get(call.name)
+    if model is None:
+        raise ValueError(f"Code Engineer 无权使用工具：{call.name}")
+    return call.model_copy(update={"arguments": model.model_validate(call.arguments).model_dump()})
 
 
-def execute_tool_call(
-    call: ToolCall,
-    *,
-    workspace_root: Path,
-    allowed: set[str] | None = None,
-    complete_work_item: Callable[[dict[str, Any]], ToolExecutionResult] | None = None,
-    report_blocked: Callable[[dict[str, Any]], ToolExecutionResult] | None = None,
-    write_new_code: Callable[[dict[str, Any]], ToolExecutionResult] | None = None,
-    record_engineering_memory: Callable[[dict[str, Any]], ToolExecutionResult] | None = None,
-    retrieve_code_context: Callable[[dict[str, Any]], ToolExecutionResult] | None = None,
-) -> ToolExecutionResult:
-    allowed_names = allowed or ALLOWED_TOOL_NAMES
-    if call.name not in allowed_names:
-        return ToolExecutionResult(
-            tool_call_id=call.id,
-            name=call.name,
-            ok=False,
-            error_code="UNKNOWN_TOOL",
-            summary=f"未知工具: {call.name}",
-        )
-    args = call.arguments
-    try:
-        if call.name == "list_files":
-            return file_tools.list_files(
-                workspace_root, path=str(args.get("path") or "."), tool_call_id=call.id
-            )
-        if call.name == "read_file":
-            return file_tools.read_file(
-                workspace_root,
-                path=str(args.get("path") or ""),
-                start_line=int(args.get("start_line") or 1),
-                end_line=int(args["end_line"]) if args.get("end_line") is not None else None,
-                tool_call_id=call.id,
-            )
-        if call.name == "search_code":
-            return file_tools.search_code(
-                workspace_root,
-                query=str(args.get("query") or ""),
-                path_filter=str(args["path_filter"]) if args.get("path_filter") else None,
-                tool_call_id=call.id,
-            )
-        if call.name == "retrieve_code_context":
-            if retrieve_code_context is None:
-                raise BusinessException("当前阶段不能使用代码 RAG")
-            return retrieve_code_context(args)
-        if call.name == "edit_file_by_replace":
-            return file_tools.edit_file_by_replace(
-                workspace_root,
-                path=str(args.get("path") or ""),
-                old_text=str(args.get("old_text") or ""),
-                new_text=str(args.get("new_text") or ""),
-                expected_hash=str(args.get("expected_hash") or ""),
-                tool_call_id=call.id,
-            )
-        if call.name == "write_new_code":
-            if write_new_code is None:
-                raise BusinessException("当前阶段不能生成完整文件")
-            return write_new_code(args)
-        if call.name == "record_engineering_memory":
-            if record_engineering_memory is None:
-                raise BusinessException("当前阶段不能记录工程记忆")
-            return record_engineering_memory(args)
-        if call.name == "generate_image":
-            return image_tools.generate_project_image(
-                workspace_root,
-                path=str(args.get("path") or ""),
-                prompt=str(args.get("prompt") or ""),
-                size=str(args.get("size") or "2K"),
-                watermark=bool(args.get("watermark", True)),
-                tool_call_id=call.id,
-            )
-        if call.name == "install_project_dependency":
-            return project_deps.install_project_dependency(
-                workspace_root,
-                manager=str(args.get("manager") or ""),
-                action=str(args.get("action") or ""),
-                packages=args.get("packages"),
-                target=str(args.get("target") or "frontend"),
-                tool_call_id=call.id,
-            )
-        if call.name == "run_check":
-            return check_tools.run_check(
-                workspace_root,
-                check_id=str(args.get("check_id") or ""),
-                tool_call_id=call.id,
-            )
-        if call.name == "complete_work_item":
-            if complete_work_item is None:
-                raise BusinessException("当前阶段不能结束工作单元")
-            return complete_work_item(args)
-        if call.name == "report_blocked":
-            if report_blocked is None:
-                raise BusinessException("当前阶段不能报告阻断")
-            return report_blocked(args)
-    except (ConflictException, BusinessException) as exc:
-        return ToolExecutionResult(
-            tool_call_id=call.id,
-            name=call.name,
-            ok=False,
-            error_code="TOOL_REJECTED",
-            summary=str(exc),
-        )
+def rejected_tool(call: ToolCall, error: Exception) -> ToolExecutionResult:
     return ToolExecutionResult(
         tool_call_id=call.id,
         name=call.name,
         ok=False,
-        error_code="UNKNOWN_TOOL",
-        summary=f"未实现工具: {call.name}",
+        error_code="TOOL_REJECTED",
+        summary=str(error)[:2000],
+        arguments=call.arguments,
     )
+
+
+def execute_tool_call(call: ToolCall, *, workspace_root: Path) -> ToolExecutionResult:
+    """Execute an already scoped tool; mutations must target staging, never live source."""
+    try:
+        call = validate_tool_call(call)
+        args = call.arguments
+        handlers: dict[str, Callable[..., ToolExecutionResult]] = {
+            "list_files": files.list_files,
+            "read_file": files.read_file,
+            "search_code": files.search_code,
+            "write_file": files.apply_patch,
+            "edit_file_by_replace": files.edit_file_by_replace,
+            "generate_image": images.generate_project_image,
+            "install_project_dependency": project_deps.install_project_dependency,
+            "run_check": checks.run_check,
+        }
+        handler = handlers.get(call.name)
+        if handler is None:
+            raise ValueError("完成和阻断必须由工作流门禁处理")
+        result = handler(workspace_root, **args, tool_call_id=call.id)
+        return result.model_copy(update={"name": call.name, "arguments": call.arguments})
+    except (AppException, ValidationError, ValueError, OSError) as exc:
+        return rejected_tool(call, exc)

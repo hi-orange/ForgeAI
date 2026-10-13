@@ -245,7 +245,21 @@ def execute_architect_tool(
                 update={"name": call.name, "arguments": dict(call.arguments)}
             ), None
         if call.name in {"editor_write", "write_system_design"}:
+            if (
+                call.name == "write_system_design"
+                and "artifact:app_spec" not in state.inspection_keys
+            ):
+                raise BusinessException("提交设计前必须 read_artifact 读取本轮冻结 PRD")
             design = _design_from_call(call)
+            design.validate_requirement_dependencies(state.app_spec)
+            for interface in design.interfaces:
+                if interface.kind == "http" and (
+                    interface.method
+                    not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+                    or not interface.path
+                    or not interface.path.startswith("/")
+                ):
+                    raise BusinessException("HTTP 设计必须提供有效 method 和绝对 API path")
             state.draft = design
             result = ToolExecutionResult(
                 tool_call_id=call.id,

@@ -161,7 +161,7 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         self.assertEqual(
             snapshot["call_budget"],
             {
-                "max_model_turns": 40,
+                "max_model_turns": 80,
                 "max_tool_calls": 120,
                 "max_repair_rounds": 3,
             },

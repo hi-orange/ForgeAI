@@ -178,6 +178,9 @@ def complete_architect_task(
 
     design = SystemDesign.model_validate(design.model_dump())
     payload = design.model_dump(mode="json")
+    # Keep canonical identities stable for designs predating dependency contracts.
+    if not design.implementation_dependencies:
+        payload.pop("implementation_dependencies", None)
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     result_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     try:
@@ -203,7 +206,11 @@ def complete_architect_task(
             raise ConflictException("Architect 任务没有提交资格")
         execution = task_execution.require_execution(db, task_id, execution_id, lock=True)
         assert execution is not None
-        load_approved_app_spec(db, project_id, run_id, app_spec_item_id, lock=True)
+        _, _, _, spec = load_approved_app_spec(db, project_id, run_id, app_spec_item_id, lock=True)
+        try:
+            design.validate_requirement_dependencies(spec)
+        except ValueError as exc:
+            raise BusinessException(str(exc)) from exc
         item = configuration_manager.stage_configuration_item(
             db,
             project_id=project_id,

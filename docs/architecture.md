@@ -78,6 +78,63 @@ when all such flags are false and the change is a small extension of existing co
 
 ## Scheduling model
 
+### Role decisions and engineering kernel
+
+Role names denote ownership and decision boundaries, not four interchangeable chat personas:
+
+- Product Manager converges user intent into scope, non-goals, open questions and observable
+  acceptance. New submissions must explicitly link acceptance criteria to their feature ids;
+  legacy artifact readers may remain permissive. Only the user approves product intent.
+- Architect resolves cross-layer contracts, dependency direction, data ownership and material
+  technical tradeoffs. It reads the frozen intent before submitting design, and does not prescribe
+  the engineer's tool sequence or modify application source.
+- Code Engineer selects its next tool using frozen intent, current source and execution feedback.
+  It reads, creates or locally edits source, runs checks and repairs from evidence. There is no
+  mandatory model-generated file plan and no nested whole-file writer model. The platform stages
+  mutations, fences commits by active execution and original bytes, retains recoverable revisions,
+  bounds cost/no-progress, and verifies completion requests. The final source still needs independent QA.
+- Test Engineer judges one exact source/test identity against frozen acceptance. It separates code
+  defects, unavailable infrastructure, missing evidence and contract challenges. It cannot edit
+  application source or redefine acceptance to make a run pass.
+
+The current engineering strategy is `evidence_tool_loop_v1`. Its checkpoint migration preserves
+completed work, source revisions, measured counters and terminal stop-loss state. Legacy file plans
+are historical context, not executable pending actions. A runtime upgrade alone does not reset a
+failed run's repair budget. Explicit manual repair creates a fresh bounded attempt.
+
+Research informs this design; it does not establish ForgeAI-specific performance:
+[SWE-agent](https://arxiv.org/abs/2405.15793) studies agent-computer interfaces;
+[mini-SWE-agent](https://mini-swe-agent.com/latest/advanced/control_flow/) provides a minimal
+model/action/observation implementation; the 2026 survey
+[Code as Agent Harness](https://arxiv.org/abs/2605.18747) discusses planning, state, feedback and
+verification mechanisms. The four roles, staged commits and stop-loss settings are project-specific
+engineering choices, not a paper reproduction. Deterministic regression tests do not measure model
+quality; compare real-model runs on the same tasks and budgets before claiming an improvement.
+
+### Engineering dependency scheduling
+
+Product feature order is presentation order, never the construction schedule. Architect may freeze
+`implementation_dependencies` between approved feature ids (for example authenticated identity before
+private business operations). Code Engineer submits an `update_delivery_plan` graph using observed
+source and those contracts before source mutation. Requirements and tasks have a many-to-many mapping:
+shared foundations and multiple implementation slices must not introduce new product scope.
+
+The runtime validates exact approved feature coverage, unique task ids, existing dependency targets,
+acyclicity and frozen architecture dependencies. A visual foundation establishes or verifies reuse of
+shared design tokens before feature work; it does not force a redesign of existing applications.
+Authentication is added only when approved, not detected with title keywords or inserted as a universal
+template. The scheduler selects only pending nodes whose prerequisites completed platform checks.
+Ready-node ordering is an engineering plan choice, not the PRD's list position.
+
+Replanning may adjust pending nodes but cannot remove or redefine completed nodes, invent completion
+state, reset budgets or replace approved inputs. Graph revisions and reasons are checkpointed. Legacy
+unfinished feature queues require a dependency plan before further writes while preserving completed
+work and counters; completed runs remain immutable. QA repair retains its narrow defect scope and does
+not recreate the whole application plan. Structural graph validation cannot prove the model identified
+every semantic dependency; source checks and independent acceptance remain necessary.
+
+### Workflow ownership
+
 Leader owns ambiguous semantic decisions. The workflow engine owns deterministic execution and hard
 gates.
 
