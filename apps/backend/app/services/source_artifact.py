@@ -19,7 +19,7 @@ from app.artifacts.source import (
 )
 from app.core.exceptions import ConflictException, NotFoundException
 from app.core.settings import settings
-from app.generation.workspace import default_workspace_path
+from app.generation.workspace import default_workspace_path, publish_workspace_directory
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
 from app.models.source_artifact import SourceArtifact
 from app.schemas.code_artifact import CodeArtifact, SourceFileIdentity
@@ -284,7 +284,7 @@ def ensure_code_workspace(
         if restored_hash != value.source_hash:
             raise ConflictException("恢复后的工作区未通过 source_hash 校验")
         try:
-            staging.rename(destination)
+            publish_workspace_directory(staging, destination)
         except OSError:
             if not destination.exists():
                 raise

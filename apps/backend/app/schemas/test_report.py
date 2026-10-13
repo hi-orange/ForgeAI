@@ -7,6 +7,8 @@ from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from app.schemas.qa_suite import QASuite
+
 ReportText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
@@ -65,6 +67,10 @@ class TestVerification(BaseModel):
     command: ShortReportText
     evidence: ReportText
     artifact_paths: list[str] = Field(default_factory=list, max_length=20)
+    execution_id: str | None = Field(default=None, max_length=64)
+    failure_kind: str | None = Field(
+        default=None, pattern=r"^(product|script|environment|conflict)$"
+    )
 
 
 class DefectRecord(BaseModel):
@@ -76,6 +82,8 @@ class DefectRecord(BaseModel):
     description: ReportText
     evidence: ReportText
     related_requirement_ids: list[str] = Field(default_factory=list, max_length=50)
+    related_test_ids: list[str] = Field(default_factory=list, max_length=200)
+    execution_id: str | None = Field(default=None, max_length=64)
 
 
 class TestChallenge(BaseModel):
@@ -98,6 +106,9 @@ class TestReport(BaseModel):
     test_hash: str | None = Field(
         default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
+    # Optional for reading historical v1/v2 reports. New publication validates v3 evidence.
+    test_suite: QASuite | None = None
+    suite_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     requirement_results: list[RequirementVerification] = Field(min_length=1, max_length=100)
     check_results: list[CheckVerification] = Field(min_length=1, max_length=30)
     test_results: list[TestVerification] = Field(default_factory=list, max_length=200)
@@ -124,6 +135,10 @@ class TestReport(BaseModel):
             + [item.status for item in self.check_results]
             + [item.status for item in self.test_results]
         )
+        if (self.test_suite is None) != (self.suite_hash is None):
+            raise ValueError("测试套件和资产 hash 必须同时提供")
+        if self.test_suite is not None and self.test_suite.digest() != self.suite_hash:
+            raise ValueError("测试套件 hash 不匹配")
         if (self.test_plan_item_id is None) != (self.test_hash is None):
             raise ValueError("test_plan_item_id 与 test_hash 必须同时提供")
         if len(self.regression_test_ids) != len(set(self.regression_test_ids)):
@@ -145,6 +160,8 @@ class TestReport(BaseModel):
             raise ValueError("存在未通过项或缺陷时不能给出通过结论")
         if self.quality_conclusion == QualityConclusion.FAILED and not (failed or self.defects):
             raise ValueError("失败结论必须有失败证据或缺陷")
-        if self.quality_conclusion == QualityConclusion.BLOCKED and not blocked:
+        if self.quality_conclusion == QualityConclusion.BLOCKED and not (
+            blocked or self.test_challenges
+        ):
             raise ValueError("阻断结论必须有未执行或阻断证据")
         return self

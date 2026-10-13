@@ -364,6 +364,39 @@ class ProductManagerWorkflowTests(ProductManagerWorkflowFixture):
         self.assertEqual(self.chat.call_count, 2)
         self._assert_published(result)
 
+    def test_pm_recovers_saved_editor_draft_and_history_after_network_failure(self):
+        from app.schemas.agent_action import ChatWithToolsResult, ToolCall
+
+        plan, task = self._create_plan()
+        self.chat.side_effect = [
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(
+                        id="draft",
+                        name="edit_prd",
+                        arguments={"prd": valid_spec()},
+                    )
+                ]
+            ),
+            RuntimeError("connection interrupted"),
+            self.chat.return_value,
+        ]
+        with self.assertRaisesRegex(RuntimeError, "connection interrupted"):
+            self._run()
+        with self.session_factory() as db:
+            execution = task_execution.latest_execution(db, task.task_id)
+            recovery_id = execution.execution_id
+            self.assertEqual(execution.draft["tool_loop"]["turns"], 2)
+            self.assertEqual(
+                execution.draft["tool_loop"]["state"]["draft"]["goal"], valid_spec()["goal"]
+            )
+            self.assertEqual(execution.error, "connection interrupted")
+        result = self._run(recovery_execution_id=recovery_id)
+        self._assert_published(result)
+        history = self.chat.call_args.kwargs["messages"]
+        self.assertTrue(any(m.get("tool_call_id") == "draft" for m in history))
+        self.assertEqual(self.chat.call_count, 3)
+
     def test_owner_and_terminal_run_are_rechecked_before_replay(self):
         with self.assertRaises(NotFoundException):
             self._run(user=self.outsider)

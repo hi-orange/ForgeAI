@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
@@ -167,6 +168,35 @@ def renew_execution_lease(db: Session, task_id: str, execution_id: str) -> None:
 
         sync_checkpoint_activity_events(db, execution)
     db.commit()
+
+
+def save_execution_draft(db: Session, execution: TaskExecution, draft: dict[str, Any]) -> None:
+    """Commit progress and its lease in one fenced write, even with a stale ORM object."""
+    from app.services.workflow_events import sync_checkpoint_activity_events
+
+    now = utc_now()
+    payload = json.loads(json.dumps(draft, ensure_ascii=False, allow_nan=False))
+    try:
+        with db.no_autoflush:
+            saved = db.connection().execute(
+                update(TaskExecution)
+                .where(
+                    TaskExecution.execution_id == execution.execution_id,
+                    TaskExecution.task_id == execution.task_id,
+                    TaskExecution.status == "running",
+                    TaskExecution.active_slot == 1,
+                    TaskExecution.expires_at > now,
+                )
+                .values(draft=payload, expires_at=now + EXECUTION_LEASE)
+            )
+            if saved.rowcount != 1:
+                raise ConflictException("执行编号已失效，不能保存进度")
+            db.refresh(execution)
+            sync_checkpoint_activity_events(db, execution)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def fail_execution(

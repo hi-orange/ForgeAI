@@ -347,18 +347,16 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         self.assertTrue(progress.code_ready)
         self.assertEqual(progress.execution_id, execution.execution_id)
 
-    def test_pause_only_clears_the_worker_marker_after_persisting_the_fence(self):
+    def test_pause_rolls_back_when_execution_fence_is_lost(self):
         published = self._publish_only()
         delivery = self._assign(published.item_id)
         _, execution = self._claim(delivery.task_id)
         with (
             self.session_factory() as db,
             patch("app.services.requirements.fail_execution", return_value=False),
-            patch("app.services.requirements.mark_engineering_inactive") as mark_inactive,
             self.assertRaises(ConflictException),
         ):
             pause_active_execution(db, self.owner, self.project.id, self.run.run_id)
-        mark_inactive.assert_not_called()
         with self.session_factory() as db:
             self.assertEqual(db.get(TaskExecution, execution.execution_id).status, "running")
 

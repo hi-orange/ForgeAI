@@ -7,6 +7,7 @@ artifact and decides the next assignment.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -18,7 +19,7 @@ from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.services import architect as architect_service
 from app.services.engineering import load_approved_app_spec
-from app.services.task_execution import fail_execution
+from app.services.task_execution import fail_execution, require_execution, save_execution_draft
 from app.telemetry.agent import agent_telemetry_scope
 
 
@@ -48,6 +49,12 @@ def run_architecture_task(
         app_spec_item_id = task.input_configuration_item_ids[0]
         _, _, _, spec = load_approved_app_spec(reader, project_id, run_id, app_spec_item_id)
     workspace_root = default_workspace_path(settings.runtime_data_root, project_id, run_id)
+
+    def save_progress(progress: dict[str, Any]) -> None:
+        current = require_execution(db, task_id, execution.execution_id, lock=True)
+        assert current is not None
+        save_execution_draft(db, current, {**(current.draft or {}), "tool_loop": progress})
+
     try:
         with agent_telemetry_scope(
             project_id=project_id,
@@ -60,6 +67,8 @@ def run_architecture_task(
             design = generate_system_design(
                 spec=spec,
                 workspace_root=workspace_root,
+                checkpoint=(execution.draft or {}).get("tool_loop"),
+                on_checkpoint=save_progress,
                 on_activity=lambda observation: architect_service.record_architect_activity(
                     db,
                     task_id,

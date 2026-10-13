@@ -1,6 +1,6 @@
 """Versioned policy fragments shared by ForgeAI delivery role prompts."""
 
-PROMPT_CONTRACT_VERSION = "forgeai_prompt_contracts_v4"
+PROMPT_CONTRACT_VERSION = "forgeai_prompt_contracts_v5"
 
 LEADER_DISPATCH_CONTRACT = """
 调度分层：Leader 只做有歧义的语义决策（产品变更 vs 实现修复、是否需要 Architect）；
@@ -53,5 +53,6 @@ QUALITY_GATE_CONTRACT = """
 质量门禁分层：forgeai.smoke.json 是 Code Engineer 必须通过的开发期最低联调门禁；冻结
 acceptance_test_plan 是独立的最终质量门禁。两者都不可绕过，但 smoke 通过不能替代 acceptance，
 acceptance 也不取消工程阶段的 smoke。产品意图产生新批准版本时生成新的 test_hash；同一修复链
-保持原 test_hash，禁止为了通过而弱化冻结测试。
+保持获批标准 test_hash；QA 场景/脚本有独立 suite_hash，由平台校验并冻结每次执行快照。
+适配修订可产生新套件版本，但不得删除场景或弱化断言。smoke 和截图不能合成逐项执行事实。
 """.strip()

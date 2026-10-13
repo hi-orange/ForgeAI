@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from pydantic import ValidationError
+from qa_fixtures import add_unit_evidence, report_assets
 from test_architect import valid_design, valid_spec
 
 from app.agents import test_engineer as test_engineer_agent
@@ -13,14 +14,12 @@ from app.models.task import TaskRecipient
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import TestReport as QualityReport
-from app.tools.test_engineer import (
-    TestEngineerToolState as EngineerToolState,
-)
-from app.tools.test_engineer import (
-    execute_test_engineer_tool,
+from app.services.qa_verification import QAVerificationState as EngineerToolState
+from app.services.qa_verification import (
     export_test_engineer_progress,
     restore_test_engineer_progress,
 )
+from app.tools.test_engineer import execute_test_engineer_tool
 
 SOURCE_HASH = "a" * 64
 
@@ -51,6 +50,7 @@ def passed_report() -> dict:
                 ),
             },
         ],
+        **report_assets(),
         "defects": [],
         "quality_conclusion": "passed",
         "summary": "已验证当前准确代码结果，核心验收和完整检查均通过。",
@@ -78,6 +78,7 @@ def visual_result(tool_call_id: str = "visual") -> ToolExecutionResult:
 
 def failed_report() -> dict:
     report = passed_report()
+    report.update(report_assets("failed"))
     report["requirement_results"][0]["status"] = "failed"
     report["requirement_results"][0]["evidence"] = "保存接口返回 500。"
     report["check_results"][0]["status"] = "failed"
@@ -90,11 +91,24 @@ def failed_report() -> dict:
             "description": "调用保存接口时发生未处理异常。",
             "evidence": "完整检查输出显示 POST /api/reading-records 返回 500。",
             "related_requirement_ids": ["ac_track"],
+            "related_test_ids": ["test_ac_track"],
+            "execution_id": "qa_unit_fixture",
         }
     ]
     report["quality_conclusion"] = "failed"
     report["summary"] = "核心保存流程失败，当前代码不能通过质量验证。"
     return report
+
+
+def unit_progress():
+    state = EngineerToolState(
+        app_spec=valid_spec(),
+        code_item_id="ci_code",
+        code_source_hash=SOURCE_HASH,
+        workspace_root=Path("."),
+    )
+    add_unit_evidence(state)
+    return export_test_engineer_progress(state)
 
 
 class TestEngineerTests(unittest.TestCase):
@@ -107,6 +121,9 @@ class TestEngineerTests(unittest.TestCase):
             profile.allowed_tools,
             frozenset(
                 {
+                    "design_test_cases",
+                    "write_test_script",
+                    "run_acceptance_tests",
                     "read_artifact",
                     "list_files",
                     "read_file",
@@ -136,6 +153,7 @@ class TestEngineerTests(unittest.TestCase):
                 code_source_hash=SOURCE_HASH,
                 workspace_root=Path(directory),
             )
+            add_unit_evidence(state)
             with patch(
                 "app.tools.test_engineer.check_tools.run_check",
                 return_value=ToolExecutionResult(
@@ -205,6 +223,7 @@ class TestEngineerTests(unittest.TestCase):
                     ),
                     state,
                 )
+            add_unit_evidence(state, "failed")
             state.checks["visual"] = visual_result()
             missing_defect = failed_report()
             missing_defect["defects"] = []
@@ -323,11 +342,12 @@ class TestEngineerTests(unittest.TestCase):
                     workspace_root=Path(directory),
                     heartbeat=heartbeat,
                     on_progress=saved_progress.append,
+                    saved_progress=unit_progress(),
                 )
         self.assertEqual(report.quality_conclusion, "passed")
         self.assertEqual(chat.call_count, 4)
         self.assertEqual(heartbeat.call_count, 8)
-        self.assertEqual(len(saved_progress), 4)
+        self.assertEqual(len(saved_progress), 8)
         self.assertEqual(set(saved_progress[-1]["checks"]), {"all", "visual"})
         self.assertEqual(
             {tool.name for tool in chat.call_args_list[0].kwargs["tools"]},
@@ -335,11 +355,11 @@ class TestEngineerTests(unittest.TestCase):
         )
         self.assertEqual(
             {tool.name for tool in chat.call_args_list[2].kwargs["tools"]},
-            {"capture_screenshots"},
+            test_engineer_agent.TEST_ENGINEER_PROFILE.allowed_tools,
         )
         self.assertEqual(
             {tool.name for tool in chat.call_args_list[3].kwargs["tools"]},
-            {"write_test_report"},
+            test_engineer_agent.TEST_ENGINEER_PROFILE.allowed_tools,
         )
 
     def test_agent_stops_immediately_when_visual_runtime_is_stale(self):
@@ -520,7 +540,7 @@ class TestEngineerTests(unittest.TestCase):
                         workspace_root=Path(directory),
                     )
 
-    def test_explore_before_check_is_capped(self):
+    def test_case_design_can_inspect_adapters_without_smoke_forcing(self):
         with TemporaryDirectory(prefix="forgeai-test-engineer-cap-") as directory:
             root = Path(directory)
             (root / "frontend").mkdir()
@@ -547,9 +567,7 @@ class TestEngineerTests(unittest.TestCase):
                 ToolCall(id="read_blocked", name="read_file", arguments={"path": "frontend/a.tsx"}),
                 state,
             )
-        self.assertFalse(blocked.ok)
-        self.assertEqual(blocked.error_code, "CHECK_FIRST")
-        self.assertIn("run_check", blocked.summary)
+        self.assertTrue(blocked.ok)
 
 
 if __name__ == "__main__":

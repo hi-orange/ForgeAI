@@ -1,5 +1,6 @@
 import hashlib
 import json
+from typing import Any
 
 from pydantic import ValidationError
 from sqlalchemy import select, update
@@ -160,14 +161,34 @@ def generate_task_app_spec(
     try:
         with Session(bind=db.get_bind(), autoflush=False) as reader:
             task, plan, message = _load_running_task(reader, user, project_id, run_id, task_id)
-            task_execution.require_execution(reader, task_id, execution_id)
-            payload = _prepare_input(reader, task, message)
+            execution = task_execution.require_execution(reader, task_id, execution_id)
+            saved = dict(execution.draft or {}) if execution else {}
+            payload = (
+                ProductManagerInput.model_validate(saved["input"])
+                if saved.get("kind") == "product_manager_checkpoint" and saved.get("input")
+                else _prepare_input(reader, task, message)
+            )
             plan_id, cause_message_id = plan.plan_id, plan.cause_message_id
             input_item_ids = list(task.input_configuration_item_ids)
     except ValidationError as exc:
         raise BusinessException("Product Manager 需求输入不符合要求") from exc
 
     model = settings.deepseek_model
+
+    def save_progress(progress: dict[str, Any]) -> None:
+        with Session(bind=db.get_bind(), autoflush=False) as writer:
+            current = task_execution.require_execution(writer, task_id, execution_id, lock=True)
+            assert current is not None
+            task_execution.save_execution_draft(
+                writer,
+                current,
+                {
+                    "kind": "product_manager_checkpoint",
+                    "input": payload.model_dump(mode="json"),
+                    "tool_loop": progress,
+                },
+            )
+
     with agent_telemetry_scope(
         project_id=project_id,
         build_run_id=run_id,
@@ -176,7 +197,15 @@ def generate_task_app_spec(
         role="Product Manager",
         bind=db.get_bind(),
     ):
-        app_spec = product_manager_agent.generate_app_spec(payload)
+        app_spec = (
+            product_manager_agent.generate_app_spec(
+                payload,
+                checkpoint=saved.get("tool_loop"),
+                on_checkpoint=save_progress,
+            )
+            if execution_id
+            else product_manager_agent.generate_app_spec(payload)
+        )
 
     # 模型调用期间可能发生停止或取消。用新的只读事务检查，不读旧会话的缓存/快照。
     # 这里只拒绝已经失去资格的草稿；真正发布时还需要 ConfigurationManager 的事务检查。

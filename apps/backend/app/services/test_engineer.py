@@ -26,11 +26,13 @@ from app.schemas.acceptance_test_plan import AcceptanceTestPlan
 from app.schemas.app_spec import AppSpec
 from app.schemas.code_artifact import CodeArtifact
 from app.schemas.configuration_item import ConfigurationItemRegistration
+from app.schemas.qa_suite import QASuite
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import build_run as build_run_service
 from app.services import configuration_manager, task_execution
 from app.services import plan as plan_service
+from app.services import run_revision as revision_service
 from app.services import task as task_service
 from app.services.acceptance_testing import load_acceptance_test_plan
 from app.services.engineering.handoff import (
@@ -39,7 +41,7 @@ from app.services.engineering.handoff import (
     load_engineering_source,
 )
 
-TEST_REPORT_SCHEMA_VERSION = 2
+TEST_REPORT_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,7 @@ class TestInputs:
     system_design: SystemDesign | None
     acceptance_test_plan_item: ConfigurationItem | None
     acceptance_test_plan: AcceptanceTestPlan | None
+    inherited_suite: QASuite | None = None
 
 
 def _load_task(
@@ -160,6 +163,51 @@ def load_test_inputs(
                 source_item_id=code_item.upstream_item_ids[0],
                 lock=lock,
             )
+    inherited_suite = None
+    # Repairs inherit the exact QA assets, never historical execution passes.
+    for upstream_id in code_item.upstream_item_ids[1:]:
+        upstream = db.scalar(
+            select(ConfigurationItem).where(
+                ConfigurationItem.item_id == upstream_id,
+                ConfigurationItem.project_id == project_id,
+            )
+        )
+        if (
+            upstream is not None
+            and upstream.semantic_type == ConfigurationItemType.TEST_REPORT.value
+        ):
+            inherited_suite = TestReport.model_validate(upstream.payload).test_suite
+    if inherited_suite is None:
+        inherited_suite = _revision_suite(db, project_id, run_id)
+    # Infrastructure retries keep the assets of the last published verification
+    # of this exact source. Execution observations are always collected again.
+    prior_reports = db.scalars(
+        select(ConfigurationItem)
+        .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+        .join(Task, Task.task_id == TaskResult.task_id)
+        .join(Plan, Plan.plan_id == Task.plan_id)
+        .where(
+            ConfigurationItem.project_id == project_id,
+            ConfigurationItem.producer_run_id == run_id,
+            ConfigurationItem.semantic_type == ConfigurationItemType.TEST_REPORT.value,
+            ConfigurationItem.state == "usable",
+            Task.status == TaskStatus.SUCCEEDED.value,
+            Plan.build_run_id == run_id,
+        )
+        .order_by(Plan.version.desc())
+    )
+    for prior_item in prior_reports:
+        prior = TestReport.model_validate(prior_item.payload)
+        if (
+            prior.code_item_id == code_item_id
+            and prior.source_hash == artifact.source_hash
+            and prior.test_suite is not None
+            and acceptance_test_plan_item is not None
+            and prior.test_plan_item_id == acceptance_test_plan_item.item_id
+            and prior.test_hash == acceptance_test_plan_item.content_hash
+        ):
+            inherited_suite = prior.test_suite
+            break
     return TestInputs(
         code_item=code_item,
         code_artifact=artifact,
@@ -169,7 +217,31 @@ def load_test_inputs(
         system_design=source.system_design,
         acceptance_test_plan_item=acceptance_test_plan_item,
         acceptance_test_plan=acceptance_test_plan,
+        inherited_suite=inherited_suite,
     )
+
+
+def _revision_suite(db: Session, project_id: int, run_id: str) -> QASuite | None:
+    """Carry tests across an explicit implementation repair, never product changes."""
+    revision = revision_service.get_revision_for_target(db, project_id, run_id)
+    if revision is None or revision.kind != "implementation_repair":
+        return None
+    candidates = db.scalars(
+        select(ConfigurationItem)
+        .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
+        .where(
+            ConfigurationItem.project_id == project_id,
+            ConfigurationItem.producer_run_id == revision.source_run_id,
+            ConfigurationItem.semantic_type == ConfigurationItemType.TEST_REPORT.value,
+            ConfigurationItem.state == "usable",
+        )
+        .order_by(ConfigurationItem.id.desc())
+    )
+    for item in candidates:
+        report = TestReport.model_validate(item.payload)
+        if report.code_item_id == revision.baseline_code_item_id:
+            return report.test_suite
+    return None
 
 
 def claim_test_engineer_task(
@@ -276,6 +348,40 @@ def complete_test_engineer_task(
             raise ConflictException("Test Engineer 任务没有提交资格")
         execution = task_execution.require_execution(db, task_id, execution_id, lock=True)
         assert execution is not None
+        # Publication repeats the gate from persisted platform observations; callers
+        # cannot bypass tool validation by directly constructing a passing report.
+        from pathlib import Path
+
+        from app.services.qa_verification import (
+            QAVerificationState,
+            restore_test_engineer_progress,
+            validate_report,
+        )
+
+        state = QAVerificationState(
+            app_spec=inputs.app_spec,
+            code_item_id=code_item_id,
+            code_source_hash=inputs.code_artifact.source_hash,
+            workspace_root=Path("."),
+            acceptance_test_plan=inputs.acceptance_test_plan,
+            acceptance_test_plan_item_id=(
+                inputs.acceptance_test_plan_item.item_id
+                if inputs.acceptance_test_plan_item is not None
+                else None
+            ),
+            acceptance_test_hash=(
+                inputs.acceptance_test_plan_item.content_hash
+                if inputs.acceptance_test_plan_item is not None
+                else None
+            ),
+        )
+        inherited_suite = getattr(inputs, "inherited_suite", None)
+        if inherited_suite is not None:
+            state.suite_versions = [inherited_suite]
+        draft = execution.draft or {}
+        checkpoint = draft.get("checkpoint", {})
+        restore_test_engineer_progress(state, checkpoint.get("verification"), for_recovery=False)
+        validate_report(report, state)
         item = configuration_manager.stage_configuration_item(
             db,
             project_id=project_id,
@@ -317,17 +423,9 @@ def complete_test_engineer_task(
             run.status = BuildRunStatus.SUCCEEDED.value
             run.error = None
             run.active_slot = None
-        elif report.quality_conclusion == QualityConclusion.FAILED:
-            # A failed report is structured feedback, not a terminal build state.
-            # Leader will either create a bounded repair assignment or close the
-            # run after the configured number of independent QA cycles.
-            run.error = report.summary[:500]
         else:
-            # Missing infrastructure or evidence is not a code defect. Sending it
-            # back to Code Engineer would burn repair rounds without changing the
-            # observation, so close with the actionable blocked reason.
-            run.status = BuildRunStatus.FAILED.value
-            run.active_slot = None
+            # Failed checks await bounded repair; blocked checks await explicit
+            # recovery or a user decision. Neither reopens a terminal BuildRun.
             run.error = report.summary[:500]
         db.commit()
         db.refresh(item)

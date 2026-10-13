@@ -50,12 +50,11 @@ from app.services.engineering import (
     ENGINEERING_TASK_KEY,
     QUALITY_TASK_KEY,
     find_architecture_task,
-    find_claimed_engineering_task,
-    find_pending_engineering_task,
     load_approved_app_spec,
     load_engineering_source,
     prepare_requirements_followup,
 )
+from app.services.engineering.handoff import find_dispatched_task
 from app.services.project_message import stage_user_project_message
 from app.services.project_message_classification import (
     get_stored_classification,
@@ -339,21 +338,29 @@ def create_engineering_delivery_task(
     Direct ``app_spec`` delivery is intentionally gated so callers cannot bypass
     Leader's complexity decision.
     """
-    delivery_task: Task | None = None
-    approved_payload: dict | None = None
     try:
         run = lock_run(db, user, project_id, run_id)
         source = load_engineering_source(db, project_id, run_id, item_id, lock=True)
+        direct = source.system_design is None
+        if direct and not allow_direct:
+            raise ConflictException("只有 Leader 可以把简单需求直接交给 Code Engineer")
         revision = db.scalar(
             select(RunRevision).where(
                 RunRevision.project_id == project_id, RunRevision.target_run_id == run_id
             )
         )
         cross_run = source.source_plan.build_run_id != run_id
-        if cross_run:
-            if revision is None or revision.kind != "implementation_repair":
-                raise ConflictException("跨运行工程输入缺少实现修订关系")
-            if run.status == "queued":
+        if cross_run and (revision is None or revision.kind != "implementation_repair"):
+            raise ConflictException("跨运行工程输入缺少实现修订关系")
+        replay = find_dispatched_task(db, project_id, run_id, item_id, TaskRecipient.CODE_ENGINEER)
+        if replay is not None and (
+            replay.status != "pending" or run.status not in {"queued", "running"}
+        ):
+            db.commit()
+            return replay
+        delivery_task = replay
+        if delivery_task is None:
+            if cross_run and run.status == "queued":
                 build_run_service.stage_running(
                     db,
                     run,
@@ -361,146 +368,55 @@ def create_engineering_delivery_task(
                     allowed_running_stages={BuildRunStage.DEVELOPER},
                 )
                 db.flush()
-                db.refresh(run)
-        if run.status != "running" or run.active_slot != 1:
-            raise ConflictException("当前构建不能进行需求到工程交付的交接")
-        acceptance_plan = get_or_create_acceptance_test_plan(
-            db,
-            project_id=project_id,
-            run_id=run_id,
-            source=source,
-        )
-        direct = source.system_design is None
-        if direct and not allow_direct:
-            raise ConflictException("只有 Leader 可以把简单需求直接交给 Code Engineer")
-        allowed_stages = ("pm", "developer") if direct else ("architect", "developer")
-        if run.stage not in allowed_stages:
-            raise ConflictException("当前构建不能进行需求到工程交付的交接")
-        source_plan = source.source_plan
-        approved_payload = source.app_spec.model_dump(mode="json")
-        claimed = (
-            None
-            if cross_run
-            else find_claimed_engineering_task(
-                db, source_plan, item_id, acceptance_plan.item_id, lock=True
-            )
-        )
-        if claimed is not None:
-            db.commit()
-            db.refresh(claimed)
-            delivery_task = claimed
-        else:
             expected_stage = "developer" if cross_run else ("pm" if direct else "architect")
-            if run.stage != expected_stage:
+            if (run.status, run.stage, run.active_slot) != ("running", expected_stage, 1):
                 raise ConflictException("当前构建不能进行需求到工程交付的交接")
+            source_plan = source.source_plan
             latest = db.scalar(
                 select(Plan)
                 .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
                 .order_by(Plan.version.desc())
                 .limit(1)
                 .with_for_update()
-                .execution_options(populate_existing=True)
             )
-            if not cross_run and (latest is None or latest.version < source_plan.version):
-                raise ConflictException("需求已进入其他后续计划，请刷新进度")
-            existing = None
-            if cross_run:
-                for candidate_plan in db.scalars(
-                    select(Plan)
-                    .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
-                    .order_by(Plan.version)
-                ).all():
-                    candidate_tasks = list(
-                        db.scalars(select(Task).where(Task.plan_id == candidate_plan.plan_id)).all()
-                    )
-                    expected_inputs = [item_id, acceptance_plan.item_id]
-                    if (
-                        len(candidate_tasks) == 1
-                        and candidate_tasks[0].input_configuration_item_ids == expected_inputs
-                    ):
-                        existing = candidate_tasks[0]
-                        break
-            else:
-                existing = find_pending_engineering_task(
-                    db, source_plan, item_id, acceptance_plan.item_id, lock=True
-                )
-            if existing is not None:
-                if existing.task_key == ENGINEERING_TASK_KEY:
-                    engineering_plan = db.scalar(
-                        select(Plan).where(Plan.plan_id == existing.plan_id).with_for_update()
-                    )
-                    assert engineering_plan is not None
-                    blocking = db.scalar(
-                        select(Plan.plan_id)
-                        .where(
-                            Plan.project_id == project_id,
-                            Plan.build_run_id == run_id,
-                            Plan.version > engineering_plan.version,
-                            Plan.status.in_(("pending", "running", "succeeded")),
-                        )
-                        .limit(1)
-                    )
-                    if blocking is not None:
-                        raise ConflictException("需求已进入其他后续计划，请刷新进度")
-                    db.commit()
-                    db.refresh(existing)
-                    delivery_task = existing
-            if delivery_task is None:
-                if existing is None:
-                    blocking = db.scalar(
-                        select(Plan.plan_id)
-                        .where(
-                            Plan.project_id == project_id,
-                            Plan.build_run_id == run_id,
-                            Plan.version > source_plan.version,
-                            Plan.status.in_(("pending", "running", "succeeded")),
-                        )
-                        .limit(1)
-                    )
-                    if blocking is not None:
-                        raise ConflictException("需求已进入其他后续计划，请刷新进度")
-                next_version = (
-                    db.scalar(
-                        select(Plan.version)
-                        .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
-                        .order_by(Plan.version.desc())
-                        .limit(1)
-                    )
-                    or (0 if cross_run else source_plan.version)
-                ) + 1
-                plan = plan_service.stage_plan(
-                    db,
-                    user,
-                    project_id,
-                    run_id,
-                    PlanCreate(
-                        version=next_version,
-                        cause_message_id=(
-                            revision.cause_message_id
-                            if cross_run and revision
-                            else source_plan.cause_message_id
-                        ),
-                        tasks=[
-                            TaskCreate(
-                                task_key=ENGINEERING_TASK_KEY,
-                                recipient=TaskRecipient.CODE_ENGINEER,
-                                title=(
-                                    "根据已批准需求直接交付应用代码"
-                                    if direct
-                                    else "根据系统设计交付应用代码"
-                                ),
-                                instructions=ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
-                                expected_output_type=ConfigurationItemType.CODE,
-                                input_configuration_item_ids=[item_id, acceptance_plan.item_id],
-                            )
-                        ],
+            if (cross_run and latest is not None) or (
+                not cross_run and (latest is None or latest.plan_id != source_plan.plan_id)
+            ):
+                raise ConflictException("已有其他后续计划，不能重复派工")
+            acceptance_plan = get_or_create_acceptance_test_plan(
+                db, project_id=project_id, run_id=run_id, source=source
+            )
+            plan = plan_service.stage_plan(
+                db,
+                user,
+                project_id,
+                run_id,
+                PlanCreate(
+                    version=(latest.version if latest is not None else 0) + 1,
+                    cause_message_id=(
+                        revision.cause_message_id
+                        if cross_run and revision
+                        else source_plan.cause_message_id
                     ),
-                )
-                task = db.scalar(select(Task).where(Task.plan_id == plan.plan_id))
-                assert task is not None
-                db.commit()
-                db.refresh(task)
-                delivery_task = task
+                    tasks=[
+                        TaskCreate(
+                            task_key=ENGINEERING_TASK_KEY,
+                            recipient=TaskRecipient.CODE_ENGINEER,
+                            title="根据已批准需求直接交付应用代码"
+                            if direct
+                            else "根据系统设计交付应用代码",
+                            instructions=ENGINEERING_DELIVERY_TASK_INSTRUCTIONS,
+                            expected_output_type=ConfigurationItemType.CODE,
+                            input_configuration_item_ids=[item_id, acceptance_plan.item_id],
+                        )
+                    ],
+                ),
+            )
+            delivery_task = db.scalar(select(Task).where(Task.plan_id == plan.plan_id))
+            assert delivery_task is not None
+        approved_payload = source.app_spec.model_dump(mode="json")
+        db.commit()
+        db.refresh(delivery_task)
     except IntegrityError as exc:
         db.rollback()
         raise ConflictException("工程交付派工保存冲突，请重试") from exc
@@ -874,18 +790,30 @@ def dispatch_approved_requirements(
         run_id=run_id,
         target_message_id=source_plan.cause_message_id,
     )
-    outcome = leader_agent.lead_project_turn(
-        context,
-        instruction=(
-            "本轮只决定已批准 app_spec 的下一个角色。创建且分派一个任务。若命中 "
-            "external_integration、auth_or_permission、concurrency、persisted_contract_migration、"
-            "breaking_public_contract 任一标志，或新增超过 1 个相互关联业务实体，交给 Architect；"
-            "仅当这些标志全为 false、最多影响 2 个既有业务模块且契约已明确时，才交给 "
-            "Code Engineer。任务 instructions 首句必须记录命中的 reason code。任务只引用准确成果 "
-            f"{approved_item_id}，不得安排 Product Manager、Test Engineer 或未来任务。"
-        ),
-        max_turns=leader_agent.LEADER_SIMPLE_DISPATCH_TURNS,
-    )
+    from app.telemetry.agent import agent_telemetry_scope
+
+    with agent_telemetry_scope(
+        project_id=project_id,
+        build_run_id=run_id,
+        task_id=None,
+        execution_id=None,
+        role="Leader",
+        bind=db.get_bind(),
+    ):
+        outcome = leader_agent.lead_project_turn(
+            context,
+            instruction=(
+                "本轮只决定已批准 app_spec 的下一个角色。创建且分派一个任务。若命中 "
+                "external_integration、auth_or_permission、concurrency、persisted_contract_migration、"
+                "breaking_public_contract 任一标志，或新增超过 1 个相互关联业务实体，"
+                "交给 Architect；"
+                "仅当这些标志全为 false、最多影响 2 个既有业务模块且契约已明确时，才交给 "
+                "Code Engineer。任务 instructions 首句必须记录命中的 reason code。"
+                "任务只引用准确成果 "
+                f"{approved_item_id}，不得安排 Product Manager、Test Engineer 或未来任务。"
+            ),
+            max_turns=leader_agent.LEADER_SIMPLE_DISPATCH_TURNS,
+        )
     path = _delivery_path_from_outcome(
         outcome,
         approved_item_id=approved_item_id,
@@ -926,9 +854,15 @@ def dispatch_completed_code(
 
     try:
         run = lock_run(db, user, project_id, run_id)
+        inputs = load_test_inputs(db, project_id, run_id, code_item_id, lock=True)
+        replay = find_dispatched_task(
+            db, project_id, run_id, code_item_id, TaskRecipient.TEST_ENGINEER
+        )
+        if replay is not None:
+            db.commit()
+            return replay
         if run.status != "running" or run.stage != "developer" or run.active_slot != 1:
             raise ConflictException("当前构建不能进行代码到质量验证的交接")
-        inputs = load_test_inputs(db, project_id, run_id, code_item_id, lock=True)
         latest = db.scalar(
             select(Plan)
             .where(Plan.project_id == project_id, Plan.build_run_id == run_id)
@@ -939,27 +873,6 @@ def dispatch_completed_code(
         )
         if latest is None:
             raise ConflictException("当前构建没有可继续的计划")
-        if latest.version > inputs.code_plan.version:
-            tasks = list(db.scalars(select(Task).where(Task.plan_id == latest.plan_id)).all())
-            if len(tasks) == 1:
-                replay = tasks[0]
-                if (
-                    replay.task_key == QUALITY_TASK_KEY
-                    and replay.recipient == TaskRecipient.TEST_ENGINEER.value
-                    and replay.expected_output_type == ConfigurationItemType.TEST_REPORT.value
-                    and replay.input_configuration_item_ids == [code_item_id]
-                    and not replay.depends_on_task_ids
-                    and replay.status
-                    in {
-                        "pending",
-                        "running",
-                        "succeeded",
-                    }
-                ):
-                    db.commit()
-                    db.refresh(replay)
-                    return replay
-            raise ConflictException("代码成果已进入其他后续计划，请刷新进度")
         if latest.plan_id != inputs.code_plan.plan_id:
             raise ConflictException("代码成果不是当前最新计划的结果")
         plan = plan_service.stage_plan(
@@ -1012,7 +925,7 @@ def retry_blocked_quality_validation(
 
     try:
         run = lock_run(db, user, project_id, run_id)
-        if (run.status, run.stage, run.active_slot) != ("failed", "qa", None):
+        if (run.status, run.stage, run.active_slot) != ("running", "qa", 1):
             raise ConflictException("当前构建不处于可恢复的质量阻塞状态")
         row = db.execute(
             select(ConfigurationItem, Task, Plan)
@@ -1079,13 +992,6 @@ def retry_blocked_quality_validation(
         )
         if int(quality_cycles or 0) >= MAX_QUALITY_CYCLES:
             raise ConflictException("独立验收重试轮次已用尽")
-        # Plan validation only accepts active BuildRuns. Reactivate the locked run
-        # inside this transaction before staging the retry plan, and flush so the
-        # validator's SELECT ... FOR UPDATE observes the new state. Any later
-        # failure rolls both the run transition and the plan back together.
-        run.status = BuildRunStatus.RUNNING.value
-        run.stage = "qa"
-        run.active_slot = 1
         run.error = None
         db.flush()
         plan = plan_service.stage_plan(
@@ -1137,8 +1043,6 @@ def dispatch_quality_repair(
 
     try:
         run = lock_run(db, user, project_id, run_id)
-        if run.status != "running" or run.stage != "qa" or run.active_slot != 1:
-            raise ConflictException("当前构建不能从质量验证进入修复")
         row = db.execute(
             select(ConfigurationItem, Task, Plan)
             .join(TaskResult, TaskResult.configuration_item_id == ConfigurationItem.item_id)
@@ -1168,6 +1072,16 @@ def dispatch_quality_repair(
         ):
             raise ConflictException("只有已完成的独立验收报告可以触发修复")
         report = TestReport.model_validate(report_item.payload)
+        replay = find_dispatched_task(
+            db, project_id, run_id, report_item_id, TaskRecipient.CODE_ENGINEER
+        )
+        if replay is not None:
+            db.commit()
+            return replay
+        if run.status in {"failed", "cancelled", "succeeded"}:
+            return None
+        if run.status != "running" or run.stage != "qa" or run.active_slot != 1:
+            raise ConflictException("当前构建不能从质量验证进入修复")
         if report.quality_conclusion == QualityConclusion.PASSED:
             raise ConflictException("已通过的质量报告不需要修复")
         inputs = load_test_inputs(
@@ -1223,7 +1137,6 @@ def dispatch_quality_repair(
             approved_item_id=source_item_id,
             code_item_id=inputs.code_item.item_id,
             report_item_id=report_item_id,
-            cause_message_id=latest.cause_message_id,
             challenge_resolved=challenge_resolved,
         )
         if next_action.action == NextActionKind.RETRY_INFRASTRUCTURE:

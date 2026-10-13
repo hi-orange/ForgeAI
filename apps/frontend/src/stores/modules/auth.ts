@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import * as authApi from '@/api/modules/auth'
+import { ApiError } from '@/api/request'
 import type {
   ChangePasswordPayload,
   LoginPayload,
@@ -72,11 +73,16 @@ export const useAuthStore = defineStore('auth', () => {
 
     try {
       user.value = await authApi.fetchMe()
-    } catch {
-      setToken(null)
-      user.value = null
-    } finally {
+      error.value = null
       bootstrapped.value = true
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 401) {
+        setToken(null)
+        user.value = null
+        bootstrapped.value = true
+      } else {
+        error.value = '暂时无法连接服务，请稍后刷新；登录信息已保留'
+      }
     }
   }
 

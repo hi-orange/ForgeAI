@@ -234,6 +234,7 @@ const props = defineProps<{
   planItems: RequirementPlanItem[]
   canApprove: boolean
   canResume: boolean
+  automaticRecovery: boolean
   busy: boolean
   refreshing: boolean
 }>()
@@ -322,6 +323,8 @@ const planReady = computed(
   () => props.canApprove || postApproval.value || props.status?.state === 'ready_for_delivery',
 )
 const previewTitle = computed(() => {
+  if (props.automaticRecovery) return '正在自动恢复构建'
+  if (props.status?.state === 'retry_available') return '构建已暂停'
   if (preview.value?.status === 'starting') return '正在启动预览'
   if (preview.value?.status === 'error') return '预览启动失败'
   if (props.status?.state === 'completed') return '应用已完成运行验证'
@@ -332,6 +335,9 @@ const previewTitle = computed(() => {
   return '把想法变成看得见的应用'
 })
 const previewDescription = computed(() => {
+  if (props.automaticRecovery) return props.status?.error || '后台已安排恢复，进度会继续更新。'
+  if (props.status?.state === 'retry_available')
+    return props.status.error || '当前没有任务在执行，请在左侧选择继续处理。'
   if (preview.value?.status === 'starting')
     return '正在构建前端产物并启动本机前后端，完成后会直接显示在这里。'
   if (preview.value?.status === 'error') return '可以重试启动预览；源码仍可在「编辑器」中查看。'

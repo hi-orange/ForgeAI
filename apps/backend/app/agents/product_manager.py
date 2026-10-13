@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from pydantic import ValidationError
@@ -37,7 +38,12 @@ def _initial_messages(payload: ProductManagerInput) -> list[dict[str, Any]]:
     ]
 
 
-def generate_app_spec(payload: ProductManagerInput) -> AppSpec:
+def generate_app_spec(
+    payload: ProductManagerInput,
+    *,
+    checkpoint: dict[str, Any] | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
+) -> AppSpec:
     """Run the bounded research/editor loop without performing database writes."""
 
     try:
@@ -46,6 +52,12 @@ def generate_app_spec(payload: ProductManagerInput) -> AppSpec:
         raise BusinessException("Product Manager 需求输入不符合要求") from exc
 
     state = ProductManagerToolState(payload=payload)
+    saved = (checkpoint or {}).get("state", {})
+    if saved.get("draft"):
+        state.draft = AppSpec.model_validate(saved["draft"])
+    state.opened_urls = set(saved.get("opened_urls", []))
+    if checkpoint and checkpoint.get("output"):
+        return AppSpec.model_validate(checkpoint["output"])
     return run_bounded_tool_loop(
         messages=_initial_messages(payload),
         tools=ALLOWED_PRODUCT_MANAGER_TOOLS,
@@ -58,4 +70,11 @@ def generate_app_spec(payload: ProductManagerInput) -> AppSpec:
         exhausted_message="Product Manager 工具调用预算已用尽，尚未提交 PRD",
         execute_tool=lambda call: execute_product_manager_tool(call, state),
         model_call=chat_with_tools,
+        checkpoint=checkpoint,
+        on_checkpoint=on_checkpoint,
+        export_state=lambda: {
+            "draft": state.draft.model_dump(mode="json") if state.draft else None,
+            "opened_urls": sorted(state.opened_urls),
+        },
+        batch_read_tools={"search_product_context"},
     )

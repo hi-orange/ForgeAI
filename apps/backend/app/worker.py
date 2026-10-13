@@ -9,6 +9,8 @@ import threading
 import time
 from uuid import uuid4
 
+from sqlalchemy import select
+
 from app.core.exceptions import AppException, ConflictException, WorkflowBlockedException
 from app.core.settings import settings
 from app.db.database import SessionLocal
@@ -53,7 +55,9 @@ def _existing_result(db, task_id: str) -> ConfigurationItem | None:
     saved = db.get(TaskResult, task_id)
     if saved is None:
         return None
-    return db.get(ConfigurationItem, saved.configuration_item_id)
+    return db.scalar(
+        select(ConfigurationItem).where(ConfigurationItem.item_id == saved.configuration_item_id)
+    )
 
 
 def _latest_recovery_id(db, task_id: str) -> str | None:
@@ -91,9 +95,8 @@ def _handle_product_manager(job: WorkflowJob, worker_id: str) -> None:
 
 
 def _handle_architect(job: WorkflowJob, worker_id: str) -> None:
-    from app.orchestration.leader import run_architect_and_continue
+    from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
     from app.services import leader as leader_service
-    from app.services.engineering import claim_code_engineer_task, start_claimed_engineering
 
     user = _owner(job)
     project_id = int(_required_payload(job, "project_id"))
@@ -105,10 +108,7 @@ def _handle_architect(job: WorkflowJob, worker_id: str) -> None:
             delivery = leader_service.dispatch_completed_design(
                 db, user, project_id, run_id, existing.item_id
             )
-            code_task, code_execution = claim_code_engineer_task(
-                db, user, project_id, run_id, delivery.task_id
-            )
-            start_claimed_engineering(db, user, project_id, run_id, code_task, code_execution)
+            start_dispatched_delivery(db, user, project_id, run_id, delivery)
             return
         recovery_id = str(job.payload.get("recovery_execution_id") or "") or _latest_recovery_id(
             db, task_id
@@ -126,43 +126,9 @@ def _handle_architect(job: WorkflowJob, worker_id: str) -> None:
         )
 
 
-def _enqueue_quality_for_code(
-    db, user: User, project_id: int, run_id: str, code_item: ConfigurationItem
-) -> None:
-    from app.services import leader as leader_service
-    from app.services.workflow_jobs import enqueue_job
-
-    quality_task = leader_service.dispatch_completed_code(
-        db, user, project_id, run_id, code_item.item_id
-    )
-    enqueue_job(
-        db,
-        job_type="quality",
-        idempotency_key=f"quality:{quality_task.task_id}",
-        project_id=project_id,
-        build_run_id=run_id,
-        task_id=quality_task.task_id,
-        payload={
-            "user_id": user.id,
-            "project_id": project_id,
-            "run_id": run_id,
-            "task_id": quality_task.task_id,
-        },
-    )
-    from app.services.security_gate import enqueue_security_gate
-
-    enqueue_security_gate(
-        db,
-        user_id=user.id,
-        project_id=project_id,
-        run_id=run_id,
-        code_item_id=code_item.item_id,
-    )
-
-
 def _handle_engineering(job: WorkflowJob, worker_id: str) -> None:
     from app.services.engineering import claim_code_engineer_task
-    from app.services.engineering.run import _run_and_publish
+    from app.services.engineering.run import _run_and_publish, dispatch_code_validation
 
     user = _owner(job)
     project_id = int(_required_payload(job, "project_id"))
@@ -171,7 +137,7 @@ def _handle_engineering(job: WorkflowJob, worker_id: str) -> None:
     with SessionLocal() as db:
         existing = _existing_result(db, task_id)
         if existing is not None:
-            _enqueue_quality_for_code(db, user, project_id, run_id, existing)
+            dispatch_code_validation(db, user, project_id, run_id, existing.item_id)
             return
         execution = db.get(TaskExecution, job.execution_id) if job.execution_id else None
         if execution is None or execution.status != "running":

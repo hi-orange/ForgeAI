@@ -49,15 +49,6 @@ MESSAGE_TURN_INSTRUCTION = """
 本轮最多创建一个可立即分派的任务。
 """.strip()
 
-QUALITY_FAILURE_TURN_INSTRUCTION = """
-本轮仲裁一份 FAILED/BLOCKED 的独立验收报告。先 read_project_context 与 read_task_result。
-规则：
-1. FAILED 是实现未满足冻结意图，派 Code Engineer，并引用准确 code / app_spec / test_report id。
-2. BLOCKED 且无测试质疑是环境或证据阻断，应恢复验收基础设施，不要改代码。
-3. 冻结测试与获批意图冲突时等待用户 challenge 裁决，不要改测试或擅自修产品。
-4. 不得直接派 Test Engineer；其复验由引擎在新代码发布后自动创建。
-""".strip()
-
 
 def _latest_approved_app_spec_item(
     db: Session, *, project_id: int, run_id: str | None = None
@@ -485,10 +476,9 @@ def decide_quality_failure_next_action(
     approved_item_id: str,
     code_item_id: str,
     report_item_id: str,
-    cause_message_id: int,
     challenge_resolved: bool = False,
 ) -> NextAction:
-    """Engine-first quality failure routing; Leader only for mixed/ambiguous owners."""
+    """Persist the deterministic owner of an immutable quality report."""
 
     project_service.get_user_project(db, user, project_id)
     proposed = resolve_quality_failure_next_action(
@@ -502,46 +492,13 @@ def decide_quality_failure_next_action(
     replay = decision_event_service.get_decision(db, decision_key)
     if replay is not None:
         return replay[1]
-    if proposed.action != NextActionKind.NEEDS_LEADER:
-        return decision_event_service.record_decision(
-            db,
-            decision_key=decision_key,
-            project_id=project_id,
-            build_run_id=run_id,
-            report_item_id=report_item_id,
-            action=validate_next_action(proposed),
-        )
-
-    context = leader_service.build_leader_context(
-        db,
-        project_id=project_id,
-        run_id=run_id,
-        target_message_id=cause_message_id,
-    )
-    with agent_telemetry_scope(
-        project_id=project_id,
-        build_run_id=run_id,
-        task_id=None,
-        execution_id=None,
-        role="Leader",
-        bind=db.get_bind(),
-    ):
-        outcome = leader_agent.lead_project_turn(
-            context,
-            instruction=(
-                f"{QUALITY_FAILURE_TURN_INSTRUCTION}\n"
-                f"report_item_id={report_item_id}; code_item_id={code_item_id}; "
-                f"approved_item_id={approved_item_id}."
-            ),
-            max_turns=leader_agent.LEADER_SIMPLE_DISPATCH_TURNS,
-        )
     return decision_event_service.record_decision(
         db,
         decision_key=decision_key,
         project_id=project_id,
         build_run_id=run_id,
         report_item_id=report_item_id,
-        action=validate_next_action(next_action_from_leader_outcome(outcome)),
+        action=validate_next_action(proposed),
     )
 
 

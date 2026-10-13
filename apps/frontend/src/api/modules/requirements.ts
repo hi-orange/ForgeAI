@@ -87,6 +87,9 @@ export type RequirementsStatus = {
   preview_work_item_title?: string | null
   preview_updated_at?: string | null
   execution_id: string | null
+  stage?: 'pm' | 'architect' | 'developer' | 'qa' | 'runtime' | null
+  job_status?: string | null
+  next_retry_at?: string | null
   execution_expires_at: string | null
   error: string | null
   retryable?: boolean
@@ -97,8 +100,21 @@ export type RequirementsStatus = {
   code_item_id?: string | null
   test_report_item_id?: string | null
   test_challenges?: TestChallenge[]
+  test_results?: TestVerification[]
+  test_suite_hash?: string | null
   workspace_path?: string | null
   activities?: EngineeringActivity[]
+}
+
+export type TestVerification = {
+  test_id: string
+  acceptance_ids: string[]
+  check_id: string
+  status: 'passed' | 'failed' | 'blocked' | 'not_run'
+  command: string
+  evidence: string
+  execution_id?: string | null
+  failure_kind?: 'product' | 'script' | 'environment' | 'conflict' | null
 }
 
 export type RequirementMessage = {

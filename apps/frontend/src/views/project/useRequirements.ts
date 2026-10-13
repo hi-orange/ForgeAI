@@ -107,20 +107,28 @@ export function useRequirements(projectId: number) {
 
   const canResume = computed(
     () =>
-      status.value?.state === 'pending' ||
-      (status.value?.state === 'retry_available' && status.value.retryable !== false) ||
-      (status.value?.state === 'quality_failed' && status.value.retryable !== false) ||
-      (status.value?.state === 'ready_for_delivery' && !busy.value) ||
-      (['design_pending', 'engineering_pending', 'quality_pending'].includes(
-        status.value?.state ?? '',
-      ) &&
-        Boolean(status.value?.error)) ||
-      (status.value?.state === 'engineering_running' &&
-        (Boolean(status.value.error) || !status.value.activities?.length)),
+      !automaticRecovery.value &&
+      (status.value?.state === 'pending' ||
+        (status.value?.state === 'retry_available' && status.value.retryable !== false) ||
+        (status.value?.state === 'quality_failed' && status.value.retryable !== false) ||
+        (status.value?.state === 'ready_for_delivery' && !busy.value) ||
+        (['design_pending', 'engineering_pending', 'quality_pending'].includes(
+          status.value?.state ?? '',
+        ) &&
+          Boolean(status.value?.error)) ||
+        (status.value?.state === 'engineering_running' &&
+          (Boolean(status.value.error) || !status.value.activities?.length))),
+  )
+  const automaticRecovery = computed(
+    () =>
+      Boolean(status.value?.next_retry_at) ||
+      (status.value?.state === 'retry_available' &&
+        ['queued', 'running'].includes(status.value?.job_status ?? '')),
   )
   const needsManualRepair = computed(
     () =>
       status.value?.state === 'retry_available' &&
+      !automaticRecovery.value &&
       status.value.retryable === false &&
       Boolean(status.value.run_id && status.value.task_id && status.value.execution_id),
   )
@@ -150,6 +158,7 @@ export function useRequirements(projectId: number) {
     if (disposed) return
     if (
       busy.value ||
+      automaticRecovery.value ||
       status.value?.state === 'running' ||
       status.value?.state === 'design_running' ||
       status.value?.state === 'design_pending' ||
@@ -440,6 +449,7 @@ export function useRequirements(projectId: number) {
   })
 
   return {
+    automaticRecovery,
     name,
     status,
     messages,

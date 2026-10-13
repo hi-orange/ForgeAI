@@ -8,8 +8,9 @@ import time
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
-from app.core.exceptions import BusinessException, ProviderException
+from app.core.exceptions import BusinessException, ModelProtocolException, ProviderException
 from app.core.llm_response import CompletionContentKind, normalize_completion_content
 from app.core.settings import settings
 from app.schemas.agent_action import ChatWithToolsResult, TokenUsage, ToolCall, ToolDefinition
@@ -332,8 +333,35 @@ def chat_with_tools(
     }
     started = time.perf_counter()
     data = _post_chat(body, timeout=timeout)
-    result = parse_agent_action(data)
-    record_model_turn(result, round((time.perf_counter() - started) * 1000))
+    # Meter the received response before parsing tool arguments. Invalid output is
+    # still paid work; never silently omit it from the run's measured usage.
+    usage = data.get("usage")
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    choice = choice if isinstance(choice, dict) else {}
+    message = choice.get("message")
+    message = message if isinstance(message, dict) else {}
+    measured = ChatWithToolsResult(
+        model=data.get("model") if isinstance(data.get("model"), str) else None,
+        usage=TokenUsage.model_validate(
+            {key: value for key, value in usage.items() if type(value) is int and value >= 0}
+        )
+        if isinstance(usage, dict)
+        else None,
+        protocol="native" if message.get("tool_calls") else "json",
+    )
+    record_model_turn(measured, round((time.perf_counter() - started) * 1000))
+    try:
+        result = parse_agent_action(data)
+    except (BusinessException, ValidationError, TypeError, AttributeError) as exc:
+        logger.warning(
+            "LLM invalid tool response: model=%s finish_reason=%s usage=%s error=%s",
+            measured.model,
+            choice.get("finish_reason"),
+            usage,
+            exc,
+        )
+        raise ModelProtocolException(str(exc)) from exc
     logger.info(
         "LLM tool turn: model=%s finish_reason=%s tool_calls=%s content_length=%s usage=%s",
         result.model or data.get("model"),

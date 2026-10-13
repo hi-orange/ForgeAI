@@ -33,11 +33,25 @@ BINARY_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 SECURITY_SCANNER_VERSION = "forgeai-security-v1"
 SECURITY_REPORT_PREFIX = "FORGEAI_SECURITY_REPORT="
+APPLICATION_UID = None
+
+
+def application_process_options():
+    # Independent QA keeps its controller/evidence under a different OS identity.
+    return (
+        {}
+        if APPLICATION_UID is None
+        else {
+            "user": APPLICATION_UID,
+            "group": APPLICATION_UID,
+            "extra_groups": [],
+        }
+    )
 
 
 def command(argv, cwd, timeout=90):
     print("检查:", " ".join(str(part) for part in argv), flush=True)
-    subprocess.run(argv, cwd=cwd, check=True, timeout=timeout)
+    subprocess.run(argv, cwd=cwd, check=True, timeout=timeout, **application_process_options())
 
 
 def materialize(files):
@@ -313,6 +327,8 @@ def ensure_frontend_dependencies():
     ) == expected.get("devDependencies")
     if same_manifest:
         modules.mkdir(exist_ok=True)
+        if APPLICATION_UID is not None:
+            os.chown(modules, APPLICATION_UID, APPLICATION_UID)
         for dependency in TEMPLATE_FRONTEND_MODULES.iterdir():
             if dependency.name.startswith(".vite"):
                 continue
@@ -750,6 +766,7 @@ def start_backend(port=8080):
     process = subprocess.Popen(
         ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=ROOT / "backend",
+        **application_process_options(),
     )
     wait_http(f"http://127.0.0.1:{port}/api/v1/health", process, "后端")
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/openapi.json", timeout=2) as response:
@@ -767,9 +784,10 @@ def backend():
         stop_process(process)
 
 
-def frontend():
+def frontend(*, skip_dependencies=False):
     frontend_root = ROOT / "frontend"
-    ensure_frontend_dependencies()
+    if not skip_dependencies:
+        ensure_frontend_dependencies()
     package = json.loads((frontend_root / "package.json").read_text(encoding="utf-8"))
     dependencies = {
         **(package.get("dependencies") or {}),

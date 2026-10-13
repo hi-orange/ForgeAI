@@ -18,17 +18,17 @@ from app.models.task import TaskRecipient
 from app.schemas.acceptance_test_plan import AcceptanceTestPlan
 from app.schemas.agent_action import ToolCall
 from app.schemas.app_spec import AppSpec
+from app.schemas.qa_suite import QASuite
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import TestReport
-from app.tools.test_engineer import (
-    TEST_ENGINEER_TOOLS,
-    TestEngineerToolState,
-    execute_test_engineer_tool,
+from app.services.qa_verification import (
+    QAVerificationState,
     export_test_engineer_progress,
     restore_test_engineer_progress,
 )
+from app.tools.test_engineer import TEST_ENGINEER_TOOLS, execute_test_engineer_tool
 
-MAX_TEST_ENGINEER_TOOL_TURNS = 32
+MAX_TEST_ENGINEER_TOOL_TURNS = 64
 _TRANSIENT_EVIDENCE_ERRORS = frozenset(
     {
         "CHECK_ENVIRONMENT_UNAVAILABLE",
@@ -53,6 +53,7 @@ def verify_code(
     acceptance_test_plan_item_id: str | None = None,
     acceptance_test_hash: str | None = None,
     acceptance_test_plan: AcceptanceTestPlan | None = None,
+    inherited_suite: QASuite | None = None,
     saved_progress: object = None,
     heartbeat: Callable[[], None] | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
@@ -72,7 +73,7 @@ def verify_code(
         character not in "0123456789abcdef" for character in code_source_hash
     ):
         raise BusinessException("Test Engineer 代码 source_hash 格式异常")
-    state = TestEngineerToolState(
+    state = QAVerificationState(
         app_spec=spec,
         system_design=system_design,
         code_item_id=code_item_id,
@@ -82,20 +83,23 @@ def verify_code(
         acceptance_test_hash=acceptance_test_hash,
         acceptance_test_plan=acceptance_test_plan,
     )
+    if inherited_suite is not None:
+        from app.services.qa_assets import validate_suite
+
+        validate_suite(inherited_suite, spec, acceptance_test_plan)
+        state.suite_versions = [inherited_suite]
     restore_test_engineer_progress(state, saved_progress)
     resumed_progress = export_test_engineer_progress(state)
-    if "all" not in state.checks:
-        preferred_next_tools = [
-            "read_artifact(app_spec)",
-            "read_artifact(acceptance_test_plan)",
-            'run_check(check_id="all")',
-            'capture_screenshots(route="/")',
-            "write_test_report",
-        ]
-    elif not any(check_id.startswith("visual") for check_id in state.checks):
-        preferred_next_tools = ['capture_screenshots(route="/")', "write_test_report"]
-    else:
-        preferred_next_tools = ["write_test_report"]
+    preferred_next_tools = [
+        "read_artifact(app_spec)",
+        "design_test_cases",
+        "write_test_script",
+        "run_acceptance_tests",
+        'run_check(check_id="all")',
+        "capture_screenshots",
+        "record_defect",
+        "write_test_report",
+    ]
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
@@ -117,10 +121,10 @@ def verify_code(
                         else None
                     ),
                     "acceptance_execution_contract": {
-                        "available_runtime_tool": 'run_check(check_id="all")',
-                        "available_browser_tool": 'capture_screenshots(route="/")',
-                        "target_paths_are_logical": True,
-                        "missing_logical_target_is_not_a_code_defect": True,
+                        "available_runtime_tool": "run_acceptance_tests",
+                        "scripts_are_bounded_data": True,
+                        "api_steps_before_browser_steps": True,
+                        "smoke_and_screenshots_are_not_case_evidence": True,
                     },
                     "tool_budget": MAX_TEST_ENGINEER_TOOL_TURNS,
                     "preferred_next_tools": preferred_next_tools,
@@ -130,14 +134,11 @@ def verify_code(
             ),
         },
     ]
-    turns_used = 0
 
     def execute(call: ToolCall) -> tuple[Any, TestReport | None]:
-        nonlocal turns_used
         if heartbeat is not None:
             heartbeat()
         observation, output = execute_test_engineer_tool(call, state)
-        turns_used += 1
         if on_progress is not None:
             on_progress(export_test_engineer_progress(state))
         if observation.error_code in _TRANSIENT_EVIDENCE_ERRORS:
@@ -145,7 +146,7 @@ def verify_code(
             # not code defects. Stop immediately instead of spending the remaining budget
             # retrying the same expensive check.
             raise BusinessException(observation.summary)
-        remaining = MAX_TEST_ENGINEER_TOOL_TURNS - turns_used
+        remaining = MAX_TEST_ENGINEER_TOOL_TURNS - state.tool_turns
         if output is None and remaining <= 4:
             if "all" not in state.checks:
                 next_step = '请先 run_check(check_id="all")。'
@@ -162,35 +163,11 @@ def verify_code(
     def call_model(**kwargs: Any):
         if heartbeat is not None:
             heartbeat()
-        all_check = state.checks.get("all")
-        visual_checks = [
-            result for check_id, result in state.checks.items() if check_id.startswith("visual")
-        ]
-        if all_check is not None and not visual_checks:
-            # Screenshot evidence is mandatory and should happen exactly once after all.
-            kwargs["tools"] = [
-                tool for tool in ALLOWED_TEST_ENGINEER_TOOLS if tool.name == "capture_screenshots"
-            ]
-        elif all_check is not None and visual_checks:
-            has_code_failure = any(
-                not result.ok and result.error_code not in _TRANSIENT_EVIDENCE_ERRORS
-                for result in [all_check, *visual_checks]
-            )
-            final_tool_names = (
-                {
-                    "read_artifact",
-                    "list_files",
-                    "read_file",
-                    "search_code",
-                    "record_defect",
-                    "write_test_report",
-                }
-                if has_code_failure
-                else {"write_test_report"}
-            )
-            kwargs["tools"] = [
-                tool for tool in ALLOWED_TEST_ENGINEER_TOOLS if tool.name in final_tool_names
-            ]
+        # Reserve before model/tool work: crashes and invalid tool calls do not
+        # reset the recovery budget or permit unlimited expensive attempts.
+        state.tool_turns += 1
+        if on_progress is not None:
+            on_progress(export_test_engineer_progress(state))
         return chat_with_tools(**kwargs)
 
     return run_bounded_tool_loop(
@@ -198,7 +175,7 @@ def verify_code(
         tools=ALLOWED_TEST_ENGINEER_TOOLS,
         allowed_tools=TEST_ENGINEER_PROFILE.allowed_tools,
         role_name="Test Engineer",
-        max_turns=MAX_TEST_ENGINEER_TOOL_TURNS,
+        max_turns=max(0, MAX_TEST_ENGINEER_TOOL_TURNS - state.tool_turns),
         temperature=0.0,
         max_tokens=8192,
         missing_message="Test Engineer 未调用工具验证或提交报告",

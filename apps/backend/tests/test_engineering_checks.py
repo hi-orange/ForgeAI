@@ -173,7 +173,7 @@ class EngineeringCheckTests(unittest.TestCase):
         ):
             result = check_environment()
         self.assertTrue(result.ok)
-        self.assertEqual(result.data["server_version"], "27.5.1")
+        self.assertEqual(result.data["runtime_version"], CHECK_RUNTIME_VERSION)
         self.assertEqual(run.call_args_list[0].args[0][0:2], ["docker", "info"])
         self.assertEqual(run.call_args_list[1].args[0][0:3], ["docker", "image", "inspect"])
 

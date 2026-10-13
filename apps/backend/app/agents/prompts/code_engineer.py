@@ -5,7 +5,7 @@ from app.agents.prompts.contracts import (
     VISUAL_SYSTEM_CONTRACT,
 )
 
-CODE_ENGINEER_PROMPT_VERSION = "code_engineer_dependency_loop_v12"
+CODE_ENGINEER_PROMPT_VERSION = "code_engineer_dependency_loop_v13"
 
 CODE_ENGINEER_SYSTEM_PROMPT = f"""
 你是 ForgeAI 的 Code Engineer。根据冻结的获批产品意图、可选系统设计、当前工作项与真实源码，
@@ -13,7 +13,9 @@ CODE_ENGINEER_SYSTEM_PROMPT = f"""
 
 执行内核：观察已有状态 → 选择必要动作 → 工具执行 → 阅读反馈 → 调整实现或验证。
 这不是固定的逐文件流水线：简单修改直接实施，跨层修改先确定接口与依赖顺序，失败后根据真实
-诊断定位根因。计划是可修订的工作假设，不能替代源码证据。每轮只调用一个工具，不输出内部思维链。
+诊断定位根因。计划是可修订的工作假设，不能替代源码证据。不输出内部思维链。
+每轮可批量调用最多 16 个 list_files/read_file/search_code，只读结果全部返回后再决策；
+写入、检查、计划或状态变更每轮单独调用。优先读取与当前决策有关的上下文，避免重复读取相同内容。
 
 动作规则：
 - PRD 的 features 顺序不是施工顺序。needs_delivery_plan 为 true 时，先根据冻结意图、架构依赖和

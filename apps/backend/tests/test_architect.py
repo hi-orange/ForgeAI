@@ -80,6 +80,84 @@ def valid_design() -> dict:
 
 
 class ArchitectTests(unittest.TestCase):
+    def test_recovers_design_draft_and_inspections_without_restarting_tool_loop(self):
+        progress = []
+        initial = [
+            ChatWithToolsResult(tool_calls=[ToolCall(id="intent", name="read_artifact")]),
+            ChatWithToolsResult(
+                tool_calls=[
+                    ToolCall(
+                        id="draft", name="editor_write", arguments={"system_design": valid_design()}
+                    )
+                ]
+            ),
+            BusinessException("provider unavailable"),
+        ]
+        with TemporaryDirectory(prefix="forgeai-architect-resume-") as directory:
+            with patch.object(architect_agent, "chat_with_tools", side_effect=initial):
+                with self.assertRaisesRegex(BusinessException, "provider unavailable"):
+                    architect_agent.generate_system_design(
+                        spec=valid_spec(),
+                        workspace_root=Path(directory),
+                        on_checkpoint=progress.append,
+                    )
+            self.assertEqual(progress[-1]["turns"], 3)
+            self.assertIn("artifact:app_spec", progress[-1]["state"]["inspection_keys"])
+            with patch.object(
+                architect_agent,
+                "chat_with_tools",
+                return_value=ChatWithToolsResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="write_system_design",
+                            arguments={"system_design": valid_design()},
+                        )
+                    ]
+                ),
+            ) as chat:
+                result = architect_agent.generate_system_design(
+                    spec=valid_spec(),
+                    workspace_root=Path(directory),
+                    checkpoint=progress[-1],
+                    on_checkpoint=progress.append,
+                )
+            self.assertEqual(result.model_dump(), valid_design())
+            self.assertEqual(progress[-1]["turns"], 4)
+            self.assertEqual(chat.call_count, 1)
+            with patch.object(architect_agent, "chat_with_tools") as chat:
+                replay = architect_agent.generate_system_design(
+                    spec=valid_spec(), workspace_root=Path(directory), checkpoint=progress[-1]
+                )
+                self.assertEqual(replay, result)
+                chat.assert_not_called()
+
+    def test_invalid_model_response_uses_bounded_correction_without_losing_context(self):
+        from app.core.exceptions import ModelProtocolException
+
+        with TemporaryDirectory(prefix="forgeai-architect-protocol-") as directory:
+            turns = [
+                ChatWithToolsResult(tool_calls=[ToolCall(id="intent", name="read_artifact")]),
+                ModelProtocolException("工具参数不是合法 JSON"),
+                ChatWithToolsResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="write_system_design",
+                            arguments={"system_design": valid_design()},
+                        )
+                    ]
+                ),
+            ]
+            progress = []
+            with patch.object(architect_agent, "chat_with_tools", side_effect=turns) as chat:
+                result = architect_agent.generate_system_design(
+                    spec=valid_spec(), workspace_root=Path(directory), on_checkpoint=progress.append
+                )
+            self.assertEqual(result.model_dump(), valid_design())
+            self.assertEqual(progress[-1]["turns"], 3)
+            self.assertIn("未执行任何工具", chat.call_args.kwargs["messages"][-1]["content"])
+
     def test_role_has_requested_goal_deliverable_and_tools(self):
         profile = get_role_profile(TaskRecipient.ARCHITECT)
         self.assertEqual(profile.display_name, "Architect")
@@ -266,7 +344,7 @@ class ArchitectTests(unittest.TestCase):
             ["system", "user", "assistant", "tool"],
         )
 
-    def test_agent_defers_extra_parallel_calls_without_failing_the_execution(self):
+    def test_agent_executes_read_batch_without_failing_the_execution(self):
         turns = [
             ChatWithToolsResult(
                 tool_calls=[
@@ -290,6 +368,7 @@ class ArchitectTests(unittest.TestCase):
         ]
         observations = []
         with TemporaryDirectory(prefix="forgeai-architect-agent-") as directory:
+            (Path(directory) / "README.md").write_text("source context", encoding="utf-8")
             with patch.object(architect_agent, "chat_with_tools", side_effect=turns) as chat:
                 result = architect_agent.generate_system_design(
                     spec=valid_spec(),
@@ -300,7 +379,7 @@ class ArchitectTests(unittest.TestCase):
         self.assertEqual(result.model_dump(), valid_design())
         self.assertEqual(
             [item.error_code for item in observations],
-            [None, None],
+            [None, None, None],
         )
         history = chat.call_args_list[1].kwargs["messages"]
         self.assertEqual(

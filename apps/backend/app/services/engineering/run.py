@@ -12,33 +12,27 @@ from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.services.engineering.claim import read_frozen_input_snapshot
 from app.services.engineering.completion import complete_code_engineer_task
-from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
+from app.services.task_execution import latest_execution, save_execution_draft, utc_now
 
 logger = logging.getLogger("forgeai")
 
 
-def is_engineering_active(execution_id: str) -> bool:
-    """Compatibility query backed by the durable job table."""
+def is_engineering_active(db: Session, execution_id: str) -> bool:
+    """Check durable ownership in the caller transaction."""
 
     from sqlalchemy import select
 
-    from app.db.database import SessionLocal
     from app.models.workflow_job import WorkflowJob
 
-    with SessionLocal() as db:
-        return (
-            db.scalar(
-                select(WorkflowJob.job_id).where(
-                    WorkflowJob.execution_id == execution_id,
-                    WorkflowJob.status.in_(("queued", "running", "retry_wait")),
-                )
+    return (
+        db.scalar(
+            select(WorkflowJob.job_id).where(
+                WorkflowJob.execution_id == execution_id,
+                WorkflowJob.status.in_(("queued", "running", "retry_wait")),
             )
-            is not None
         )
-
-
-def mark_engineering_inactive(execution_id: str) -> None:
-    """Compatibility no-op; execution fencing and job cancellation are durable."""
+        is not None
+    )
 
 
 def _record_loop_failure(
@@ -81,16 +75,58 @@ def _record_loop_failure(
             )
             checkpoint["activity"] = activity
             snapshot["checkpoint"] = checkpoint
-            import json
-
-            from sqlalchemy.orm.attributes import flag_modified
-
-            execution.draft = json.loads(json.dumps(snapshot))
-            flag_modified(execution, "draft")
-            db.commit()
-            renew_execution_lease(db, task_id, execution_id)
+            save_execution_draft(db, execution, snapshot)
     except Exception:
         logger.exception("failed to persist engineering loop error execution_id=%s", execution_id)
+
+
+def dispatch_code_validation(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    code_item_id: str,
+    *,
+    enqueue_quality: bool = True,
+) -> Task:
+    """Use the same durable handoff for publication and worker recovery."""
+    # Import locally: Leader depends on the engineering service facade.
+    from app.services import leader as leader_service
+
+    quality_task = leader_service.dispatch_completed_code(
+        db,
+        user,
+        project_id,
+        run_id,
+        code_item_id,
+    )
+    if enqueue_quality:
+        from app.services.security_gate import enqueue_security_gate
+        from app.services.workflow_jobs import enqueue_job
+
+        if quality_task.status in {"pending", "running"}:
+            enqueue_job(
+                db,
+                job_type="quality",
+                idempotency_key=f"quality:{quality_task.task_id}",
+                project_id=project_id,
+                build_run_id=run_id,
+                task_id=quality_task.task_id,
+                payload={
+                    "user_id": user.id,
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "task_id": quality_task.task_id,
+                },
+            )
+        enqueue_security_gate(
+            db,
+            user_id=user.id,
+            project_id=project_id,
+            run_id=run_id,
+            code_item_id=code_item_id,
+        )
+    return quality_task
 
 
 def _run_and_publish(
@@ -129,42 +165,10 @@ def _run_and_publish(
         task_id,
         execution_id,
     )
-    # Import locally: Leader depends on the engineering service facade.
-    from app.services import leader as leader_service
-
-    quality_task = leader_service.dispatch_completed_code(
-        db,
-        user,
-        project_id,
-        run_id,
-        code_item.item_id,
+    quality_task = dispatch_code_validation(
+        db, user, project_id, run_id, code_item.item_id, enqueue_quality=enqueue_quality
     )
     result.update(code_item_id=code_item.item_id, quality_task_id=quality_task.task_id)
-    if enqueue_quality:
-        from app.services.security_gate import enqueue_security_gate
-        from app.services.workflow_jobs import enqueue_job
-
-        enqueue_job(
-            db,
-            job_type="quality",
-            idempotency_key=f"quality:{quality_task.task_id}",
-            project_id=project_id,
-            build_run_id=run_id,
-            task_id=quality_task.task_id,
-            payload={
-                "user_id": user.id,
-                "project_id": project_id,
-                "run_id": run_id,
-                "task_id": quality_task.task_id,
-            },
-        )
-        enqueue_security_gate(
-            db,
-            user_id=user.id,
-            project_id=project_id,
-            run_id=run_id,
-            code_item_id=code_item.item_id,
-        )
     return result
 
 

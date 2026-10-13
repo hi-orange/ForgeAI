@@ -84,7 +84,7 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("优先选择 implementation_repair", MESSAGE_CLASSIFICATION_SYSTEM_PROMPT)
 
     def test_shared_prompt_contracts_have_one_versioned_source(self):
-        self.assertEqual(PROMPT_CONTRACT_VERSION, "forgeai_prompt_contracts_v4")
+        self.assertEqual(PROMPT_CONTRACT_VERSION, "forgeai_prompt_contracts_v5")
         self.assertIn("安全、权限、所有权", CONFLICT_PRIORITY_CONTRACT)
         self.assertIn("awaiting_approval", APPROVAL_WORKFLOW_CONTRACT)
         self.assertIn("批量读取", TOOL_EXECUTION_CONTRACT)

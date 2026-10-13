@@ -161,8 +161,7 @@ def record_architect_activity(
     )
     checkpoint["activity"] = activity
     draft["checkpoint"] = checkpoint
-    execution.draft = json.loads(json.dumps(draft, ensure_ascii=False))
-    task_execution.renew_execution_lease(db, task_id, execution_id)
+    task_execution.save_execution_draft(db, execution, draft)
 
 
 def complete_architect_task(

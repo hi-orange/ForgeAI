@@ -15,7 +15,7 @@ from app.generation.engineering.checkpoint import (
     prepare_manual_repair_retry,
 )
 from app.generation.workspace import default_workspace_path, workspace_is_ready
-from app.models.build_run import BuildRun
+from app.models.build_run import BuildRun, BuildRunStage
 from app.models.configuration_item import ConfigurationItem
 from app.models.plan import Plan
 from app.models.project_message import ProjectMessage, ProjectMessageSender
@@ -25,6 +25,7 @@ from app.models.task_execution import TaskExecution
 from app.models.task_result import TaskResult
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
+from app.models.workflow_job import WorkflowJob
 from app.orchestration.leader import run_architect_and_continue, start_dispatched_delivery
 from app.orchestration.product_manager import run_product_manager_workflow
 from app.orchestration.test_engineer import run_test_engineer_task
@@ -61,7 +62,6 @@ from app.services.engineering import (
     find_pending_engineering_task,
     load_approved_app_spec,
     load_engineering_source,
-    mark_engineering_inactive,
     read_frozen_input_snapshot,
 )
 from app.services.leader import create_clarification_plan, create_product_revision_plan
@@ -69,7 +69,7 @@ from app.services.run_control import cancel_active_run
 from app.services.task_execution import fail_execution, latest_execution, lock_run, utc_now
 from app.services.test_engineer import load_test_inputs
 from app.services.workflow_events import append_event
-from app.services.workflow_jobs import PAUSED_JOB_ERROR, pause_jobs_for_run
+from app.services.workflow_jobs import ACTIVE_JOB_STATUSES, PAUSED_JOB_ERROR, pause_jobs_for_run
 
 logger = logging.getLogger("forgeai")
 
@@ -275,7 +275,7 @@ def resolve_quality_challenge(
         raise ConflictException("测试质疑报告已变化，请刷新后重试")
 
     run = lock_run(db, user, project_id, run_id)
-    if (run.status, run.stage, run.active_slot) != ("failed", "qa", None):
+    if (run.status, run.stage, run.active_slot) != ("running", "qa", 1):
         raise ConflictException("测试质疑已经被处理，请刷新进度")
     inputs = load_test_inputs(db, project_id, run_id, status.code_item_id, lock=True)
     source = load_engineering_source(
@@ -289,9 +289,6 @@ def resolve_quality_challenge(
     if resolution.action == "repair_code":
         if not status.retryable:
             raise ConflictException("代码自动修复轮次已用尽，请修改产品意图或重新开始构建")
-        run.status = "running"
-        run.stage = "qa"
-        run.active_slot = 1
         run.error = None
         db.flush()
         task = leader_service.dispatch_quality_repair(
@@ -308,9 +305,7 @@ def resolve_quality_challenge(
 
     assert resolution.client_message_id is not None
     assert resolution.content is not None
-    run.status = "running"
     run.stage = "pm"
-    run.active_slot = 1
     run.error = None
     db.flush()
     plan = create_product_revision_plan(
@@ -476,15 +471,12 @@ def continue_engineering(
         return get_requirements_status(db, user, project_id)
     if current_task is not None and current_task.recipient == "Code Engineer":
         if status.state == "engineering_pending":
-            task, execution = engineering.claim_code_engineer_task(
-                db, user, project_id, run_id, current_task.task_id
-            )
-            engineering.start_claimed_engineering(db, user, project_id, run_id, task, execution)
+            start_dispatched_delivery(db, user, project_id, run_id, current_task)
             return get_requirements_status(db, user, project_id)
         if status.state == "engineering_generated" and status.code_item_id:
-            leader_service.dispatch_completed_code(
-                db, user, project_id, run_id, status.code_item_id
-            )
+            from app.services.engineering.run import dispatch_code_validation
+
+            dispatch_code_validation(db, user, project_id, run_id, status.code_item_id)
             return get_requirements_status(db, user, project_id)
         if status.state == "retry_available":
             return _resume_engineering_from_retry(db, user, project_id, run_id, status)
@@ -523,7 +515,7 @@ def ensure_engineering_running(
     status = get_requirements_status(db, user, project_id)
     if status.run_id != run_id or status.state != "engineering_running":
         return status
-    if not status.execution_id or engineering.is_engineering_active(status.execution_id):
+    if not status.execution_id or engineering.is_engineering_active(db, status.execution_id):
         return status
     if status.error and not force:
         return status
@@ -551,8 +543,8 @@ def _resume_engineering_from_retry(
     if not task_id or not status.execution_id:
         raise BusinessException("当前没有可继续的工程任务")
     # A worker can publish its blocked checkpoint just before releasing the
-    # in-process marker. Do not supersede it during that finalization window.
-    if engineering.is_engineering_active(status.execution_id):
+    # durable job. Do not supersede it during that finalization window.
+    if engineering.is_engineering_active(db, status.execution_id):
         return status
     task, execution = engineering.claim_code_engineer_task(
         db,
@@ -588,7 +580,7 @@ def retry_terminal_engineering(
     current_task = task_service.get_user_task(db, user, project_id, status.task_id)
     if current_task.recipient != "Code Engineer":
         raise ConflictException("当前失败不是代码修复任务")
-    if engineering.is_engineering_active(status.execution_id):
+    if engineering.is_engineering_active(db, status.execution_id):
         raise ConflictException("工程任务仍在收尾，请稍后刷新")
 
     previous = latest_execution(db, status.task_id, lock=True)
@@ -715,8 +707,6 @@ def pause_active_execution(
             db.rollback()
             raise ConflictException("执行状态已变化，请刷新后重试")
         db.commit()
-        # The execution fence is durable before the process-local marker is released.
-        mark_engineering_inactive(status.execution_id)
     else:
         db.commit()
     return get_requirements_status(db, user, project_id)
@@ -852,6 +842,24 @@ def _checkpoint_has_written_code(checkpoint: object) -> bool:
 
 def _attach_workspace_status(db: Session, result: RequirementsStatus) -> RequirementsStatus:
     if result.run_id is not None:
+        if result.task_id is not None:
+            job = db.scalar(
+                select(WorkflowJob)
+                .where(
+                    WorkflowJob.build_run_id == result.run_id,
+                    WorkflowJob.task_id == result.task_id,
+                )
+                .order_by(
+                    WorkflowJob.status.in_(ACTIVE_JOB_STATUSES).desc(),
+                    WorkflowJob.created_at.desc(),
+                    WorkflowJob.job_id.desc(),
+                )
+                .limit(1)
+            )
+            if job is not None:
+                result.job_status = job.status
+                if job.status == "retry_wait" and job.error != PAUSED_JOB_ERROR:
+                    result.next_retry_at = job.available_at
         result.activities = _activities_for_run(db, result.run_id)
         preview_event = db.scalar(
             select(WorkflowEvent)
@@ -915,6 +923,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
     if run is None:
         return _attach_workspace_status(db, result)
     result.run_id = run.run_id
+    result.stage = BuildRunStage(run.stage) if run.stage else None
     plan = db.scalar(
         select(Plan).where(Plan.build_run_id == run.run_id).order_by(Plan.version.desc()).limit(1)
     )
@@ -1011,26 +1020,22 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                 raise ConflictException("质量报告正文不符合要求") from exc
             result.test_report_item_id = report_item.item_id
             result.test_challenges = report.test_challenges
+            # Historical v1/v2 reports may contain inferred results. Only show
+            # runner-backed v3 case evidence as independently executed acceptance.
+            if report.test_suite is not None:
+                result.test_results = report.test_results
+                result.test_suite_hash = report.suite_hash
             result.error = run.error
+            active = run.status == "running" and run.active_slot == 1
             if report.quality_conclusion == QualityConclusion.PASSED and run.status == "succeeded":
                 result.state = "completed"
-            elif report.quality_conclusion == QualityConclusion.BLOCKED and report.test_challenges:
-                result.state = "quality_challenge"
-                quality_cycles = db.scalar(
-                    select(func.count())
-                    .select_from(Task)
-                    .join(Plan, Task.plan_id == Plan.plan_id)
-                    .where(
-                        Plan.project_id == project_id,
-                        Plan.build_run_id == run.run_id,
-                        Task.task_key == QUALITY_TASK_KEY,
-                        Task.recipient == "Test Engineer",
-                    )
-                )
-                result.retryable = int(quality_cycles or 0) < leader_service.MAX_QUALITY_CYCLES
             else:
-                result.state = "quality_failed"
-                if report.quality_conclusion == QualityConclusion.BLOCKED:
+                challenged = report.quality_conclusion == QualityConclusion.BLOCKED and bool(
+                    report.test_challenges
+                )
+                result.state = "quality_challenge" if challenged and active else "quality_failed"
+                result.retryable = False
+                if active and report.quality_conclusion == QualityConclusion.BLOCKED:
                     quality_cycles = db.scalar(
                         select(func.count())
                         .select_from(Task)
@@ -1042,12 +1047,7 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                             Task.recipient == "Test Engineer",
                         )
                     )
-                    result.retryable = (
-                        not report.test_challenges
-                        and int(quality_cycles or 0) < leader_service.MAX_QUALITY_CYCLES
-                    )
-                else:
-                    result.retryable = False
+                    result.retryable = int(quality_cycles or 0) < leader_service.MAX_QUALITY_CYCLES
             return _attach_workspace_status(db, result)
         result.state = "stopped"
         return _attach_workspace_status(db, result)

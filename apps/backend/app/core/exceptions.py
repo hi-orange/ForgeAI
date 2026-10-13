@@ -41,7 +41,15 @@ class ProviderException(BusinessException):
 
     def __init__(self, msg: str, *, retryable: bool, data: Any = None) -> None:
         self.retryable = retryable
-        super().__init__(msg, data=data)
+        AppException.__init__(self, msg, status_code=503 if retryable else 502, data=data)
+
+
+class ModelProtocolException(ProviderException):
+    """A received response failed validation; a bounded loop can request correction."""
+
+    def __init__(self, msg: str) -> None:
+        super().__init__(msg, retryable=True)
+        self.status_code = self.code = 502
 
 
 class WorkflowBlockedException(BusinessException):

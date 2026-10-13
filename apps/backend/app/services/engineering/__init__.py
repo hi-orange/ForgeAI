@@ -18,7 +18,6 @@ from app.services.engineering.handoff import (
     ENGINEERING_TASK_KEY,
     QUALITY_TASK_KEY,
     find_architecture_task,
-    find_claimed_engineering_task,
     find_pending_engineering_task,
     load_approved_app_spec,
     load_engineering_source,
@@ -26,7 +25,6 @@ from app.services.engineering.handoff import (
 )
 from app.services.engineering.run import (
     is_engineering_active,
-    mark_engineering_inactive,
     start_claimed_engineering,
 )
 
@@ -44,12 +42,10 @@ __all__ = [
     "claim_code_engineer_task",
     "complete_code_engineer_task",
     "find_architecture_task",
-    "find_claimed_engineering_task",
     "find_pending_engineering_task",
     "is_engineering_active",
     "load_approved_app_spec",
     "load_engineering_source",
-    "mark_engineering_inactive",
     "prepare_requirements_followup",
     "read_frozen_input_snapshot",
     "start_claimed_engineering",

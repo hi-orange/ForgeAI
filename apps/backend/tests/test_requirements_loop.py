@@ -14,7 +14,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
-from test_architect import valid_design
 from test_product_manager_workflow import (
     ProductManagerWorkflowFixture,
     approval_payload,
@@ -48,7 +47,6 @@ from app.schemas.requirements import (
     RequirementsApproval,
     RequirementsStatus,
 )
-from app.schemas.system_design import SystemDesign
 from app.services import leader, product_manager, task, task_execution
 from app.services.app_spec import approve_requirements
 from app.services.requirements import (
@@ -61,6 +59,89 @@ from app.services.requirements import (
 
 
 class RequirementsLoopTests(ProductManagerWorkflowFixture):
+    def test_retry_status_tracks_active_job_and_excludes_user_pause(self):
+        from app.models.workflow_job import WorkflowJob
+        from app.services.workflow_jobs import PAUSED_JOB_ERROR, enqueue_job
+
+        self.chat.side_effect = RuntimeError("provider offline")
+        with self.assertRaisesRegex(RuntimeError, "provider offline"):
+            self._run()
+        status = self._status()
+        self.assertEqual(status.state, "retry_available")
+        self.assertEqual(status.stage.value, "pm")
+        with self.session_factory() as db:
+            job = enqueue_job(
+                db,
+                job_type="product_manager",
+                idempotency_key="retry-status",
+                project_id=self.project.id,
+                build_run_id=self.run.run_id,
+                task_id=status.task_id,
+                payload={},
+            )
+            # A historical failure can share the same timestamp and sort later by UUID.
+            job_id = job.job_id
+            job.status = "retry_wait"
+            job.available_at = task_execution.utc_now() + timedelta(seconds=15)
+            db.add(
+                WorkflowJob(
+                    job_id="job_z_old",
+                    idempotency_key="old-status",
+                    job_type="product_manager",
+                    project_id=self.project.id,
+                    build_run_id=self.run.run_id,
+                    task_id=status.task_id,
+                    status="failed",
+                    payload={},
+                    created_at=job.created_at,
+                )
+            )
+            db.commit()
+            retry_at = job.available_at
+        status = self._status()
+        self.assertEqual(status.job_status, "retry_wait")
+        self.assertEqual(status.next_retry_at, retry_at)
+        with self.session_factory() as db:
+            job = db.get(WorkflowJob, job_id)
+            job.error = PAUSED_JOB_ERROR
+            db.commit()
+        self.assertIsNone(self._status().next_retry_at)
+
+    def test_approval_routing_usage_is_persisted_for_exact_run(self):
+        from app.models.agent_usage_event import AgentUsageEvent
+        from app.schemas.agent_action import ChatWithToolsResult, TokenUsage
+        from app.telemetry.agent import record_model_turn
+
+        result = self._run()
+        route = self.leader.side_effect
+
+        def measured_route(*args, **kwargs):
+            for _ in range(2):
+                record_model_turn(
+                    ChatWithToolsResult(model="fixture", usage=TokenUsage(total_tokens=120)), 5
+                )
+            return route(*args, **kwargs)
+
+        self.leader.side_effect = measured_route
+        with self.session_factory() as db:
+            approved_id = approve_requirements(
+                db,
+                self.owner,
+                self.project.id,
+                self.run.run_id,
+                result.configuration_item_id,
+                RequirementsApproval.model_validate(approval_payload()),
+            )
+            leader.dispatch_approved_requirements(
+                db, self.owner, self.project.id, self.run.run_id, approved_id
+            )
+        with self.session_factory() as db:
+            rows = list(db.scalars(select(AgentUsageEvent).where(AgentUsageEvent.role == "Leader")))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(sum(row.total_tokens for row in rows), 240)
+            self.assertTrue(all(row.build_run_id == self.run.run_id for row in rows))
+            self.assertTrue(all(row.project_id == self.project.id for row in rows))
+
     def _quality_challenge_status(self) -> RequirementsStatus:
         return RequirementsStatus(
             project_id=self.project.id,
@@ -110,7 +191,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             run_id=self.run.run_id,
             state="engineering_pending",
         )
-        run = SimpleNamespace(status="failed", stage="qa", active_slot=None, error="blocked")
+        run = SimpleNamespace(status="running", stage="qa", active_slot=1, error="blocked")
         inputs = SimpleNamespace(code_item=SimpleNamespace(upstream_item_ids=["ci_design"]))
         source = SimpleNamespace(app_spec_item=SimpleNamespace(item_id="ci_approved"))
         repair_task = SimpleNamespace(task_id="task_repair")
@@ -160,7 +241,7 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
             run_id=self.run.run_id,
             state="awaiting_approval",
         )
-        run = SimpleNamespace(status="failed", stage="qa", active_slot=None, error="blocked")
+        run = SimpleNamespace(status="running", stage="qa", active_slot=1, error="blocked")
         inputs = SimpleNamespace(code_item=SimpleNamespace(upstream_item_ids=["ci_design"]))
         source = SimpleNamespace(app_spec_item=SimpleNamespace(item_id="ci_approved"))
         plan = SimpleNamespace(cause_message_id=42)
@@ -884,6 +965,9 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         self.execute = f"{self.base}/build-runs/{self.run.run_id}/requirements"
 
     def test_http_questions_answer_replay_and_page_refresh(self):
+        from app.orchestration.leader import start_dispatched_delivery
+
+        self.start_delivery.side_effect = start_dispatched_delivery
         before = self.client.get(f"{self.base}/requirements")
         self.assertEqual(before.json()["data"]["state"], "not_started")
         self.chat.assert_not_called()
@@ -919,21 +1003,15 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         )
         self.assertEqual(replay_approval.status_code, 200, replay_approval.text)
         self.assertEqual(replay_approval.json(), approval.json())
-        with (
-            patch(
-                "app.orchestration.architect.generate_system_design",
-                return_value=SystemDesign.model_validate(valid_design()),
-            ),
-            patch(
-                "app.orchestration.leader.start_claimed_engineering",
-                return_value={"started": True},
-            ),
-        ):
-            started = self.client.post(
-                f"{self.base}/build-runs/{approval.json()['data']['run_id']}/engineering"
-            )
+        started = self.client.post(
+            f"{self.base}/build-runs/{approval.json()['data']['run_id']}/engineering"
+        )
         self.assertEqual(started.status_code, 200, started.text)
-        self.assertEqual(started.json()["data"]["state"], "engineering_running")
+        self.assertEqual(started.json()["data"]["state"], "engineering_pending")
+        self.assertIsNone(started.json()["data"]["execution_id"])
+        self._run_queued_engineering()
+        current = self.client.get(f"{self.base}/requirements").json()["data"]
+        self.assertEqual(current["state"], "engineering_running")
         self.assertEqual(self.chat.call_count, 2)
 
     def test_http_retries_dispatch_from_approved_requirements_without_another_model_call(self):
@@ -1025,6 +1103,9 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         self.chat.assert_not_called()
 
     def test_http_pause_engineering_then_continue(self):
+        from app.orchestration.leader import start_dispatched_delivery
+
+        self.start_delivery.side_effect = start_dispatched_delivery
         first = self.client.post(self.execute, json={"message_id": self.message.id})
         self.assertEqual(first.status_code, 200, first.text)
         item_id = first.json()["data"]["configuration_item_id"]
@@ -1035,29 +1116,35 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         self.assertEqual(approval.status_code, 200, approval.text)
         self.assertEqual(approval.json()["data"]["state"], "engineering_pending")
         run_id = approval.json()["data"]["run_id"]
-        with (
-            patch(
-                "app.orchestration.architect.generate_system_design",
-                return_value=SystemDesign.model_validate(valid_design()),
-            ),
-            patch(
-                "app.orchestration.leader.start_claimed_engineering",
-                return_value={"started": True},
-            ),
-        ):
-            started = self.client.post(f"{self.base}/build-runs/{run_id}/engineering")
+        started = self.client.post(f"{self.base}/build-runs/{run_id}/engineering")
         self.assertEqual(started.status_code, 200, started.text)
-        self.assertEqual(started.json()["data"]["state"], "engineering_running")
+        self.assertEqual(started.json()["data"]["state"], "engineering_pending")
+        self._run_queued_engineering()
         paused = self.client.post(f"{self.base}/build-runs/{run_id}/pause")
         self.assertEqual(paused.status_code, 200, paused.text)
         body = paused.json()["data"]
         self.assertEqual(body["state"], "retry_available")
         self.assertIn("暂停", body["error"] or "")
-        with patch(
-            "app.services.requirements.engineering.start_claimed_engineering",
-            return_value={"started": True, "execution_id": "exec_test"},
-        ) as start:
-            resumed = self.client.post(f"{self.base}/build-runs/{run_id}/engineering")
+        resumed = self.client.post(f"{self.base}/requirements/continue")
         self.assertEqual(resumed.status_code, 200, resumed.text)
-        self.assertEqual(resumed.json()["data"]["state"], "engineering_running")
-        start.assert_called_once()
+        self._run_queued_engineering()
+        current = self.client.get(f"{self.base}/requirements").json()["data"]
+        self.assertEqual(current["state"], "engineering_running")
+        self.assertNotEqual(current["execution_id"], body["execution_id"])
+
+    def _run_queued_engineering(self):
+        from app import worker
+        from app.services.workflow_jobs import claim_next_job
+
+        with self.session_factory() as db:
+            job = claim_next_job(db, "api-test-worker")
+            self.assertIsNotNone(job)
+            self.assertEqual(job.job_type, "engineering")
+        with (
+            patch.object(worker, "SessionLocal", self.session_factory),
+            patch(
+                "app.services.engineering.run._run_and_publish",
+                return_value={"outcome": "generated"},
+            ),
+        ):
+            worker.execute_job(job.job_id, "api-test-worker")

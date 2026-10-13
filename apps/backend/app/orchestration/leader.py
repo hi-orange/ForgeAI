@@ -13,7 +13,6 @@ from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.orchestration.architect import run_architecture_task
 from app.services import leader as leader_service
-from app.services.engineering import claim_code_engineer_task, start_claimed_engineering
 
 logger = logging.getLogger("forgeai")
 
@@ -25,32 +24,20 @@ def start_dispatched_delivery(
     run_id: str,
     task: Task,
 ) -> dict[str, Any]:
-    """Start the role selected by Leader without another browser command.
-
-    The approval request only persists the assignment. Long-running role work is
-    owned by the backend process so closing or refreshing the page cannot strand
-    the SOP between two roles.
-    """
-
-    if task.recipient == "Code Engineer":
-        code_task, execution = claim_code_engineer_task(db, user, project_id, run_id, task.task_id)
-        return start_claimed_engineering(
-            db,
-            user,
-            project_id,
-            run_id,
-            code_task,
-            execution,
-        )
-    if task.recipient != "Architect":
-        raise ValueError(f"Leader 分派了不支持自动启动的角色：{task.recipient}")
+    """Persist one role job; only its worker owns execution claiming."""
+    roles = {"Code Engineer": "engineering", "Architect": "architect"}
+    if task.recipient not in roles:
+        raise ValueError(f"Unsupported delivery role: {task.recipient}")
+    if task.status in {"succeeded", "failed", "cancelled"}:
+        return {"started": False, "task_id": task.task_id}
+    job_type = roles[task.recipient]
 
     from app.services.workflow_jobs import enqueue_job
 
     job = enqueue_job(
         db,
-        job_type="architect",
-        idempotency_key=f"architect:{task.task_id}",
+        job_type=job_type,
+        idempotency_key=f"{job_type}:{task.task_id}",
         project_id=project_id,
         build_run_id=run_id,
         task_id=task.task_id,
@@ -88,15 +75,5 @@ def run_architect_and_continue(
     delivery = leader_service.dispatch_completed_design(
         db, user, project_id, run_id, design_item.item_id
     )
-    code_task, code_execution = claim_code_engineer_task(
-        db, user, project_id, run_id, delivery.task_id
-    )
-    start_claimed_engineering(
-        db,
-        user,
-        project_id,
-        run_id,
-        code_task,
-        code_execution,
-    )
-    return code_task
+    start_dispatched_delivery(db, user, project_id, run_id, delivery)
+    return delivery

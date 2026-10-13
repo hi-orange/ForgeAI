@@ -75,6 +75,7 @@
             :running="timelineRunning"
             :failed="
               (status.state === 'retry_available' || status.state === 'quality_failed') &&
+              !automaticRecovery &&
               Boolean(status.error)
             "
             @open-file="openWorkspaceFile"
@@ -181,6 +182,7 @@
             {{ question }}
           </p>
         </div>
+        <QualityEvidence v-if="status?.test_results?.length" :results="status.test_results" />
         <section v-if="status?.state === 'quality_challenge'" class="challenge-card">
           <strong>验收测试与已批准需求存在冲突</strong>
           <p>Test Engineer 没有改写冻结测试。请选择按原验收继续修代码，或说明需求应怎样修改。</p>
@@ -223,18 +225,14 @@
           </div>
         </section>
         <section v-if="needsManualRepair" class="terminal-recovery" role="alert">
-          <strong>自动修复已停止，等待你选择下一步</strong>
-          <p>
-            系统不会继续调用模型。当前代码和进度已经保留，你可以让 AI
-            换个思路再修一轮，或结束本次构建。
-          </p>
-          <details v-if="status?.error" class="recovery-error">
-            <summary>查看最后一次错误</summary>
+          <strong>构建已暂停，等待你选择下一步</strong>
+          <p>系统不会继续调用模型。已保存的进度会保留，你可以重新分析并继续，或结束本次构建。</p>
+          <div v-if="status?.error" class="recovery-error">
             <p>{{ status.error }}</p>
-          </details>
+          </div>
           <div class="recovery-actions">
             <button class="primary" type="button" :disabled="busy" @click="retryRepair">
-              {{ busy ? '正在启动…' : '重新分析并修复' }}
+              {{ busy ? '正在启动…' : '重新分析并继续' }}
             </button>
             <button
               class="secondary danger"
@@ -326,6 +324,7 @@
         :plan-items="planItems"
         :can-approve="canApprove"
         :can-resume="canResume"
+        :automatic-recovery="automaticRecovery"
         :busy="busy"
         :refreshing="refreshing"
         @refresh="refresh"
@@ -400,6 +399,7 @@ import type { WorkspaceView } from './projectView'
 import { isNearThreadBottom, isWriteActivity } from './buildTimeline'
 import AppPreviewPane from './components/AppPreviewPane.vue'
 import BuildTimeline from './components/BuildTimeline.vue'
+import QualityEvidence from './components/QualityEvidence.vue'
 import ProjectTopbar, { type TopbarModeTab } from './components/ProjectTopbar.vue'
 import WorkspaceEditorPane from './components/WorkspaceEditorPane.vue'
 import { useRequirements } from './useRequirements'
@@ -412,6 +412,7 @@ const {
   messages,
   text,
   error,
+  automaticRecovery,
   busy,
   pausing,
   refreshing,
@@ -457,6 +458,7 @@ const featureCount = computed(
 )
 const showApprovedPlan = computed(
   () =>
+    ['architect', 'developer', 'qa', 'runtime'].includes(status.value?.stage ?? '') ||
     status.value?.state === 'ready_for_delivery' ||
     status.value?.state === 'design_pending' ||
     status.value?.state === 'design_running' ||
@@ -510,6 +512,7 @@ const labels = {
 }
 const postApproval = computed(
   () =>
+    ['architect', 'developer', 'qa', 'runtime'].includes(status.value?.stage ?? '') ||
     status.value?.state === 'ready_for_delivery' ||
     status.value?.state === 'design_pending' ||
     status.value?.state === 'design_running' ||
@@ -556,18 +559,20 @@ const llmRetryTitle = computed(() => {
   return '大模型暂时不可用'
 })
 const stateLabel = computed(() => {
+  if (automaticRecovery.value) return '正在自动恢复，进度会继续更新'
   if (understandingFirstTurn.value) return '正在理解…'
   if (busy.value) return '正在处理…'
   if (awaitingIdeaAfterReply.value) return '等待你的描述'
-  if (needsManualRepair.value) return '自动修复已停止，等待你的选择'
+  if (needsManualRepair.value) return '构建已暂停，等待你的选择'
   if (canRetryStart.value) return llmRetryTitle.value
   return status.value ? labels[status.value.state] : '正在加载项目…'
 })
 const agentText = computed(() => {
+  if (automaticRecovery.value) return status.value?.error || '后台已安排恢复，无需重复点击继续。'
   if (awaitingIdeaAfterReply.value) return ''
   if (understandingFirstTurn.value) return '我在理解你刚才说的话。'
   if (needsManualRepair.value)
-    return '连续修复没有解决检查错误，系统已经停止，不会继续调用模型。请选择重新分析修复或结束本次构建。'
+    return status.value?.error || '当前执行已停止。请选择重新分析并继续，或结束本次构建。'
   if (canRetryStart.value) {
     const message = error.value || ''
     if (message.includes('余额不足')) {
@@ -582,15 +587,12 @@ const agentText = computed(() => {
     return '构建还没有开始。恢复后可从原需求继续，不会重复创建任务。'
   }
   if (canApprove.value) return '我整理了一份初步计划。选择你想要的功能，随时补充自己的想法。'
+  if (status.value?.state === 'retry_available') {
+    return status.value.error || '构建已暂停，点击继续处理后会从已保存进度恢复。'
+  }
   if (postApproval.value) {
     if (status.value?.state === 'completed') {
       return '代码已经通过独立验收，当前版本可以使用。'
-    }
-    if (status.value?.state === 'retry_available' && status.value.code_ready) {
-      return (
-        status.value.error ||
-        '业务代码已写入，但独立验收还没有完成。可继续处理，不会丢掉已生成的代码。'
-      )
     }
     if (status.value?.state === 'quality_challenge') {
       return '冻结验收规则与已批准需求出现冲突，需要你选择继续修代码还是修订产品意图。'
@@ -627,9 +629,6 @@ const agentText = computed(() => {
       return '系统设计已完成，实现任务已进入队列，等待 Code Engineer 领取。'
     }
     return '计划已批准，正在开始构建应用。'
-  }
-  if (status.value?.state === 'retry_available') {
-    return status.value.error || '构建已暂停，点击继续处理后会从已保存进度恢复。'
   }
   if (busy.value || status.value?.state === 'running')
     return '我正在把你的想法整理成可选择的功能和页面。'

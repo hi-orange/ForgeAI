@@ -592,6 +592,78 @@ test('terminal engineering failure can be ended while preserving a stopped statu
   f.unmount()
 })
 
+test('automatic retry keeps polling and does not offer a competing manual resume', async () => {
+  const f = await fixture(
+    progress('retry_available', {
+      task_id: 'task-engineering',
+      execution_id: 'exec-retry',
+      job_status: 'retry_wait',
+      next_retry_at: '2026-10-13T14:30:00',
+      error: 'network unavailable',
+    }),
+  )
+  await f.mount()
+  assert.equal(f.view.automaticRecovery.value, true)
+  assert.equal(f.view.canResume.value, false)
+  assert.equal(f.timers.size, 1)
+  f.setState(
+    progress('retry_available', {
+      task_id: 'task-engineering',
+      execution_id: 'exec-retry',
+      job_status: 'failed',
+      retryable: false,
+      error: '没有新进展',
+    }),
+  )
+  await f.view.refresh()
+  assert.equal(f.view.automaticRecovery.value, false)
+  assert.equal(f.view.needsManualRepair.value, true)
+  assert.equal(f.timers.size, 0)
+  f.unmount()
+})
+
+test('auth bootstrap retains credentials on unavailable backend and clears only rejected sessions', async () => {
+  class ApiError extends Error {
+    constructor(code) {
+      super('request failed')
+      this.code = code
+    }
+  }
+  for (const code of [503, 500, 401]) {
+    const storage = new Map([['forgeai_access_token', 'saved-token']])
+    const localStorage = {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
+    }
+    const api = {
+      fetchMe: mock.fn(async () => {
+        throw new ApiError(code)
+      }),
+    }
+    const module = await loadModule(
+      '../src/stores/modules/auth.ts',
+      {
+        vue: { ref, computed },
+        pinia: { defineStore: (_id, setup) => setup },
+        '@/api/modules/auth': api,
+        '@/api/request': { ApiError },
+      },
+      { localStorage, sessionStorage: { ...localStorage, getItem: () => null } },
+    )
+    const store = module.useAuthStore()
+    await store.bootstrap()
+    assert.equal(store.token.value, code === 401 ? null : 'saved-token')
+    assert.equal(store.bootstrapped.value, code === 401)
+    if (code !== 401) {
+      api.fetchMe.mock.mockImplementation(async () => ({ id: 1 }))
+      await store.bootstrap()
+      assert.equal(store.user.value.id, 1)
+      assert.equal(store.bootstrapped.value, true)
+    }
+  }
+})
+
 test('polling clears a stale continue error after quality validation has started', async () => {
   const f = await fixture(
     progress('retry_available', {

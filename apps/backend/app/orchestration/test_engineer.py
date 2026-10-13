@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -10,15 +9,14 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.agents.test_engineer import verify_code
-from app.core.exceptions import BusinessException
+from app.core.exceptions import AppException, BusinessException
 from app.models.configuration_item import ConfigurationItem
 from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.schemas.test_report import TestReport
 from app.services import test_engineer as test_engineer_service
 from app.services.source_artifact import ensure_code_workspace
-from app.services.task_execution import fail_execution, renew_execution_lease
-from app.services.workflow_events import sync_checkpoint_activity_events
+from app.services.task_execution import fail_execution, renew_execution_lease, save_execution_draft
 from app.telemetry.agent import agent_telemetry_scope
 
 logger = logging.getLogger("forgeai")
@@ -33,8 +31,6 @@ def _record_quality_activity(
     detail: str,
     ok: bool = True,
 ) -> None:
-    from sqlalchemy.orm.attributes import flag_modified
-
     draft = dict(execution.draft or {})
     checkpoint = draft.get("checkpoint")
     if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "quality_checkpoint":
@@ -51,12 +47,7 @@ def _record_quality_activity(
     )
     checkpoint["activity"] = activity
     draft["checkpoint"] = checkpoint
-    # JSON columns need an explicit dirty flag or later activity rows never persist.
-    execution.draft = json.loads(json.dumps(draft, ensure_ascii=False))
-    flag_modified(execution, "draft")
-    sync_checkpoint_activity_events(db, execution)
-    db.commit()
-    db.refresh(execution)
+    save_execution_draft(db, execution, draft)
 
 
 def _saved_quality_progress(execution: TaskExecution) -> object:
@@ -74,19 +65,13 @@ def _save_quality_progress(
 ) -> None:
     """Persist resumable QA evidence and renew the execution fence atomically."""
 
-    from sqlalchemy.orm.attributes import flag_modified
-
     draft = dict(execution.draft or {})
     checkpoint = draft.get("checkpoint")
     if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "quality_checkpoint":
         checkpoint = {"kind": "quality_checkpoint", "activity": []}
     checkpoint["verification"] = progress
     draft["checkpoint"] = checkpoint
-    execution.draft = json.loads(json.dumps(draft, ensure_ascii=False))
-    flag_modified(execution, "draft")
-    db.flush()
-    renew_execution_lease(db, execution.task_id, execution.execution_id)
-    db.refresh(execution)
+    save_execution_draft(db, execution, draft)
 
 
 def run_test_engineer_task(
@@ -111,27 +96,27 @@ def run_test_engineer_task(
     )
     if on_execution_started is not None:
         on_execution_started(execution)
-    _record_quality_activity(
-        db,
-        execution,
-        name="quality_start",
-        label="开始独立验证",
-        detail="检查准确代码结果并逐条验证批准的验收条件",
-    )
-    with Session(bind=db.get_bind(), autoflush=False) as reader:
-        inputs = test_engineer_service.load_test_inputs(
-            reader,
-            project_id,
-            run_id,
-            task.input_configuration_item_ids[0],
-        )
-    workspace_root, _ = ensure_code_workspace(
-        db,
-        project_id=project_id,
-        run_id=run_id,
-        code_item_id=inputs.code_item.item_id,
-    )
     try:
+        _record_quality_activity(
+            db,
+            execution,
+            name="quality_start",
+            label="开始独立验证",
+            detail="检查准确代码结果并逐条验证批准的验收条件",
+        )
+        with Session(bind=db.get_bind(), autoflush=False) as reader:
+            inputs = test_engineer_service.load_test_inputs(
+                reader,
+                project_id,
+                run_id,
+                task.input_configuration_item_ids[0],
+            )
+        workspace_root, _ = ensure_code_workspace(
+            db,
+            project_id=project_id,
+            run_id=run_id,
+            code_item_id=inputs.code_item.item_id,
+        )
 
         def heartbeat() -> None:
             renew_execution_lease(db, task_id, execution.execution_id)
@@ -165,6 +150,7 @@ def run_test_engineer_task(
                 acceptance_test_plan=inputs.acceptance_test_plan,
                 workspace_root=workspace_root,
                 saved_progress=_saved_quality_progress(execution),
+                inherited_suite=inputs.inherited_suite,
                 heartbeat=heartbeat,
                 on_progress=save_progress,
             )
@@ -187,14 +173,18 @@ def run_test_engineer_task(
         )
     except Exception as exc:
         message = str(exc).strip() or "Test Engineer 执行失败，可重试恢复。"
-        _record_quality_activity(
-            db,
-            execution,
-            name="quality_error",
-            label="独立验证失败",
-            detail=message,
-            ok=False,
-        )
+        db.rollback()
+        try:
+            _record_quality_activity(
+                db,
+                execution,
+                name="quality_error",
+                label="独立验证失败",
+                detail=message,
+                ok=False,
+            )
+        except AppException:
+            db.rollback()
         fail_execution(
             db,
             task_id,
@@ -219,7 +209,7 @@ def route_completed_test_report(
     report = TestReport.model_validate(report_item.payload)
     if report.quality_conclusion.value == "failed":
         # Test Engineer remains read-only; Leader consumes the immutable report.
-        from app.services import engineering
+        from app.orchestration.leader import start_dispatched_delivery
         from app.services import leader as leader_service
 
         try:
@@ -233,21 +223,7 @@ def route_completed_test_report(
             if repair_task is None:
                 return
             if repair_task.recipient == "Code Engineer":
-                code_task, code_execution = engineering.claim_code_engineer_task(
-                    db,
-                    user,
-                    project_id,
-                    run_id,
-                    repair_task.task_id,
-                )
-                engineering.start_claimed_engineering(
-                    db,
-                    user,
-                    project_id,
-                    run_id,
-                    code_task,
-                    code_execution,
-                )
+                start_dispatched_delivery(db, user, project_id, run_id, repair_task)
             else:
                 raise BusinessException("质量失败只能派给 Code Engineer")
         except Exception:

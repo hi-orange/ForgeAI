@@ -46,6 +46,38 @@ docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-react-v1 .
 
 临时数据库只用于验证，检查结束后销毁；不能把“验证建表成功”理解为生产数据库已经部署。
 这些工程检查不会证明所有业务验收条款、权限流程或浏览器交互都已满足。
+
+## 独立 QA 运行器
+
+Test Engineer 的 `design_test_cases` 提交场景，`write_test_script` 生成受限 API/浏览器
+JSON 脚本，`run_acceptance_tests` 冻结整个套件并实际执行。它不读取 smoke 来生成逐项结论。
+`sandbox/acceptance.py` 与 `acceptance.mjs` 是镜像内的可信解释器，不执行模型提供的任意代码。
+API 支持站内请求、JSON 断言和响应变量；浏览器支持导航、输入、点击、选择、刷新、返回及
+文本/元素/路径断言。API 准备步骤在浏览器操作之前；每个浏览器用例使用独立会话。
+
+QA 容器禁用网络，不挂载宿主目录/socket，不传平台密钥。应用、迁移和前端构建使用 nobody；
+可信控制器使用 root，capabilities 限于 SETUID/SETGID/CHOWN/KILL，并保留 no-new-privileges
+和 CPU/内存/PID 限制。控制器在启动应用前创建仅自身可写的证据目录；源码不能伪造清单。
+应用数据在本次容器的临时 SQLite 中，执行结束删除容器。容器仍不是防内核漏洞的安全边界。
+
+QA 执行不联网安装依赖。当前要求依赖与所选镜像预装清单相符；否则明确 environment/blocked，
+需准备匹配依赖的检查镜像。本轮没有实现按项目自动构建离线依赖镜像。
+更新三个运行器文件后重新构建镜像（运行时版本 18）。
+每次执行记录 code/source/suite/runner/execution 身份和逐步观察。诊断副本位于
+`forgeai/qa/<source_hash>/<execution_id>/`，持久恢复以受租约保护的任务检查点为准。
+测试资产修订最多 32 版、有效执行最多 6 次、模型轮次最多 64，恢复不重置预算。
+
+真实闭环回归（不调用模型，不访问开发者数据库）：
+
+```sh
+FORGEAI_TEST_DOCKER=1 uv run --with pytest pytest tests/test_qa_execution.py -q
+```
+
+该测试在临时应用里检出跨账号泄漏，再改变业务源码并使用同一套件复测；同时执行完整检查和
+截图作为补充门禁。证据副本保存在 `output/qa-integration/`。未启用 Docker 时明确 skipped。
+
+## 在线预览与原有检查隔离
+
 工程检查容器仍是一次性冒烟，不负责在线预览。
 构建完成后，平台可在本机 `127.0.0.1` 启动 loopback 预览会话。生成源码通过标准输入复制到
 独立的无特权容器，在容器内安装依赖、迁移临时 SQLite、构建前端并启动后端；宿主只运行可信

@@ -21,6 +21,32 @@ ARCHITECTURE_TASK_KEY = "system_design"
 QUALITY_TASK_KEY = "quality_validation"
 
 
+def find_dispatched_task(
+    db: Session, project_id: int, run_id: str, input_item_id: str, recipient: TaskRecipient
+) -> Task | None:
+    """Read an existing role handoff, including after later plans advance the run."""
+    task_key, output_type = {
+        TaskRecipient.CODE_ENGINEER: (ENGINEERING_TASK_KEY, "code"),
+        TaskRecipient.TEST_ENGINEER: (QUALITY_TASK_KEY, "test_report"),
+    }[recipient]
+    candidates = db.scalars(
+        select(Task)
+        .join(Plan, Task.plan_id == Plan.plan_id)
+        .where(
+            Plan.project_id == project_id,
+            Plan.build_run_id == run_id,
+            Task.recipient == recipient.value,
+            Task.task_key == task_key,
+            Task.expected_output_type == output_type,
+        )
+        .order_by(Plan.version)
+    )
+    for task in candidates:
+        if input_item_id in task.input_configuration_item_ids:
+            return task
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class EngineeringSource:
     input_item: ConfigurationItem
@@ -283,48 +309,13 @@ def find_pending_engineering_task(
         if plan.status == "running" and _is_claimed_engineering_delivery_task(
             task, item_id, acceptance_test_plan_item_id
         ):
-            # Already claimed; create_engineering_delivery_task uses find_claimed separately.
+            # A claimed delivery is no longer a pending handoff.
             continue
         if plan.status == "pending":
             raise ConflictException("已有后续任务与本次工程交付不一致")
         if task.status not in (TaskStatus.CANCELLED.value, TaskStatus.FAILED.value):
             raise ConflictException("已有其他后续计划，不能重复派工")
     return engineering
-
-
-def find_claimed_engineering_task(
-    db: Session,
-    source_plan: Plan,
-    item_id: str,
-    acceptance_test_plan_item_id: str | None = None,
-    *,
-    lock: bool = False,
-) -> Task | None:
-    """Return the running engineering delivery for this approval, if already claimed."""
-    statement = (
-        select(Plan)
-        .where(
-            Plan.project_id == source_plan.project_id,
-            Plan.build_run_id == source_plan.build_run_id,
-            Plan.version > source_plan.version,
-            Plan.status == "running",
-            Plan.cause_message_id == source_plan.cause_message_id,
-        )
-        .order_by(Plan.version.asc())
-    )
-    if lock:
-        statement = statement.with_for_update().execution_options(populate_existing=True)
-    for plan in db.scalars(statement).all():
-        tasks_query = select(Task).where(Task.plan_id == plan.plan_id)
-        if lock:
-            tasks_query = tasks_query.with_for_update().execution_options(populate_existing=True)
-        tasks = list(db.scalars(tasks_query).all())
-        if len(tasks) != 1:
-            continue
-        task = tasks[0]
-        if _is_claimed_engineering_delivery_task(task, item_id, acceptance_test_plan_item_id):
-            return task
-    return None
 
 
 def prepare_requirements_followup(db: Session, source: Plan, item_id: str) -> int:

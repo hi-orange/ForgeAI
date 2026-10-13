@@ -7,7 +7,7 @@ from typing import Annotated, Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-ACCEPTANCE_TEST_PLAN_SCHEMA_VERSION: Final = 2
+ACCEPTANCE_TEST_PLAN_SCHEMA_VERSION: Final = 3
 
 TestText = Annotated[
     str,

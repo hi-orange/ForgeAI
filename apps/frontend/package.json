@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test:requirements": "node --experimental-vm-modules --test tests/requirements.test.mjs",
-    "dev": "vite",
+    "dev": "node ../../scripts/wait-for-backend.mjs && vite",
     "build": "run-p type-check \"build-only {@}\" --",
     "preview": "vite preview",
     "build-only": "vite build",

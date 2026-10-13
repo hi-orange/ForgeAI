@@ -9,7 +9,6 @@ from app.models.plan import Plan, PlanStatus
 from app.models.task import Task, TaskStatus
 from app.models.task_execution import TaskExecution
 from app.models.user import User
-from app.services.engineering import mark_engineering_inactive
 from app.services.task_execution import lock_run
 from app.services.workflow_jobs import cancel_jobs_for_run
 
@@ -73,13 +72,11 @@ def cancel_active_run(
         else []
     )
     now = datetime.now(UTC).replace(tzinfo=None)
-    execution_ids: list[str] = []
     for execution in executions:
         execution.status = "cancelled"
         execution.active_slot = None
         execution.finished_at = now
         execution.error = reason[:500]
-        execution_ids.append(execution.execution_id)
     for task in tasks:
         task.status = TaskStatus.CANCELLED.value
     for plan in plans:
@@ -90,6 +87,4 @@ def cancel_active_run(
     cancel_jobs_for_run(db, run_id)
     db.commit()
     db.refresh(run)
-    for execution_id in execution_ids:
-        mark_engineering_inactive(execution_id)
     return run

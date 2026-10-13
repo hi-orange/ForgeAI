@@ -378,10 +378,26 @@ def recover_orphaned_work(db: Session) -> int:
             TaskExecution.active_slot == 1,
             TaskExecution.expires_at <= now,
             BuildRun.paused_at.is_(None),
+            BuildRun.status == "running",
+            BuildRun.active_slot == 1,
         )
-        .with_for_update()
     ).all()
     for execution, task, plan, project in rows:
+        # Never lock a joined recovery scan: MySQL can lock Project rows before
+        # filtering expired executions, deadlocking a healthy checkpoint's FK insert.
+        execution = db.scalar(
+            select(TaskExecution)
+            .where(
+                TaskExecution.execution_id == execution.execution_id,
+                TaskExecution.status == "running",
+                TaskExecution.active_slot == 1,
+                TaskExecution.expires_at <= now,
+            )
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        if execution is None:
+            continue
         active = db.scalar(
             select(WorkflowJob.job_id).where(
                 WorkflowJob.task_id == task.task_id,
@@ -458,9 +474,20 @@ def recover_orphaned_work(db: Session) -> int:
             BuildRun.active_slot == 1,
             BuildRun.paused_at.is_(None),
         )
-        .with_for_update()
     ).all()
     for task, plan, project in pending_rows:
+        task = db.scalar(
+            select(Task)
+            .where(
+                Task.task_id == task.task_id,
+                Task.status == "pending",
+                Task.updated_at <= orphan_cutoff,
+            )
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        if task is None:
+            continue
         active = db.scalar(
             select(WorkflowJob.job_id).where(
                 WorkflowJob.task_id == task.task_id,

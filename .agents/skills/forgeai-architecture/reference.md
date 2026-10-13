@@ -4,9 +4,12 @@
 
 - `app_spec`: Product Manager; becomes delivery input only after explicit user approval.
 - `system_design`: Architect; derives from one exact approved `app_spec`.
-- `acceptance_test_plan`: platform-owned frozen test design for one exact engineering source.
+- `acceptance_test_plan`: platform-owned frozen approved standards/identities for exact engineering input.
+- QA suite: Test Engineer scenario/script draft, validated and versioned by the platform as JSON;
+  `suite_hash` identifies executable assets independently of the approved-standard `test_hash`.
 - `code`: Code Engineer; content-addressed source identity and provenance.
-- `test_report`: Test Engineer; immutable evidence for one exact `source_hash` and `test_hash`.
+- `test_report`: Test Engineer; immutable evidence for one exact `source_hash`, `test_hash` and
+  `suite_hash`, with runner-owned per-case observations and execution ids.
 
 ## Scheduling
 
@@ -23,6 +26,12 @@
 ## Compatibility
 
 - A repair may create a new `code` and `source_hash` while retaining the same approved `app_spec` and `test_hash`.
+- A repair inherits the QA suite from its predecessor report and must rerun it on the new source.
+  Endpoint/selector adaptation may produce a new suite version, but cannot delete scenarios,
+  operations, input data or assertions. Expected-result changes require a challenge.
+- Acceptance plan schema v3 names independent QA execution. Report schema v3 embeds the suite;
+  QA checkpoint v2 retains version history, execution records and spent budgets. v1/v2 artifacts
+  remain readable; only new runner-bound evidence can satisfy a new passing publication.
 - A product change creates a new approved `app_spec`, acceptance plan and `test_hash`; it does not mutate the old frozen plan.
 - A change after a terminal run creates a new BuildRun and explicit `RunRevision`; old artifacts and
   execution state remain immutable. Implementation repair may clone the source workspace but must

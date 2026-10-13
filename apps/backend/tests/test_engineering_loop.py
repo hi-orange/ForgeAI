@@ -9,7 +9,7 @@ from test_engineering_claim import EngineeringClaimTests
 from test_product_manager_workflow import valid_spec
 
 from app.agents.code_engineer import CODE_ENGINEER_PROFILE, CODE_ENGINEER_TOOLS, decide_next_action
-from app.core.exceptions import BusinessException
+from app.core.exceptions import BusinessException, ProviderException
 from app.generation.delivery import planning_item
 from app.generation.engineering.checkpoint import (
     EXECUTION_MODE,
@@ -34,6 +34,72 @@ def turn(name, **arguments):
 
 
 class EngineeringLoopTests(EngineeringClaimTests):
+    def test_read_batches_gather_new_context_without_stopping_before_planning(self):
+        self._start()
+        for index in range(18):
+            (self.root / f"context_{index}.txt").write_text(f"evidence {index}", encoding="utf-8")
+        reads = []
+
+        def decide(*, observations, **kwargs):
+            reads[:] = [o for o in observations if o.name == "read_file"]
+            if len(reads) < 18:
+                start = len(reads)
+                return ChatWithToolsResult(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"read_{i}", name="read_file", arguments={"path": f"context_{i}.txt"}
+                        )
+                        for i in range(start, min(start + 9, 18))
+                    ]
+                )
+            return self._implement(observations=observations, **kwargs)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(self._checkpoint()["model_turns"], 9)
+        self.assertEqual(len(self._checkpoint()["context_fingerprints"]), 18)
+
+    def test_repeated_identical_read_is_still_bounded(self):
+        self._start()
+        (self.root / "repeat.txt").write_text("same", encoding="utf-8")
+        self.model.side_effect = None
+        self.model.return_value = turn("read_file", path="repeat.txt")
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertEqual(self._checkpoint()["model_turns"], 13)
+        self.assertEqual(self._checkpoint()["no_progress_steps"], 12)
+
+    def test_provider_failure_preserves_progress_and_retry_disposition(self):
+        self._start()
+        self.model.side_effect = ProviderException("provider offline", retryable=True)
+        with self.assertRaises(ProviderException) as failure:
+            self._run()
+        self.assertTrue(failure.exception.retryable)
+        self.assertEqual(self._checkpoint()["outcome"], "running")
+        self.assertEqual(self._checkpoint()["model_turns"], 1)
+        self.model.side_effect = self._implement
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertGreater(self._checkpoint()["model_turns"], 1)
+
+    def test_agent_rejects_multi_mutation_batch_instead_of_silently_dropping_calls(self):
+        spec = AppSpec.model_validate(valid_spec())
+        batch = ChatWithToolsResult(
+            tool_calls=[
+                ToolCall(
+                    id=str(i), name="write_file", arguments={"path": f"{i}.py", "content": "x"}
+                )
+                for i in range(2)
+            ]
+        )
+        with patch("app.agents.code_engineer.chat_with_tools", return_value=batch):
+            with self.assertRaisesRegex(BusinessException, "单独调用"):
+                decide_next_action(
+                    spec=spec,
+                    work_item=planning_item(spec),
+                    engineering_context={},
+                    observations=[],
+                    system_design=None,
+                )
+
     def setUp(self):
         super().setUp()
         self.enterContext(

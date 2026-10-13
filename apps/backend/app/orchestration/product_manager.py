@@ -161,14 +161,18 @@ class _ProductManagerWorkflow:
                 self._on_execution_started(execution)
             return {"execution_id": execution.execution_id, "saved_draft": execution.draft}
 
-    def _fail_execution(self, state: WorkflowState) -> None:
+    def _fail_execution(self, state: WorkflowState, error: Exception | None = None) -> None:
         try:
             with self._session_factory() as db:
                 task_execution.fail_execution(
                     db,
                     state["task_id"],
                     state["execution_id"],
-                    error="需求整理未完成，可重试恢复；已保存的需求版本不受影响。",
+                    error=(
+                        str(error)[:500]
+                        if error
+                        else "需求整理未完成，可重试恢复；已保存的需求版本不受影响。"
+                    ),
                 )
         except Exception:
             logger.error("Could not mark execution failed: %s", state["execution_id"])
@@ -180,7 +184,10 @@ class _ProductManagerWorkflow:
         try:
             with self._session_factory() as db:
                 saved_draft = state.get("saved_draft")
-                if saved_draft is not None:
+                if (
+                    saved_draft is not None
+                    and saved_draft.get("kind") != "product_manager_checkpoint"
+                ):
                     draft = dict(saved_draft)
                     if draft.get("schema_version") == 1:
                         draft["schema_version"] = 2
@@ -203,10 +210,9 @@ class _ProductManagerWorkflow:
                     db, state["task_id"], state["execution_id"], lock=True
                 )
                 assert execution is not None
-                execution.draft = result.model_dump(mode="json")
-                db.commit()
-        except Exception:
-            self._fail_execution(state)
+                task_execution.save_execution_draft(db, execution, result.model_dump(mode="json"))
+        except Exception as exc:
+            self._fail_execution(state, exc)
             raise
         return {"product_manager_result": result.model_dump(mode="json")}
 

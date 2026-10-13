@@ -12,7 +12,8 @@ turned into an isolated, traceable and recoverable generated application.
 3. Every execution uses frozen inputs. Later messages and newer artifacts never replace inputs of an
    in-flight task.
 4. Artifact ownership is enforced. Product Manager owns `app_spec`, Architect owns `system_design`,
-   Code Engineer owns generated source, and Test Engineer owns frozen acceptance evidence.
+   Code Engineer owns generated source, and Test Engineer owns independent QA scenario/script drafts
+   and evidence. The platform validates and freezes every test version and execution snapshot.
 5. Generated source is isolated from ForgeAI platform source. Writes are optimistic-concurrency
    protected, revisions are recoverable, and quality checks run against an exact source identity.
 6. `forgeai.smoke.json` is the mandatory engineering integration gate. A frozen acceptance plan is
@@ -93,9 +94,38 @@ Role names denote ownership and decision boundaries, not four interchangeable ch
   mandatory model-generated file plan and no nested whole-file writer model. The platform stages
   mutations, fences commits by active execution and original bytes, retains recoverable revisions,
   bounds cost/no-progress, and verifies completion requests. The final source still needs independent QA.
-- Test Engineer judges one exact source/test identity against frozen acceptance. It separates code
-  defects, unavailable infrastructure, missing evidence and contract challenges. It cannot edit
-  application source or redefine acceptance to make a run pass.
+- Test Engineer designs scenarios from approved acceptance, adapts bounded API/browser scripts to
+  observed interfaces, executes them and judges the exact source/test snapshot. It separates product
+  defects, script errors, unavailable infrastructure, missing evidence and contract challenges.
+  Application source is read-only. QA cannot redefine acceptance to make a run pass.
+
+### Independent QA lifecycle
+
+The platform-owned `acceptance_test_plan` freezes approved standards and stable identities before
+engineering; its `test_hash` is distinct from the versioned QA asset `suite_hash`. QA submits scenarios
+with purpose, prerequisites, data, steps, expected observations, category, environment and exact
+approved acceptance text. The platform checks criterion/feature coverage and preserves earlier
+scenarios. Execution adapters use a bounded JSON test language, not arbitrary Python/JavaScript or
+shell. API assertions and browser interactions run in a disposable off-network application with
+isolated SQLite data. The application runs under a different OS user from the trusted controller and
+cannot write its evidence. Required dependencies must already exist in the selected check image;
+an unavailable dependency is an environment block, never a product pass.
+
+Each execution binds `code_item_id`, `source_hash`, `suite_hash`, runner version and a unique execution
+id. Operation/expectation/observation records produce case statuses; neither model-authored requirement
+conclusions, smoke nor screenshots can create case passes. Every required case must pass the current
+snapshot, the supplemental smoke/visual gates must pass, and no recorded defect may remain before
+delivery. The publication service revalidates persisted platform observations under the execution
+lease, independently of model report submission.
+
+QA assets and execution history are versioned JSON in the existing fenced task checkpoint, and the
+final report embeds its frozen suite for durable repair handoff. Local execution files are diagnostic
+copies, not the recovery authority. Adapter revisions preserve scenarios, input/action order and
+assertions; changing expected behavior or assertions enters explicit challenge resolution. Product
+repair inherits the original suite and reruns all scenarios against the new source; old observations
+cannot be restored into the new identity. Recovery preserves tool, revision and execution budgets.
+Legacy plans/reports remain readable. New report publication cannot use legacy implicit synthesis
+to satisfy independent evidence requirements.
 
 The current engineering strategy is `evidence_tool_loop_v1`. Its checkpoint migration preserves
 completed work, source revisions, measured counters and terminal stop-loss state. Legacy file plans
@@ -159,6 +189,17 @@ gates.
   old pending tasks, and queued deployments that have no active job. A grace period prevents recovery
   from racing the request that originally created a decision or task. Conditional claims and active
   execution slots prevent duplicate workers from publishing the same result.
+- Recovery scans identify candidates without locking joined project rows; claims lock only the
+  eligible execution or task and skip busy rows. Healthy checkpoints must not contend with an
+  unrelated recovery scan for their project foreign key.
+- PM and Architect tool checkpoints retain frozen input, completed exchanges, draft state and spent
+  model turns. Invalid tool responses receive bounded correction feedback; provider retries retain
+  progress and do not reset budgets. Read-only tool batches execute within role and call limits;
+  state changes remain sequential. New context and valid plan changes count as engineering progress,
+  while repeated identical observations remain subject to the no-progress limit.
+- An open BuildRun can await explicit recovery. User-facing status exposes the current job and retry
+  schedule so queued recovery keeps polling while a stopped execution shows its cause and controls.
+  Received model usage is metered before tool parsing, including malformed responses and Leader routing.
 
 ## Evaluation and release evidence
 

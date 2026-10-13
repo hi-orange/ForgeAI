@@ -12,7 +12,8 @@ from test_architect import valid_spec
 
 from app.schemas.agent_action import ToolCall, ToolExecutionResult
 from app.services.acceptance_testing import build_acceptance_test_plan
-from app.tools.test_engineer import TestEngineerToolState, execute_test_engineer_tool
+from app.services.qa_verification import QAVerificationState
+from app.tools.test_engineer import execute_test_engineer_tool
 
 
 class AcceptanceTestingTests(unittest.TestCase):
@@ -62,7 +63,7 @@ class AcceptanceTestingTests(unittest.TestCase):
         )
         self.assertTrue(all(test.target_path and test.command for test in plan.tests))
         self.assertTrue(all(test.target_path.startswith("platform://") for test in plan.tests))
-        self.assertTrue(all("run_check" in test.command for test in plan.tests))
+        self.assertTrue(all("run_acceptance_tests" in test.command for test in plan.tests))
         self.assertEqual(plan.protected_paths, [])
 
     def test_code_engineer_cannot_write_frozen_test_assets(self):
@@ -92,7 +93,7 @@ class AcceptanceTestingTests(unittest.TestCase):
         source_hash = "a" * 64
         test_hash = "b" * 64
         with TemporaryDirectory(prefix="forgeai-test-evidence-") as directory:
-            state = TestEngineerToolState(
+            state = QAVerificationState(
                 app_spec=spec,
                 code_item_id="ci_code",
                 code_source_hash=source_hash,
@@ -158,13 +159,7 @@ class AcceptanceTestingTests(unittest.TestCase):
                 state,
             )
 
-        assert report is not None
-        self.assertEqual((report.test_plan_item_id, report.test_hash), ("ci_tests", test_hash))
-        self.assertEqual(
-            {item.test_id for item in report.test_results},
-            {item.test_id for item in plan.tests},
-        )
-        self.assertEqual(set(report.regression_test_ids), {item.test_id for item in plan.tests})
+        self.assertIsNone(report, "需求结论和 smoke 不能合成逐项通过")
 
 
 if __name__ == "__main__":

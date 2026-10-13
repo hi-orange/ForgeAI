@@ -53,6 +53,8 @@ def generate_system_design(
     spec: AppSpec,
     workspace_root: Path,
     on_activity: Callable[[ToolExecutionResult], None] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> SystemDesign:
     """Use bounded editor/terminal tools; persistence remains the caller's responsibility."""
 
@@ -61,6 +63,13 @@ def generate_system_design(
     if not root.is_dir():
         raise BusinessException("Architect 工作区不存在")
     state = ArchitectToolState(app_spec=spec, workspace_root=root)
+    saved = (checkpoint or {}).get("state", {})
+    if saved.get("draft"):
+        state.draft = SystemDesign.model_validate(saved["draft"])
+    state.inspection_keys = set(saved.get("inspection_keys", []))
+    state.inspection_count = len(state.inspection_keys)
+    if checkpoint and checkpoint.get("output"):
+        return SystemDesign.model_validate(checkpoint["output"])
     return run_bounded_tool_loop(
         messages=_initial_messages(spec),
         tools=ALLOWED_ARCHITECT_TOOLS,
@@ -74,4 +83,11 @@ def generate_system_design(
         execute_tool=lambda call: execute_architect_tool(call, state),
         model_call=chat_with_tools,
         on_observation=on_activity,
+        checkpoint=checkpoint,
+        on_checkpoint=on_checkpoint,
+        export_state=lambda: {
+            "draft": state.draft.model_dump(mode="json") if state.draft else None,
+            "inspection_keys": sorted(state.inspection_keys),
+        },
+        batch_read_tools={"read_artifact", "editor_read", "terminal_list", "terminal_run"},
     )

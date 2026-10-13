@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.generation import (
     DEFAULT_TEMPLATE_VERSION,
@@ -17,9 +18,69 @@ from app.generation import (
     get_template_root,
     load_template_metadata,
 )
+from app.generation.workspace import prepare_engineering_workspace, publish_workspace_directory
 
 
 class CreateWorkspaceTests(unittest.TestCase):
+    def test_workspace_publication_retries_windows_contention_then_renames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, dest = Path(tmp) / "staging", Path(tmp) / "published"
+            source.mkdir()
+            (source / "content").write_text("preserve me", encoding="utf-8")
+            failure = PermissionError("held handle")
+            failure.winerror = 5
+            original = Path.rename
+            attempts = iter([failure, None])
+
+            def rename(path, target):
+                error = next(attempts)
+                if error is not None:
+                    raise error
+                return original(path, target)
+
+            with (
+                patch.object(Path, "rename", autospec=True, side_effect=rename),
+                patch("app.generation.workspace.time.sleep") as sleep,
+            ):
+                publish_workspace_directory(source, dest)
+            sleep.assert_called_once_with(0.05)
+            self.assertEqual((dest / "content").read_text(encoding="utf-8"), "preserve me")
+            self.assertFalse(source.exists())
+
+    def test_workspace_publication_never_overwrites_or_hides_persistent_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, dest = Path(tmp) / "staging", Path(tmp) / "published"
+            source.mkdir()
+            failure = PermissionError("denied")
+            failure.winerror = 5
+            for exists, attempts in ((False, 5), (True, 1)):
+                if exists:
+                    dest.mkdir()
+                with (
+                    patch.object(Path, "rename", side_effect=failure) as rename,
+                    patch("app.generation.workspace.time.sleep"),
+                    self.assertRaises(PermissionError) as raised,
+                ):
+                    publish_workspace_directory(source, dest)
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(rename.call_count, attempts)
+                self.assertTrue(source.exists())
+
+    def test_prepare_preserves_filesystem_error_when_no_concurrent_destination_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            denied = PermissionError("directory is held by another process")
+            with patch.object(Path, "rename", side_effect=denied):
+                with self.assertRaises(PermissionError) as raised:
+                    prepare_engineering_workspace(
+                        1,
+                        "run_test",
+                        task_id="task_test",
+                        approved_item_id="ci_test",
+                        runtime_data_root=tmp,
+                    )
+            self.assertIs(raised.exception, denied)
+            self.assertFalse(default_workspace_path(tmp, 1, "run_test").exists())
+
     def test_template_metadata_and_root(self) -> None:
         self.assertEqual(DEFAULT_TEMPLATE_VERSION, FULLSTACK_REACT_V1)
         meta = load_template_metadata()

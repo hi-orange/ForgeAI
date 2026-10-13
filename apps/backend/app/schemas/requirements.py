@@ -3,9 +3,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.models.build_run import BuildRunStage
 from app.schemas.app_spec import AppSpec, RequirementId, RequirementText
 from app.schemas.product_manager_workflow import ProductManagerWorkflowResult, WorkflowId
-from app.schemas.test_report import TestChallenge
+from app.schemas.test_report import TestChallenge, TestVerification
 
 
 class RequirementsExecute(BaseModel):
@@ -90,6 +91,9 @@ class EngineeringActivity(BaseModel):
 
 class RequirementsStatus(BaseModel):
     project_id: int
+    stage: BuildRunStage | None = None
+    job_status: str | None = None
+    next_retry_at: datetime | None = None
     run_id: str | None = None
     plan_id: str | None = None
     task_id: str | None = None
@@ -132,5 +136,7 @@ class RequirementsStatus(BaseModel):
     code_item_id: str | None = None
     test_report_item_id: str | None = None
     test_challenges: list[TestChallenge] = Field(default_factory=list)
+    test_results: list[TestVerification] = Field(default_factory=list)
+    test_suite_hash: str | None = None
     workspace_path: str | None = None
     activities: list[EngineeringActivity] = Field(default_factory=list)

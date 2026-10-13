@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -13,7 +14,12 @@ from app.agents.code_engineer import (
     CODE_ENGINEER_TOOLS,
     decide_next_action,
 )
-from app.core.exceptions import BusinessException, ConflictException
+from app.core.exceptions import (
+    BusinessException,
+    ConflictException,
+    ModelProtocolException,
+    ProviderException,
+)
 from app.core.settings import settings
 from app.generation.delivery import (
     PlannedWorkItem,
@@ -95,18 +101,13 @@ def _workspace_root(project_id: int, run_id: str) -> Path:
 
 
 def _save_snapshot(db: Session, execution_id: str, snapshot: dict[str, Any]) -> None:
-    from sqlalchemy.orm.attributes import flag_modified
-
     from app.models.task_execution import TaskExecution
+    from app.services.task_execution import save_execution_draft
 
     execution = db.get(TaskExecution, execution_id)
-    if execution is None or execution.status != "running" or execution.active_slot != 1:
-        raise ConflictException("执行编号已失效或任务正在由其他执行处理")
-    if execution.expires_at <= utc_now():
-        raise ConflictException("工程执行租约已过期，请显式恢复")
-    execution.draft = json.loads(json.dumps(snapshot))
-    flag_modified(execution, "draft")
-    db.commit()
+    if execution is None:
+        raise ConflictException("执行编号已失效")
+    save_execution_draft(db, execution, snapshot)
 
 
 def _locked_current(
@@ -337,9 +338,32 @@ class _EngineeringNodes:
                     for row in checkpoint.get("observations", [])
                 ],
             )
+        except ModelProtocolException as exc:
+            call = ToolCall(
+                id=f"protocol_{checkpoint.get('model_turns', 0)}", name="model_response"
+            )
+            return self._record_action(state, call, PreparedAction(rejected_tool(call, exc)), root)
+        except ProviderException:
+            # The durable worker owns provider backoff and retryability. Preserve
+            # this checkpoint instead of converting a network failure into a product block.
+            raise
         except BusinessException as exc:
             return self._persist_failure(state, str(exc))
-        call = decision.tool_calls[0]
+        for call in decision.tool_calls:
+            update = self._execute_call(state, snapshot, checkpoint, work_item, root, call)
+            if update.get("outcome") != "running":
+                return update
+        return update
+
+    def _execute_call(
+        self,
+        state: _WorkflowState,
+        snapshot: dict[str, Any],
+        checkpoint: dict[str, Any],
+        work_item: WorkItem,
+        root: Path,
+        call: ToolCall,
+    ) -> _WorkflowUpdate:
         try:
             call = validate_tool_call(call)
         except ValueError as exc:
@@ -405,6 +429,7 @@ class _EngineeringNodes:
         with self._session_factory() as db:
             execution, snapshot, current = _locked_current(db, state)
             result = commit_action(action, root, revision_id=execution.execution_id)
+            progressed = False
             if call.name == "update_delivery_plan" and result.ok:
                 try:
                     if snapshot.get("quality_report") is not None:
@@ -428,6 +453,7 @@ class _EngineeringNodes:
                     if revised == current["work_items"] and not current.get("needs_delivery_plan"):
                         raise ConflictException("计划没有变化，请执行已就绪任务")
                     current["work_items"] = revised
+                    progressed = True
                     current["delivery_plan_version"] = 1
                     current["needs_delivery_plan"] = False
                     next_item = current_item(revised)
@@ -454,6 +480,18 @@ class _EngineeringNodes:
             history.append(result.model_dump(mode="json"))
             current["observations"] = history[-24:]
             hashes = dict(current.get("observed_hashes") or {})
+            if result.ok and call.name in {"read_file", "list_files", "search_code"}:
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        [call.name, call.arguments, result.data],
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+                seen = list(current.get("context_fingerprints") or [])
+                progressed = fingerprint not in seen
+                if progressed:
+                    current["context_fingerprints"] = [*seen, fingerprint]
             if result.ok and call.name == "read_file":
                 path = result.data.get("path")
                 digest = result.data.get("content_hash")
@@ -471,6 +509,7 @@ class _EngineeringNodes:
             current["observed_hashes"] = hashes
             if changed:
                 current["revision_id"] = execution.execution_id
+            if changed or progressed:
                 current["no_progress_steps"] = 0
             else:
                 current["no_progress_steps"] = int(current.get("no_progress_steps") or 0) + 1
@@ -482,7 +521,7 @@ class _EngineeringNodes:
             elif current["no_progress_steps"] >= 12:
                 block_checkpoint(
                     current,
-                    "连续 12 个工具动作没有源码进展，停止本次执行",
+                    "连续 12 个工具动作没有新证据、计划或源码进展，停止本次执行",
                     reason_code="NO_SOURCE_PROGRESS",
                 )
             snapshot["checkpoint"] = current

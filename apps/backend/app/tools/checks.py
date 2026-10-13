@@ -18,12 +18,13 @@ from uuid import uuid4
 
 from app.core.exceptions import BusinessException
 from app.core.settings import settings
+from app.runtime.docker import get_docker_sandbox_runtime
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.paths import MAX_FILE_BYTES, SKIP_DIRS, is_text_file, safe_path_under_root
 
 CHECK_IDS = {"quick", "database", "backend", "frontend", "all", "security"}
 CHECK_RUNTIME_LABEL = "org.forgeai.check-runtime-version"
-CHECK_RUNTIME_VERSION = "17"
+CHECK_RUNTIME_VERSION = "18"
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 MAX_BINARY_ASSETS_BYTES = 32 * 1024 * 1024
@@ -59,76 +60,18 @@ def check_environment(*, tool_call_id: str = "check_environment") -> ToolExecuti
         ok=False,
         summary="",
     )
-    binary = shutil.which("docker")
-    if binary is None:
-        return result.model_copy(
-            update={
-                "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
-                "summary": "隔离检查环境未就绪：未找到 Docker，请安装并启动 Docker。",
-            }
-        )
-    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
-        daemon = subprocess.run(
-            [binary, "info", "--format", "{{.ServerVersion}}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            creationflags=flags,
-            check=False,
+        get_docker_sandbox_runtime().require_image(
+            settings.engineering_check_image,
+            label=CHECK_RUNTIME_LABEL,
+            version=CHECK_RUNTIME_VERSION,
+            purpose="隔离检查",
         )
-        if daemon.returncode != 0:
-            detail = (daemon.stderr or daemon.stdout).strip()
-            return result.model_copy(
-                update={
-                    "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
-                    "summary": (
-                        "隔离检查环境未就绪：Docker daemon 不可用，请启动 Docker 后继续。"
-                        + (f" {detail[:240]}" if detail else "")
-                    ),
-                }
-            )
-        image = subprocess.run(
-            [
-                binary,
-                "image",
-                "inspect",
-                "--format",
-                f'{{{{ index .Config.Labels "{CHECK_RUNTIME_LABEL}" }}}}',
-                settings.engineering_check_image,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            creationflags=flags,
-            check=False,
-        )
-        if image.returncode != 0:
-            return result.model_copy(
-                update={
-                    "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
-                    "summary": (
-                        "隔离检查镜像不存在：请先构建 sandbox/Dockerfile，镜像名为 "
-                        f"{settings.engineering_check_image}。"
-                    ),
-                }
-            )
-        runtime_version = image.stdout.strip()
-        if runtime_version != CHECK_RUNTIME_VERSION:
-            return result.model_copy(
-                update={
-                    "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
-                    "summary": (
-                        "隔离检查镜像版本过旧：请重新构建 sandbox/Dockerfile，镜像名为 "
-                        f"{settings.engineering_check_image}。"
-                    ),
-                }
-            )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except BusinessException as exc:
         return result.model_copy(
             update={
                 "error_code": "CHECK_ENVIRONMENT_UNAVAILABLE",
-                "summary": f"隔离检查环境探测失败：{str(exc)[:240]}",
+                "summary": str(exc),
             }
         )
     return result.model_copy(
@@ -137,8 +80,7 @@ def check_environment(*, tool_call_id: str = "check_environment") -> ToolExecuti
             "summary": "隔离检查环境已就绪",
             "data": {
                 "image": settings.engineering_check_image,
-                "runtime_version": runtime_version,
-                "server_version": daemon.stdout.strip(),
+                "runtime_version": CHECK_RUNTIME_VERSION,
             },
         }
     )
@@ -189,45 +131,37 @@ def source_snapshot(root: Path) -> tuple[bytes, str]:
 
 
 def docker_command(binary: str, image: str, name: str, check_id: str) -> list[str]:
-    # Egress is required when generated package.json / pyproject.toml diverges from
-    # the template baseline so the check controller can install the declared deps.
-    # Source is still stdin-only; no host mounts or Docker socket.
+    """Build one fixed isolation policy, without post-hoc removal of safety flags."""
+    retained = check_id in {"visual", "qa"}
     return [
         binary,
         "run",
-        "--rm",
+        *([] if retained else ["--rm"]),
         "--pull=never",
         "--name",
         name,
-        "--read-only",
-        "--cap-drop=ALL",
-        "--security-opt=no-new-privileges",
-        "--user=65534:65534",
-        "--cpus=2",
-        "--memory=1536m",
-        "--memory-swap=1536m",
-        "--pids-limit=256",
-        "--log-driver=none",
-        "--init",
-        "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=768m,mode=1777",
+        *get_docker_sandbox_runtime().isolation_args(
+            cpus=2,
+            memory_mb=1536,
+            pids_limit=256,
+            tmpfs="rw,exec,nosuid,nodev,size=768m,mode=1777",
+            writable_layer=retained,
+            qa_controller=check_id == "qa",
+        ),
         "-i",
         "--entrypoint=python",
         image,
         "-I",
-        "/opt/forgeai/check.py",
-        check_id,
+        *(
+            ["/opt/forgeai/acceptance.py"]
+            if check_id == "qa"
+            else ["/opt/forgeai/check.py", check_id]
+        ),
     ]
 
 
 def visual_docker_command(binary: str, image: str, name: str, route: str) -> list[str]:
-    """Persist evidence until it can be copied from the stopped disposable container."""
-
-    command = docker_command(binary, image, name, "visual")
-    command.remove("--rm")
-    command.remove("--read-only")
-    command.remove("--tmpfs=/tmp:rw,exec,nosuid,nodev,size=768m,mode=1777")
-    command.append(route)
-    return command
+    return [*docker_command(binary, image, name, "visual"), route]
 
 
 def _execute(command: list[str], payload: bytes, timeout: int) -> tuple[int, str, bool]:

@@ -20,4 +20,8 @@ description: Applies ForgeAI artifact ownership, approval, frozen-input, quality
 - Do not use clarification as approval.
 - Do not modify frozen acceptance assets from Code Engineer paths.
 - Do not let smoke evidence substitute for independent acceptance evidence.
+- Preserve the distinction between approved-standard `test_hash`, QA asset `suite_hash` and each
+  source-bound execution id. QA adapter revisions never overwrite snapshots or weaken assertions.
+- Keep generated application processes unable to write trusted QA evidence; external effects are
+  disabled during independent acceptance. Check publication against persisted runner facts.
 - Do not add product behavior in architecture, engineering, or testing prompts.

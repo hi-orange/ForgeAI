@@ -117,5 +117,15 @@ def decide_next_action(
     for call in result.tool_calls:
         if call.name not in allowed:
             raise BusinessException(f"Code Engineer 无权使用工具：{call.name}")
-    # No speculative parallel writes: the next decision must consume the first result.
-    return result.model_copy(update={"tool_calls": result.tool_calls[:1]})
+    # Reads can share a model turn. Mutations must consume the previous result.
+    if len(result.tool_calls) > 1 and (
+        len(result.tool_calls) > 16
+        or any(
+            call.name not in {"list_files", "read_file", "search_code"}
+            for call in result.tool_calls
+        )
+    ):
+        from app.core.exceptions import ModelProtocolException
+
+        raise ModelProtocolException("每轮最多批量调用 16 个只读工具；写入或状态变更请单独调用")
+    return result

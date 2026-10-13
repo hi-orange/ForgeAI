@@ -23,41 +23,14 @@ if TYPE_CHECKING:
 
 
 def _test_layer(text: str) -> tuple[TestLayer, str, str, str]:
-    """Map intent to evidence the platform can really collect.
-
-    Earlier plans named pytest/vitest/playwright files that were never materialized.
-    Those fictional paths made every QA run fail before it could judge the app.
-    The frozen plan now points at platform-owned runtime and browser evidence
-    channels that Test Engineer can actually invoke.
-    """
+    """Classify logical intent; independent QA supplies execution adapters."""
     normalized = text.lower()
-    if any(token in normalized for token in ("接口", "api", "http", "请求", "响应")):
-        return (
-            TestLayer.API,
-            "forgeai-runtime",
-            "platform://fullstack/runtime",
-            'run_check(check_id="all")',
-        )
-    if any(token in normalized for token in ("计算", "规则", "权限", "校验", "状态")):
-        return (
-            TestLayer.BACKEND,
-            "forgeai-runtime",
-            "platform://fullstack/runtime",
-            'run_check(check_id="all")',
-        )
-    if any(token in normalized for token in ("组件", "表单", "按钮", "显示", "渲染")):
-        return (
-            TestLayer.FRONTEND,
-            "forgeai-browser",
-            "platform://browser/runtime",
-            'run_check(check_id="all") + capture_screenshots(route="/")',
-        )
-    return (
-        TestLayer.E2E,
-        "forgeai-browser",
-        "platform://browser/runtime",
-        'run_check(check_id="all") + capture_screenshots(route="/")',
+    layer = (
+        TestLayer.API
+        if any(token in normalized for token in ("接口", "api", "http"))
+        else TestLayer.E2E
     )
+    return layer, "forgeai-qa-dsl-v1", "platform://qa/scenarios", "run_acceptance_tests"
 
 
 def build_acceptance_test_plan(source: EngineeringSource) -> AcceptanceTestPlan:

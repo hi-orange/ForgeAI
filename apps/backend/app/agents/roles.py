@@ -112,6 +112,9 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
         deliverables=("test_report",),
         allowed_tools=frozenset(
             {
+                "design_test_cases",
+                "write_test_script",
+                "run_acceptance_tests",
                 "read_artifact",
                 "list_files",
                 "read_file",

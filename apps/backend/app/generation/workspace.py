@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -32,6 +33,26 @@ _IGNORE = shutil.ignore_patterns(
 
 class WorkspaceExistsError(FileExistsError):
     """Raised when create_workspace would overwrite an existing directory."""
+
+
+def publish_workspace_directory(staging: Path, destination: Path) -> None:
+    """Atomically publish a tree, tolerating bounded Windows handle contention.
+
+    Existing destinations belong to the caller's identity/race validation. Other
+    OS errors and persistent access failures propagate with their original cause.
+    """
+    for attempt in range(5):
+        try:
+            staging.rename(destination)
+            return
+        except OSError as exc:
+            if (
+                getattr(exc, "winerror", None) not in {5, 32, 33}
+                or destination.exists()
+                or attempt == 4
+            ):
+                raise
+            time.sleep(0.05 * (2**attempt))
 
 
 def create_workspace(
@@ -107,14 +128,17 @@ def prepare_engineering_workspace(
             else:
                 create_workspace(staging, template_version=template_version)
             try:
-                staging.rename(dest)
-            except OSError:
-                # Another worker materialized the same run workspace first.
-                shutil.rmtree(staging, ignore_errors=True)
+                publish_workspace_directory(staging, dest)
+            except OSError as exc:
+                # Only an existing valid destination proves another writer won.
+                # Preserve permission/sharing errors instead of calling them a race.
+                if not dest.exists():
+                    raise
                 if not _workspace_tree_ready(dest):
                     raise WorkspaceExistsError(
                         f"workspace path exists but is not a valid template copy: {dest}"
-                    ) from None
+                    ) from exc
+                shutil.rmtree(staging, ignore_errors=True)
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)

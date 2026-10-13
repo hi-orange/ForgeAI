@@ -2,45 +2,60 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
 from app.core.exceptions import BusinessException, ConflictException
-from app.schemas.acceptance_test_plan import AcceptanceTestPlan
 from app.schemas.agent_action import (
     ToolCall,
     ToolDefinition,
     ToolExecutionResult,
     inline_model_json_schema,
 )
-from app.schemas.app_spec import AppSpec
-from app.schemas.system_design import SystemDesign
+from app.schemas.qa_suite import QAScript, QASuite
 from app.schemas.test_report import (
     DefectRecord,
     TestReport,
-    TestVerification,
-    VerificationStatus,
 )
+from app.services.qa_assets import suite_test_results, validate_suite
+from app.services.qa_verification import QAVerificationState, is_reusable_check, validate_report
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
+from app.tools import qa_runner
 
 _DEFECT_SCHEMA = inline_model_json_schema(DefectRecord)
 _TEST_REPORT_SCHEMA = inline_model_json_schema(TestReport)
-QUALITY_PROGRESS_SCHEMA_VERSION = 1
-MAX_CHECKPOINT_OUTPUT_CHARS = 8_000
-_NON_REUSABLE_CHECK_ERRORS = frozenset(
-    {
-        "CHECK_ENVIRONMENT_UNAVAILABLE",
-        "CHECK_TIMEOUT",
-        "SOURCE_CHANGED",
-        "SOURCE_MISMATCH",
-    }
-)
-
 TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
+    ToolDefinition(
+        name="design_test_cases",
+        description="提交需求驱动场景草稿；平台校验获批预期和覆盖后冻结版本，不写业务源码。",
+        parameters={
+            "type": "object",
+            "properties": {"suite": inline_model_json_schema(QASuite)},
+            "required": ["suite"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
+        name="write_test_script",
+        description="为独立场景生成受限 API/浏览器脚本；适配修订必须保留全部操作和断言。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "test_id": {"type": "string"},
+                "expected_suite_hash": {"type": "string"},
+                "script": inline_model_json_schema(QAScript),
+            },
+            "required": ["test_id", "expected_suite_hash", "script"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
+        name="run_acceptance_tests",
+        description="冻结源码/测试快照，在无外网隔离应用执行独立 API/浏览器断言并记录证据。",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    ),
     ToolDefinition(
         name="read_artifact",
         description="读取冻结的 app_spec、system_design 或准确代码身份。",
@@ -149,220 +164,6 @@ TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
 ]
 
 
-@dataclass(slots=True)
-class TestEngineerToolState:
-    app_spec: AppSpec
-    code_item_id: str
-    code_source_hash: str
-    workspace_root: Path
-    system_design: SystemDesign | None = None
-    acceptance_test_plan_item_id: str | None = None
-    acceptance_test_hash: str | None = None
-    acceptance_test_plan: AcceptanceTestPlan | None = None
-    checks: dict[str, ToolExecutionResult] = field(default_factory=dict)
-    defects: dict[str, DefectRecord] = field(default_factory=dict)
-    explore_before_check: int = 0
-
-
-def _is_reusable_check(result: ToolExecutionResult) -> bool:
-    output = result.data.get("output")
-    stale_visual_runtime = result.name == "capture_screenshots" and (
-        isinstance(output, str) and "Unknown check" in output
-    )
-    return result.error_code not in _NON_REUSABLE_CHECK_ERRORS and not stale_visual_runtime
-
-
-def export_test_engineer_progress(state: TestEngineerToolState) -> dict[str, Any]:
-    """Create a bounded, source-bound checkpoint for a recoverable QA attempt."""
-
-    checks: dict[str, dict[str, Any]] = {}
-    for check_id, result in state.checks.items():
-        payload = result.model_dump(mode="json")
-        data = dict(payload.get("data") or {})
-        output = data.get("output")
-        if isinstance(output, str) and len(output) > MAX_CHECKPOINT_OUTPUT_CHARS:
-            data["output"] = output[-MAX_CHECKPOINT_OUTPUT_CHARS:]
-            payload["truncated"] = True
-        payload["data"] = data
-        checks[check_id] = payload
-    return {
-        "schema_version": QUALITY_PROGRESS_SCHEMA_VERSION,
-        "code_item_id": state.code_item_id,
-        "source_hash": state.code_source_hash,
-        "test_plan_item_id": state.acceptance_test_plan_item_id,
-        "test_hash": state.acceptance_test_hash,
-        "checks": checks,
-        "defects": [defect.model_dump(mode="json") for defect in state.defects.values()],
-        "explore_before_check": state.explore_before_check,
-    }
-
-
-def restore_test_engineer_progress(
-    state: TestEngineerToolState,
-    progress: object,
-) -> None:
-    """Restore only reusable evidence produced for the exact frozen code identity."""
-
-    if not isinstance(progress, dict) or (
-        progress.get("schema_version") != QUALITY_PROGRESS_SCHEMA_VERSION
-        or progress.get("code_item_id") != state.code_item_id
-        or progress.get("source_hash") != state.code_source_hash
-        or progress.get("test_plan_item_id") != state.acceptance_test_plan_item_id
-        or progress.get("test_hash") != state.acceptance_test_hash
-    ):
-        return
-    raw_checks = progress.get("checks")
-    if isinstance(raw_checks, dict):
-        for check_id, raw in raw_checks.items():
-            if not isinstance(check_id, str) or not isinstance(raw, dict):
-                continue
-            try:
-                result = ToolExecutionResult.model_validate(raw)
-            except ValidationError:
-                continue
-            if not _is_reusable_check(result):
-                continue
-            observed_hash = result.data.get("source_hash")
-            if observed_hash != state.code_source_hash:
-                continue
-            state.checks[check_id] = result
-    requirement_ids = {item.id for item in state.app_spec.acceptance_criteria}
-    raw_defects = progress.get("defects")
-    if isinstance(raw_defects, list):
-        for raw in raw_defects:
-            try:
-                defect = DefectRecord.model_validate(raw)
-            except ValidationError:
-                continue
-            if set(defect.related_requirement_ids).issubset(requirement_ids):
-                state.defects[defect.defect_id] = defect
-    explore_before_check = progress.get("explore_before_check")
-    if isinstance(explore_before_check, int):
-        state.explore_before_check = max(0, min(explore_before_check, _MAX_EXPLORE_BEFORE_CHECK))
-
-
-# Allow a few targeted reads after artifacts; then force run_check(all).
-_MAX_EXPLORE_BEFORE_CHECK = 3
-_EXPLORE_TOOLS = frozenset({"list_files", "read_file", "search_code"})
-
-
-def _result_status(result: ToolExecutionResult) -> VerificationStatus:
-    if result.ok:
-        return VerificationStatus.PASSED
-    if result.error_code in {
-        "CHECK_ENVIRONMENT_UNAVAILABLE",
-        "CHECK_TIMEOUT",
-        "SOURCE_CHANGED",
-        "SOURCE_MISMATCH",
-    }:
-        return VerificationStatus.BLOCKED
-    return VerificationStatus.FAILED
-
-
-def _validated_report(call: ToolCall, state: TestEngineerToolState) -> TestReport:
-    try:
-        report = TestReport.model_validate(call.arguments.get("test_report"))
-    except ValidationError as exc:
-        raise BusinessException("测试报告缺少需求覆盖、检查证据、缺陷或质量结论") from exc
-    if (report.code_item_id, report.source_hash) != (
-        state.code_item_id,
-        state.code_source_hash,
-    ):
-        raise BusinessException("测试报告引用的不是本轮准确代码结果")
-    if state.acceptance_test_plan is not None:
-        if not report.test_results:
-            requirement_results = {item.requirement_id: item for item in report.requirement_results}
-            all_check = state.checks.get("all")
-            synthesized: list[TestVerification] = []
-            for test in state.acceptance_test_plan.tests:
-                try:
-                    linked = [requirement_results[item_id] for item_id in test.acceptance_ids]
-                except KeyError as exc:
-                    raise BusinessException("测试报告必须逐条覆盖 PRD 验收条件") from exc
-                statuses = {item.status for item in linked}
-                if VerificationStatus.FAILED in statuses:
-                    status = VerificationStatus.FAILED
-                elif statuses & {VerificationStatus.BLOCKED, VerificationStatus.NOT_RUN}:
-                    status = VerificationStatus.BLOCKED
-                else:
-                    status = VerificationStatus.PASSED
-                synthesized.append(
-                    TestVerification(
-                        test_id=test.test_id,
-                        acceptance_ids=list(test.acceptance_ids),
-                        check_id="all",
-                        status=status,
-                        command=test.command,
-                        evidence=(
-                            "; ".join(item.evidence for item in linked)
-                            + f"；runner={all_check.summary if all_check else 'missing'}"
-                        ),
-                    )
-                )
-            payload = report.model_dump(mode="json")
-            payload.update(
-                test_plan_item_id=state.acceptance_test_plan_item_id,
-                test_hash=state.acceptance_test_hash,
-                test_results=[item.model_dump(mode="json") for item in synthesized],
-                regression_test_ids=[item.test_id for item in synthesized],
-            )
-            report = TestReport.model_validate(payload)
-        if (report.test_plan_item_id, report.test_hash) != (
-            state.acceptance_test_plan_item_id,
-            state.acceptance_test_hash,
-        ):
-            raise BusinessException("测试报告引用的不是本轮冻结测试计划")
-        planned = {item.test_id: item for item in state.acceptance_test_plan.tests}
-        reported = {item.test_id: item for item in report.test_results}
-        if set(reported) != set(planned):
-            raise BusinessException("测试报告必须逐条覆盖冻结验收测试")
-        for test_id, planned_test in planned.items():
-            evidence = reported[test_id]
-            if evidence.acceptance_ids != planned_test.acceptance_ids:
-                raise BusinessException(f"测试 {test_id} 的验收映射与冻结计划不一致")
-            if evidence.command != planned_test.command:
-                raise BusinessException(f"测试 {test_id} 的执行命令与冻结计划不一致")
-    acceptance_ids = {item.id for item in state.app_spec.acceptance_criteria}
-    reported_ids = {item.requirement_id for item in report.requirement_results}
-    if reported_ids != acceptance_ids:
-        raise BusinessException("测试报告必须逐条覆盖 PRD 验收条件")
-    if "all" not in state.checks:
-        raise BusinessException("提交测试报告前必须运行完整 all 检查")
-    visual_check_ids = [check_id for check_id in state.checks if check_id.startswith("visual")]
-    if not visual_check_ids:
-        raise BusinessException("提交测试报告前必须生成桌面端与移动端截图")
-    reported_checks = {item.check_id: item for item in report.check_results}
-    if set(reported_checks) != set(state.checks):
-        raise BusinessException("测试报告必须记录本轮全部实际检查")
-    for check_id, result in state.checks.items():
-        if reported_checks[check_id].status != _result_status(result):
-            raise BusinessException(f"检查 {check_id} 的报告状态与实际结果不一致")
-    for check_id in visual_check_ids:
-        visual_result = state.checks[check_id]
-        if visual_result.ok:
-            raw_screenshots = visual_result.data.get("screenshots")
-            screenshots = raw_screenshots if isinstance(raw_screenshots, list) else []
-            paths = [
-                str(item.get("path"))
-                for item in screenshots
-                if isinstance(item, dict) and item.get("path")
-            ]
-            visual_evidence = reported_checks[check_id].evidence
-            if len(paths) != 2 or any(path not in visual_evidence for path in paths):
-                raise BusinessException(f"检查 {check_id} 的证据必须引用本轮桌面端与移动端截图路径")
-    reported_defects = {item.defect_id: item for item in report.defects}
-    if set(reported_defects) != set(state.defects) or any(
-        reported_defects[key] != value for key, value in state.defects.items()
-    ):
-        raise BusinessException("测试报告中的缺陷必须来自本轮独立记录")
-    if (
-        any(item.status == VerificationStatus.FAILED for item in report.requirement_results)
-        and not report.defects
-    ):
-        raise BusinessException("验收失败时必须记录至少一个缺陷")
-    return report
-
-
 def _ok_result(
     call: ToolCall,
     *,
@@ -381,26 +182,77 @@ def _ok_result(
 
 def execute_test_engineer_tool(
     call: ToolCall,
-    state: TestEngineerToolState,
+    state: QAVerificationState,
 ) -> tuple[ToolExecutionResult, TestReport | None]:
     try:
-        if call.name in _EXPLORE_TOOLS and "all" not in state.checks:
-            state.explore_before_check += 1
-            if state.explore_before_check > _MAX_EXPLORE_BEFORE_CHECK:
-                return (
-                    ToolExecutionResult(
-                        tool_call_id=call.id,
-                        name=call.name,
-                        ok=False,
-                        error_code="CHECK_FIRST",
-                        summary=(
-                            '提交报告前必须先 run_check(check_id="all")。'
-                            "请立刻运行完整检查，不要继续浏览源码。"
+        if call.name == "design_test_cases":
+            suite = QASuite.model_validate(call.arguments.get("suite"))
+            previous = state.suite_versions[-1] if state.suite_versions else None
+            validate_suite(suite, state.app_spec, state.acceptance_test_plan, previous)
+            if len(state.suite_versions) >= 32:
+                raise BusinessException("独立测试资产修订预算已用尽")
+            suite = suite.model_copy(update={"revision": previous.revision + 1 if previous else 1})
+            state.suite_versions.append(suite)
+            return _ok_result(
+                call,
+                summary="测试场景已校验并冻结",
+                data={
+                    "suite_hash": suite.digest(),
+                    "suite": suite.model_dump(mode="json"),
+                },
+            ), None
+        if call.name == "write_test_script":
+            if not state.suite_versions or len(state.suite_versions) >= 32:
+                raise BusinessException("请先设计场景，或测试资产修订预算已用尽")
+            previous = state.suite_versions[-1]
+            if call.arguments.get("expected_suite_hash") != previous.digest():
+                raise BusinessException("测试资产已更新；须提供准确 expected_suite_hash")
+            script = QAScript.model_validate(call.arguments.get("script"))
+            key = str(call.arguments.get("test_id") or "")
+            suite = previous.model_copy(
+                update={
+                    "revision": previous.revision + 1,
+                    "scripts": {**previous.scripts, key: script},
+                }
+            )
+            suite = QASuite.model_validate(suite.model_dump())
+            validate_suite(suite, state.app_spec, state.acceptance_test_plan, previous)
+            state.suite_versions.append(suite)
+            return _ok_result(
+                call,
+                summary="独立脚本已生成新版本",
+                data={
+                    "suite_hash": suite.digest(),
+                    "suite": suite.model_dump(mode="json"),
+                },
+            ), None
+        if call.name == "run_acceptance_tests":
+            if not state.suite_versions or len(state.executions) >= 6:
+                raise BusinessException("独立场景尚未设计，或执行预算已用尽")
+            suite = state.suite_versions[-1]
+            result = qa_runner.run_acceptance_tests(
+                state.workspace_root,
+                code_item_id=state.code_item_id,
+                source_hash=state.code_source_hash,
+                suite=suite,
+                tool_call_id=call.id,
+            )
+            manifest = result.data.get("manifest")
+            if isinstance(manifest, dict):
+                state.executions.append(manifest)
+            state.checks["acceptance"] = result
+            return result.model_copy(
+                update={
+                    "data": {
+                        **result.data,
+                        "suite": suite.model_dump(mode="json"),
+                        "suite_hash": suite.digest(),
+                        "test_results": suite_test_results(
+                            suite, manifest if isinstance(manifest, dict) else {}
                         ),
-                        arguments=dict(call.arguments),
-                    ),
-                    None,
-                )
+                    }
+                }
+            ), None
         if call.name == "read_artifact":
             artifact = str(call.arguments.get("artifact") or "")
             if artifact == "app_spec":
@@ -462,7 +314,7 @@ def execute_test_engineer_tool(
         if call.name == "run_check":
             check_id = str(call.arguments.get("check_id") or "")
             cached = state.checks.get(check_id)
-            if cached is not None and _is_reusable_check(cached):
+            if cached is not None and is_reusable_check(cached):
                 reused = cached.model_copy(
                     update={
                         "tool_call_id": call.id,
@@ -496,7 +348,7 @@ def execute_test_engineer_tool(
                     for check_id, result in state.checks.items()
                     if check_id.startswith("visual")
                     and result.data.get("route") == route
-                    and _is_reusable_check(result)
+                    and is_reusable_check(result)
                 ),
                 None,
             )
@@ -529,6 +381,8 @@ def execute_test_engineer_tool(
             state.checks[check_id] = result
             return result, None
         if call.name == "record_defect":
+            if not state.suite_versions:
+                raise BusinessException("业务缺陷须先有独立用例的实际失败证据")
             try:
                 defect = DefectRecord.model_validate(call.arguments.get("defect"))
             except ValidationError as exc:
@@ -538,6 +392,27 @@ def execute_test_engineer_tool(
             requirement_ids = {item.id for item in state.app_spec.acceptance_criteria}
             if not set(defect.related_requirement_ids).issubset(requirement_ids):
                 raise BusinessException("缺陷引用了不存在的 PRD 验收条件")
+            if state.suite_versions:
+                suite = state.suite_versions[-1]
+                execution = next(
+                    (
+                        item
+                        for item in reversed(state.executions)
+                        if item["suite_hash"] == suite.digest()
+                    ),
+                    {},
+                )
+                failed = {
+                    row["test_id"]
+                    for row in execution.get("results", [])
+                    if row["status"] == "failed" and row["failure_kind"] == "product"
+                }
+                if (
+                    not defect.related_test_ids
+                    or not set(defect.related_test_ids) <= failed
+                    or defect.execution_id != execution.get("execution_id")
+                ):
+                    raise BusinessException("业务缺陷须引用本轮实际失败用例和执行身份")
             state.defects[defect.defect_id] = defect
             return (
                 _ok_result(
@@ -548,7 +423,9 @@ def execute_test_engineer_tool(
                 None,
             )
         if call.name == "write_test_report":
-            report = _validated_report(call, state)
+            report = validate_report(
+                TestReport.model_validate(call.arguments.get("test_report")), state
+            )
             return (
                 _ok_result(
                     call,

@@ -82,19 +82,31 @@ class DockerSandboxRuntime:
         memory_mb: int,
         pids_limit: int,
         tmpfs: str,
+        writable_layer: bool = False,
+        qa_controller: bool = False,
     ) -> list[str]:
         return [
-            "--read-only",
+            *([] if writable_layer else ["--read-only", f"--tmpfs=/tmp:{tmpfs}"]),
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
-            "--user=65534:65534",
+            *(
+                [
+                    "--user=0:0",
+                    "--network=none",
+                    "--cap-add=SETUID",
+                    "--cap-add=SETGID",
+                    "--cap-add=CHOWN",
+                    "--cap-add=KILL",
+                ]
+                if qa_controller
+                else ["--user=65534:65534"]
+            ),
             f"--cpus={cpus}",
             f"--memory={memory_mb}m",
             f"--memory-swap={memory_mb}m",
             f"--pids-limit={pids_limit}",
             "--log-driver=none",
             "--init",
-            f"--tmpfs=/tmp:{tmpfs}",
         ]
 
     @staticmethod
