@@ -137,6 +137,14 @@ def record_architect_activity(
 
     execution = task_execution.require_execution(db, task_id, execution_id, lock=True)
     assert execution is not None
+    if observation.error_code in {
+        "ARCHITECT_CONTEXT_REUSED",
+        "ARCHITECT_CONTEXT_READY",
+    }:
+        # These are private loop-control signals. The model receives them and can
+        # submit from existing context, but they are not build failures for users.
+        task_execution.renew_execution_lease(db, task_id, execution_id)
+        return
     draft = dict(execution.draft or {})
     checkpoint = draft.get("checkpoint")
     if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "architect_checkpoint":

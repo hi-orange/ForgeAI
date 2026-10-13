@@ -19,13 +19,20 @@ from app.models.build_run import BuildRun
 from app.models.project import Project
 from app.models.user import User
 from app.services import workspace_files as workspace_files_service
+from app.services.source_artifact import persist_source_artifact
+from app.services.workflow_events import append_event
+from app.tools.checks import source_snapshot
 
 
 class WorkspaceFilesTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = self.enterContext(tempfile.TemporaryDirectory(prefix="forgeai-ws-files-"))
         self.workspace_root = self.enterContext(tempfile.TemporaryDirectory(prefix="forgeai-ws-"))
+        self.artifact_root = self.enterContext(
+            tempfile.TemporaryDirectory(prefix="forgeai-source-artifacts-")
+        )
         self.enterContext(patch.object(settings, "runtime_data_root", self.workspace_root))
+        self.enterContext(patch.object(settings, "source_artifact_root", self.artifact_root))
         self.engine = create_engine(
             f"sqlite+pysqlite:///{Path(directory) / 'ws.db'}",
             connect_args={"check_same_thread": False},
@@ -64,6 +71,31 @@ class WorkspaceFilesTests(unittest.TestCase):
         with self.session_factory() as db:
             return db.get(User, self.user_id)
 
+    def _publish_revision(self, db, revision: int = 1) -> str:
+        root = Path(settings.runtime_data_root) / "work" / str(self.project_id) / self.run_id
+        snapshot, source_hash = source_snapshot(root)
+        artifact = persist_source_artifact(
+            db,
+            project_id=self.project_id,
+            snapshot_bytes=snapshot,
+            source_hash=source_hash,
+        )
+        event = append_event(
+            db,
+            idempotency_key=f"test-preview:{self.run_id}:{revision}",
+            stream_key=f"preview:{self.run_id}",
+            event_type="preview_revision_published",
+            project_id=self.project_id,
+            build_run_id=self.run_id,
+            payload={
+                "source_hash": source_hash,
+                "source_artifact_id": artifact.artifact_id,
+            },
+        )
+        self.assertEqual(event.sequence, revision)
+        db.commit()
+        return source_hash
+
     def test_list_and_read_after_prepare(self) -> None:
         prepare_engineering_workspace(
             self.project_id,
@@ -73,6 +105,9 @@ class WorkspaceFilesTests(unittest.TestCase):
             app_spec={"goal": "招聘站"},
         )
         with self.session_factory() as db:
+            source_hash = self._publish_revision(db)
+            root = Path(settings.runtime_data_root) / "work" / str(self.project_id) / self.run_id
+            (root / "frontend/src/App.tsx").write_text("UNPUBLISHED", encoding="utf-8")
             with patch("app.services.workspace_files.get_requirements_status") as status:
                 from app.schemas.requirements import RequirementsStatus
 
@@ -82,6 +117,8 @@ class WorkspaceFilesTests(unittest.TestCase):
                     state="engineering_generated",
                     workspace_ready=True,
                     code_ready=True,
+                    preview_revision=1,
+                    preview_source_hash=source_hash,
                 )
                 listing = workspace_files_service.list_project_workspace(
                     db, self._owner(), self.project_id
@@ -91,6 +128,10 @@ class WorkspaceFilesTests(unittest.TestCase):
                 self.assertIn("frontend/src/App.tsx", paths)
                 self.assertIn("backend/app/main.py", paths)
                 self.assertTrue(all(not path.startswith("forgeai/") for path in paths))
+                app = workspace_files_service.read_project_workspace_file(
+                    db, self._owner(), self.project_id, "frontend/src/App.tsx"
+                )
+                self.assertNotIn("UNPUBLISHED", app.content)
                 content = workspace_files_service.read_project_workspace_file(
                     db, self._owner(), self.project_id, "backend/app/api/health.py"
                 )
@@ -114,6 +155,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         image.parent.mkdir(parents=True, exist_ok=True)
         image.write_bytes(b"\xff\xd8\xfffake-jpeg-bytes")
         with self.session_factory() as db:
+            source_hash = self._publish_revision(db)
             with patch("app.services.workspace_files.get_requirements_status") as status:
                 from app.schemas.requirements import RequirementsStatus
 
@@ -123,6 +165,8 @@ class WorkspaceFilesTests(unittest.TestCase):
                     state="engineering_generated",
                     workspace_ready=True,
                     code_ready=True,
+                    preview_revision=1,
+                    preview_source_hash=source_hash,
                 )
                 listing = workspace_files_service.list_project_workspace(
                     db, self._owner(), self.project_id
@@ -146,7 +190,7 @@ class WorkspaceFilesTests(unittest.TestCase):
                     base64.b64encode(b"\xff\xd8\xfffake-jpeg-bytes").decode("ascii"),
                 )
 
-    def test_list_exposes_template_as_soon_as_workspace_is_ready(self) -> None:
+    def test_template_stays_hidden_until_a_source_revision_exists(self) -> None:
         prepare_engineering_workspace(
             self.project_id,
             self.run_id,
@@ -168,12 +212,12 @@ class WorkspaceFilesTests(unittest.TestCase):
                 listing = workspace_files_service.list_project_workspace(
                     db, self._owner(), self.project_id
                 )
-                self.assertTrue(listing.ready)
-                self.assertIn("frontend/src/App.tsx", {item.path for item in listing.files})
-                content = workspace_files_service.read_project_workspace_file(
-                    db, self._owner(), self.project_id, "frontend/src/App.tsx"
-                )
-                self.assertIn("HomePage", content.content)
+                self.assertFalse(listing.ready)
+                self.assertEqual(listing.files, [])
+                with self.assertRaisesRegex(ConflictException, "revision 尚未生成"):
+                    workspace_files_service.read_project_workspace_file(
+                        db, self._owner(), self.project_id, "frontend/src/App.tsx"
+                    )
 
 
 class WorkspaceReadyOnPauseTests(unittest.TestCase):

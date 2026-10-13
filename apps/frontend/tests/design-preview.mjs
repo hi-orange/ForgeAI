@@ -24,7 +24,7 @@ import AppPreviewPane from '/src/views/project/components/AppPreviewPane.vue'
 const status = {
   project_id: 1, run_id: 'design-fixture', plan_id: 'plan', task_id: 'task', message_id: 1,
   state: 'completed', execution_id: null, execution_expires_at: null, error: null,
-  result: null, app_spec: { product_intent: '招聘网站' }, workspace_ready: true, code_ready: true,
+  result: null, app_spec: { product_intent: '招聘网站' }, workspace_ready: true, code_ready: true, preview_revision: 1, preview_source_hash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
   activities: [{ id: 'done', name: 'quality', label: '独立验收通过', detail: '16/16 checks passed', ok: true }],
 }
 createApp({

@@ -25,6 +25,15 @@ MAX_TERMINAL_OUTPUT_CHARS = 12_000
 MAX_ARCHITECT_INSPECTIONS = 4
 _SYSTEM_DESIGN_SCHEMA = inline_model_json_schema(SystemDesign)
 
+
+class _ArchitectContextSignal(BusinessException):
+    """Recoverable model-loop signal that must not appear as a user-facing failure."""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 ARCHITECT_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="read_artifact",
@@ -108,9 +117,15 @@ class ArchitectToolState:
 
 def _reserve_inspection(state: ArchitectToolState, key: str) -> None:
     if key in state.inspection_keys:
-        raise BusinessException("该上下文已经读取过，请使用已有结果继续设计")
+        raise _ArchitectContextSignal(
+            "该上下文已经读取过，请使用已有结果继续设计",
+            error_code="ARCHITECT_CONTEXT_REUSED",
+        )
     if state.inspection_count >= MAX_ARCHITECT_INSPECTIONS:
-        raise BusinessException("Architect 上下文读取预算已用尽，请提交系统设计")
+        raise _ArchitectContextSignal(
+            "Architect 上下文已充分，请使用已有结果提交系统设计",
+            error_code="ARCHITECT_CONTEXT_READY",
+        )
     state.inspection_keys.add(key)
     state.inspection_count += 1
 
@@ -274,6 +289,18 @@ def execute_architect_tool(
             )
             return result, None
         raise BusinessException(f"Architect 无权使用工具：{call.name}")
+    except _ArchitectContextSignal as exc:
+        return (
+            ToolExecutionResult(
+                tool_call_id=call.id,
+                name=call.name,
+                ok=False,
+                error_code=exc.error_code,
+                summary=str(exc),
+                arguments=dict(call.arguments),
+            ),
+            None,
+        )
     except (BusinessException, ConflictException, OSError, ValueError) as exc:
         return (
             ToolExecutionResult(

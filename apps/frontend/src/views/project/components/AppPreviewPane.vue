@@ -350,7 +350,13 @@ const previewDescription = computed(() => {
   return '描述你的想法，确认核心功能，应用生成后将在这里预览。'
 })
 const canPreview = computed(
-  () => postApproval.value && Boolean(props.status?.run_id && props.status?.workspace_ready),
+  () =>
+    postApproval.value &&
+    Boolean(
+      props.status?.run_id &&
+      props.status?.workspace_ready &&
+      (props.status?.preview_revision || props.status?.code_item_id),
+    ),
 )
 const consoleRows = computed(() => {
   const rows = (props.status?.activities ?? []).map((activity) => ({
@@ -634,11 +640,10 @@ watch(
       props.projectId,
       props.status?.run_id,
       props.status?.state,
-      props.status?.workspace_ready,
-      props.status?.code_ready,
       props.status?.preview_revision ?? 0,
+      props.status?.code_item_id ?? '',
     ] as const,
-  ([projectId, runId, state, workspaceReady, _codeReady, revision], previous) => {
+  ([projectId, runId, state, revision, codeItemId], previous) => {
     const identity = `${projectId}:${runId ?? ''}`
     if (activePreviewIdentity !== identity) {
       activePreviewIdentity = identity
@@ -654,8 +659,9 @@ watch(
       previewConsoleRows.value = []
       currentPath.value = '/'
     }
-    if (workspaceReady && postApproval.value) {
-      const revisionChanged = revision !== (previous?.[5] ?? revision)
+    if ((revision || codeItemId) && postApproval.value) {
+      const revisionChanged =
+        revision !== (previous?.[3] ?? revision) || codeItemId !== (previous?.[4] ?? codeItemId)
       const stateChanged = state !== previous?.[2]
       void ensurePreview(revisionChanged || stateChanged || state === 'completed')
     } else {

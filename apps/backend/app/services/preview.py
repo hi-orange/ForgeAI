@@ -206,6 +206,8 @@ def start_preview(db: Session, user: User, project_id: int) -> PreviewStatus:
     status = get_requirements_status(db, user, project_id)
     if not status.run_id or not status.workspace_ready:
         raise BusinessException("批准后的应用工作区尚未就绪，无法启动预览")
+    if status.preview_revision is None and not status.code_item_id:
+        raise BusinessException("首个源码 revision 尚未生成，无法启动预览")
     run_id = status.run_id
     verified = status.state == "completed"
     if status.code_item_id:
@@ -246,7 +248,7 @@ def start_preview(db: Session, user: User, project_id: int) -> PreviewStatus:
         )
         current_source_hash = status.preview_source_hash
     else:
-        # Before the first generated slice, expose the copied template immediately.
+        # Legacy/final code artifacts are identity-checked by ensure_code_workspace above.
         _, current_source_hash = source_snapshot(workspace)
 
     _ensure_sweeper()

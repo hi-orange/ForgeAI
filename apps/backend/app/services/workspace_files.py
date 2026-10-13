@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import base64
-from pathlib import Path
+import binascii
+import json
+from pathlib import PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictException, NotFoundException
-from app.core.settings import settings
-from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
+from app.models.workflow_event import WorkflowEvent
 from app.services import project as project_service
 from app.services.requirements import get_requirements_status
-from app.services.source_artifact import ensure_code_workspace
+from app.services.source_artifact import ensure_code_workspace, read_source_artifact_snapshot
+from app.tools.checks import source_snapshot
 
 _SKIP_DIRS = {
     ".git",
@@ -94,7 +97,7 @@ class WorkspaceFileContent(BaseModel):
     size_bytes: int = Field(ge=0)
 
 
-def _file_kind(path: Path) -> WorkspaceFileKind | None:
+def _file_kind(path: PurePosixPath) -> WorkspaceFileKind | None:
     suffix = path.suffix.lower()
     if suffix in _TEXT_SUFFIXES or path.name in {"README", "LICENSE", ".env.example"}:
         return "text"
@@ -103,46 +106,127 @@ def _file_kind(path: Path) -> WorkspaceFileKind | None:
     return None
 
 
-def list_project_workspace(db: Session, user: User, project_id: int) -> WorkspaceListing:
-    project_service.get_user_project(db, user, project_id)
-    status = get_requirements_status(db, user, project_id)
-    if status.run_id is not None and status.code_item_id and not status.workspace_ready:
-        _, restored = ensure_code_workspace(
-            db,
-            project_id=project_id,
-            run_id=status.run_id,
-            code_item_id=status.code_item_id,
-        )
-        if restored:
-            db.commit()
-            status.workspace_ready = True
-    if (
-        status.run_id is None
-        or not status.workspace_ready
-        or not workspace_is_ready(project_id, status.run_id)
-    ):
-        return WorkspaceListing(ready=False, run_id=status.run_id)
-    root = default_workspace_path(settings.runtime_data_root, project_id, status.run_id)
-    files: list[WorkspaceFileEntry] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        relative_parts = path.relative_to(root).parts
-        if any(part in _SKIP_DIRS for part in relative_parts):
-            continue
-        relative = path.relative_to(root).as_posix()
-        if relative.startswith("forgeai/"):
-            continue
+def _decode_visible_snapshot(payload: bytes) -> dict[str, tuple[WorkspaceFileKind, bytes]]:
+    try:
+        raw_files = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ConflictException("源码 revision 快照格式损坏") from exc
+    if not isinstance(raw_files, dict) or len(raw_files) > _MAX_LISTED_FILES:
+        raise ConflictException("源码 revision 文件清单无效")
+
+    files: dict[str, tuple[WorkspaceFileKind, bytes]] = {}
+    text_size = 0
+    image_size = 0
+    for relative, encoded in raw_files.items():
+        if not isinstance(relative, str):
+            raise ConflictException("源码 revision 包含非法路径")
+        path = PurePosixPath(relative)
+        if (
+            path.is_absolute()
+            or not path.parts
+            or "\\" in relative
+            or ".." in path.parts
+            or path.parts[0] == "forgeai"
+            or path.name.startswith(".env")
+            or any(part in _SKIP_DIRS for part in path.parts)
+        ):
+            raise ConflictException("源码 revision 包含非法路径")
         kind = _file_kind(path)
         if kind is None:
             continue
-        files.append(WorkspaceFileEntry(path=relative, size_bytes=path.stat().st_size, kind=kind))
-        if len(files) >= _MAX_LISTED_FILES:
-            break
+        if isinstance(encoded, str):
+            if kind != "text":
+                raise ConflictException("源码 revision 文件编码无效")
+            data = encoded.encode("utf-8")
+            text_size += len(data)
+            if len(data) > _MAX_TEXT_BYTES or text_size > _MAX_TEXT_BYTES * 20:
+                raise ConflictException("源码 revision 文本超过展示上限")
+        elif (
+            kind == "image"
+            and len(path.parts) >= 3
+            and path.parts[:2] == ("frontend", "public")
+            and isinstance(encoded, dict)
+            and encoded.get("encoding") == "base64"
+            and isinstance(encoded.get("content"), str)
+        ):
+            try:
+                data = base64.b64decode(encoded["content"], validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ConflictException("源码 revision 图片编码损坏") from exc
+            image_size += len(data)
+            if len(data) > _MAX_IMAGE_BYTES or image_size > _MAX_IMAGE_BYTES * 20:
+                raise ConflictException("源码 revision 图片超过展示上限")
+        else:
+            raise ConflictException("源码 revision 文件编码无效")
+        files[relative] = (kind, data)
+    return files
+
+
+def _visible_source_snapshot(
+    db: Session,
+    *,
+    project_id: int,
+    status: object,
+) -> tuple[str, dict[str, tuple[WorkspaceFileKind, bytes]]] | None:
+    run_id = getattr(status, "run_id", None)
+    if not isinstance(run_id, str):
+        return None
+    revision = getattr(status, "preview_revision", None)
+    source_hash = getattr(status, "preview_source_hash", None)
+    if revision is not None:
+        if not isinstance(revision, int) or not isinstance(source_hash, str):
+            raise ConflictException("源码 revision 身份不完整")
+        event = db.scalar(
+            select(WorkflowEvent).where(
+                WorkflowEvent.project_id == project_id,
+                WorkflowEvent.build_run_id == run_id,
+                WorkflowEvent.stream_key == f"preview:{run_id}",
+                WorkflowEvent.event_type == "preview_revision_published",
+                WorkflowEvent.sequence == revision,
+            )
+        )
+        payload = event.payload if event is not None and isinstance(event.payload, dict) else None
+        artifact_id = payload.get("source_artifact_id") if payload else None
+        event_hash = payload.get("source_hash") if payload else None
+        if not isinstance(artifact_id, str) or event_hash != source_hash:
+            raise ConflictException("源码 revision 身份不完整")
+        snapshot = read_source_artifact_snapshot(
+            db,
+            project_id=project_id,
+            artifact_id=artifact_id,
+            source_hash=source_hash,
+        )
+        return run_id, _decode_visible_snapshot(snapshot)
+
+    code_item_id = getattr(status, "code_item_id", None)
+    if not isinstance(code_item_id, str):
+        return None
+    root, restored = ensure_code_workspace(
+        db,
+        project_id=project_id,
+        run_id=run_id,
+        code_item_id=code_item_id,
+    )
+    if restored:
+        db.commit()
+    snapshot, _ = source_snapshot(root)
+    return run_id, _decode_visible_snapshot(snapshot)
+
+
+def list_project_workspace(db: Session, user: User, project_id: int) -> WorkspaceListing:
+    project_service.get_user_project(db, user, project_id)
+    status = get_requirements_status(db, user, project_id)
+    visible = _visible_source_snapshot(db, project_id=project_id, status=status)
+    if visible is None:
+        return WorkspaceListing(ready=False, run_id=status.run_id)
+    run_id, snapshot = visible
+    files = [
+        WorkspaceFileEntry(path=path, size_bytes=len(data), kind=kind)
+        for path, (kind, data) in sorted(snapshot.items())
+    ]
     return WorkspaceListing(
         ready=True,
-        run_id=status.run_id,
-        root=str(root),
+        run_id=run_id,
         files=files,
     )
 
@@ -152,31 +236,18 @@ def read_project_workspace_file(
 ) -> WorkspaceFileContent:
     project_service.get_user_project(db, user, project_id)
     status = get_requirements_status(db, user, project_id)
-    if status.run_id is not None and status.code_item_id and not status.workspace_ready:
-        _, restored = ensure_code_workspace(
-            db,
-            project_id=project_id,
-            run_id=status.run_id,
-            code_item_id=status.code_item_id,
-        )
-        if restored:
-            db.commit()
-            status.workspace_ready = True
-    if (
-        status.run_id is None
-        or not status.workspace_ready
-        or not workspace_is_ready(project_id, status.run_id)
-    ):
-        raise ConflictException("应用工作区尚未准备好")
-    root = default_workspace_path(settings.runtime_data_root, project_id, status.run_id)
-    target = _safe_file_under_root(root, relative_path)
-    if not target.is_file():
+    visible = _visible_source_snapshot(db, project_id=project_id, status=status)
+    if visible is None:
+        raise ConflictException("源码 revision 尚未生成")
+    _, snapshot = visible
+    normalized = relative_path.replace("\\", "/").strip()
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ConflictException("非法文件路径")
+    source = snapshot.get(normalized)
+    if source is None:
         raise NotFoundException("文件不存在")
-    kind = _file_kind(target)
-    if kind is None:
-        raise ConflictException(f"{relative_path} 不是可预览的工作区文件")
-    raw = target.read_bytes()
-    normalized = relative_path.replace("\\", "/")
+    kind, raw = source
     if kind == "image":
         truncated = len(raw) > _MAX_IMAGE_BYTES
         payload = raw[:_MAX_IMAGE_BYTES]
@@ -184,7 +255,7 @@ def read_project_workspace_file(
             path=normalized,
             kind="image",
             content=base64.b64encode(payload).decode("ascii"),
-            media_type=_IMAGE_MEDIA_TYPES.get(target.suffix.lower(), "application/octet-stream"),
+            media_type=_IMAGE_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream"),
             truncated=truncated,
             size_bytes=len(raw),
         )
@@ -201,20 +272,3 @@ def read_project_workspace_file(
         truncated=truncated,
         size_bytes=len(raw),
     )
-
-
-def _safe_file_under_root(root: Path, relative_path: str) -> Path:
-    cleaned = relative_path.replace("\\", "/").strip()
-    if not cleaned or cleaned.startswith("/") or ".." in cleaned.split("/"):
-        raise ConflictException("非法文件路径")
-    if any(part in _SKIP_DIRS for part in cleaned.split("/")):
-        raise ConflictException("不允许读取该路径")
-    if cleaned.startswith("forgeai/"):
-        raise ConflictException("不允许读取该路径")
-    root_resolved = root.resolve()
-    candidate = (root / cleaned).resolve()
-    try:
-        candidate.relative_to(root_resolved)
-    except ValueError as exc:
-        raise ConflictException("非法文件路径") from exc
-    return candidate

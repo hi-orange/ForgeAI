@@ -5,7 +5,7 @@
         <input v-model="query" type="search" placeholder="搜索文件" aria-label="搜索文件" />
       </div>
       <div class="file-tree" role="tree">
-        <p v-if="!ready" class="tree-empty">计划获批并创建工作区后，这里会显示前后端文件。</p>
+        <p v-if="!ready" class="tree-empty">首个代码 revision 通过快速检查后，这里会显示源码。</p>
         <p v-else-if="loading" class="tree-empty">正在读取工作区…</p>
         <p v-else-if="error" class="tree-error">{{ error }}</p>
         <template v-else>

@@ -46,7 +46,7 @@ class PreviewServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(BusinessException, "工作区尚未就绪"):
                 preview_service.start_preview(db, user, 29)
 
-    def test_start_allows_unverified_engineering_workspace(self) -> None:
+    def test_start_rejects_before_first_source_revision(self) -> None:
         db = MagicMock()
         user = MagicMock()
         req = MagicMock(
@@ -57,24 +57,15 @@ class PreviewServiceTests(unittest.TestCase):
             workspace_ready=True,
             code_item_id=None,
         )
-        workspace = Path(tempfile.mkdtemp(prefix="forgeai-preview-working-"))
-        (workspace / "frontend").mkdir()
         with (
             patch.object(settings, "preview_enabled", True),
             patch.object(preview_service.project_service, "get_user_project"),
             patch.object(preview_service, "get_requirements_status", return_value=req),
-            patch.object(preview_service, "workspace_is_ready", return_value=True),
-            patch.object(preview_service, "default_workspace_path", return_value=workspace),
-            patch.object(preview_service, "source_snapshot", return_value=(b"{}", "a" * 64)),
-            patch.object(preview_service, "_ensure_sweeper"),
-            patch.object(preview_service.threading, "Thread") as thread_cls,
+            self.assertRaisesRegex(BusinessException, "revision 尚未生成"),
         ):
-            result = preview_service.start_preview(db, user, 29)
+            preview_service.start_preview(db, user, 29)
 
-        self.assertEqual(result.status, "starting")
-        self.assertFalse(result.verified)
-        self.assertEqual(preview_service._sessions[29].run_id, "run_working")
-        thread_cls.assert_called_once()
+        self.assertNotIn(29, preview_service._sessions)
 
     def test_start_uses_exact_published_revision_snapshot(self) -> None:
         db = MagicMock()

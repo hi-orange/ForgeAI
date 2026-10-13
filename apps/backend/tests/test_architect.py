@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from pydantic import ValidationError
 
@@ -9,9 +9,10 @@ from app.agents import architect as architect_agent
 from app.agents.roles import get_role_profile
 from app.core.exceptions import BusinessException
 from app.models.task import TaskRecipient
-from app.schemas.agent_action import ChatWithToolsResult, ToolCall
+from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
 from app.schemas.app_spec import AppSpec
 from app.schemas.system_design import SystemDesign
+from app.services import architect as architect_service
 from app.tools.architect import ArchitectToolState, execute_architect_tool
 
 
@@ -181,7 +182,47 @@ class ArchitectTests(unittest.TestCase):
                 state,
             )
             self.assertFalse(repeated.ok)
+            self.assertEqual(repeated.error_code, "ARCHITECT_CONTEXT_REUSED")
             self.assertIn("已经读取过", repeated.summary)
+
+    def test_context_budget_is_a_recoverable_internal_signal(self):
+        with TemporaryDirectory(prefix="forgeai-architect-budget-") as directory:
+            root = Path(directory)
+            state = ArchitectToolState(app_spec=valid_spec(), workspace_root=root)
+            state.inspection_count = 4
+
+            observation, output = execute_architect_tool(
+                ToolCall(id="extra", name="terminal_list", arguments={"path": "."}),
+                state,
+            )
+
+        self.assertIsNone(output)
+        self.assertFalse(observation.ok)
+        self.assertEqual(observation.error_code, "ARCHITECT_CONTEXT_READY")
+        self.assertNotIn("预算已用尽", observation.summary)
+
+    def test_recoverable_context_signal_is_not_user_visible(self):
+        observation = ToolExecutionResult(
+            tool_call_id="extra",
+            name="editor_read",
+            ok=False,
+            error_code="ARCHITECT_CONTEXT_READY",
+            summary="Architect 上下文已充分，请提交系统设计",
+        )
+        db = MagicMock()
+        with (
+            patch.object(
+                architect_service.task_execution,
+                "require_execution",
+                return_value=MagicMock(),
+            ) as require_execution,
+            patch.object(
+                architect_service.task_execution, "renew_execution_lease"
+            ) as renew_execution_lease,
+        ):
+            architect_service.record_architect_activity(db, "task", "execution", observation)
+        require_execution.assert_called_once_with(db, "task", "execution", lock=True)
+        renew_execution_lease.assert_called_once_with(db, "task", "execution")
 
     def test_agent_edits_then_submits_validated_system_design(self):
         turns = [

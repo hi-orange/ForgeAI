@@ -30,3 +30,4 @@ __pycache__/
 
 # Generated-app runtime volumes (workspaces, revisions, app data)
 runtime-data/
+artifact-data/

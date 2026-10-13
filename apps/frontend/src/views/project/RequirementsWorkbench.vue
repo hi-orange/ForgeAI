@@ -285,7 +285,7 @@
       <WorkspaceEditorPane
         v-if="workspaceView === 'editor'"
         :project-id="projectId"
-        :ready="Boolean(status?.workspace_ready)"
+        :ready="sourceReady"
         :run-id="status?.run_id"
         :generation="workspaceGeneration"
         :written-path="latestWrittenPath"
@@ -505,6 +505,9 @@ const successfulWrites = computed(
 )
 const workspaceGeneration = computed(() => successfulWrites.value.length)
 const latestWrittenPath = computed(() => successfulWrites.value.at(-1)?.detail || null)
+const sourceReady = computed(() =>
+  Boolean(status.value?.preview_revision || status.value?.code_item_id),
+)
 // 问询等已在对话里回过话时，不再用常驻卡重复「告诉我你想做什么」。
 const awaitingIdeaAfterReply = computed(() => {
   if (busy.value || status.value?.state !== 'not_started') return false
@@ -575,8 +578,8 @@ const agentText = computed(() => {
     }
     if (status.value?.state === 'engineering_running') {
       return status.value.activities?.length
-        ? '正在按获批需求读写工作区。当前动作保持精简，完整历史可按需展开。'
-        : '正在根据获批需求构建应用，右侧会同步显示真实文件。'
+        ? '正在按获批需求生成源码。首个 revision 通过快速检查后会在右侧显示。'
+        : '正在根据获批需求构建应用，源码通过快速检查后会在右侧显示。'
     }
     if (status.value?.state === 'design_running') {
       return 'Architect 正在把获批 PRD 转化为模块、接口和数据结构设计。'
@@ -684,11 +687,11 @@ function addRequirement() {
   newRequirement.value = ''
 }
 watch(
-  () => [status.value?.state, status.value?.workspace_ready] as const,
-  ([state, workspaceReady]) => {
+  () => [status.value?.state, status.value?.preview_revision, status.value?.code_item_id] as const,
+  ([state, previewRevision, codeItemId]) => {
     if (
       !autoOpenedWorkspace &&
-      workspaceReady &&
+      Boolean(previewRevision || codeItemId) &&
       (state === 'design_pending' ||
         state === 'design_running' ||
         state === 'engineering_pending' ||

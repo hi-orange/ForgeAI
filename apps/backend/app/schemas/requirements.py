@@ -120,8 +120,8 @@ class RequirementsStatus(BaseModel):
     retryable: bool = True
     result: ProductManagerWorkflowResult | None = None
     app_spec: AppSpec | None = None
-    # The template is visible as soon as the isolated workspace exists; code_ready means a
-    # successful business-code write has happened in this run.
+    # workspace_ready only means the isolated template exists. User-visible source is gated by
+    # preview_revision or the final code_item_id; code_ready tracks successful business-code writes.
     workspace_ready: bool = False
     code_ready: bool = False
     preview_revision: int | None = None
