@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any, TypedDict
 
 from pydantic import ValidationError
@@ -13,7 +14,8 @@ from app.agents.roles import LEADER_PROFILE
 from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_with_tools
-from app.schemas.leader import LeaderContext, LeaderOutcome
+from app.schemas.leader import LeaderContext, LeaderIntentDecision, LeaderOutcome
+from app.schemas.plan import PlanCreate
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
 from app.tools.leader import (
     LEADER_TOOLS,
@@ -114,6 +116,8 @@ def lead_project_turn(
     *,
     instruction: str = "先读取冻结上下文，再管理本轮计划和分派。",
     max_turns: int = LEADER_COMPLEX_REPLAN_TURNS,
+    checkpoint: dict[str, Any] | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> LeaderOutcome:
     """跑一轮有上限的管理流程；调用方负责把校验后的计划/结果另行落库。"""
 
@@ -124,7 +128,17 @@ def lead_project_turn(
         raise BusinessException("Leader 项目上下文不符合要求") from exc
     budget = max(1, min(int(max_turns), LEADER_COMPLEX_REPLAN_TURNS))
     # 本轮工具共享的内存状态（草稿计划、已分派任务、最终结果等）。
-    state = LeaderToolState(context=context)
+    saved = (checkpoint or {}).get("state", {})
+    state = LeaderToolState(
+        context=context,
+        intent=LeaderIntentDecision.model_validate(saved["intent"])
+        if saved.get("intent")
+        else None,
+        draft=PlanCreate.model_validate(saved["draft"]) if saved.get("draft") else None,
+        dispatched_task_keys=list(saved.get("dispatched_task_keys", [])),
+    )
+    if checkpoint and checkpoint.get("output"):
+        return LeaderOutcome.model_validate(checkpoint["output"])
     return run_bounded_tool_loop(
         messages=_leadership_messages(context, instruction),
         tools=ALLOWED_LEADER_TOOLS,
@@ -139,4 +153,11 @@ def lead_project_turn(
         execute_tool=lambda call: execute_leader_tool(call, state),
         model_call=chat_with_tools,
         final_turn_tools={"request_user_input", "finish_turn"},
+        checkpoint=checkpoint,
+        on_checkpoint=on_checkpoint,
+        export_state=lambda: {
+            "intent": state.intent.model_dump(mode="json") if state.intent else None,
+            "draft": state.draft.model_dump(mode="json") if state.draft else None,
+            "dispatched_task_keys": list(state.dispatched_task_keys),
+        },
     )

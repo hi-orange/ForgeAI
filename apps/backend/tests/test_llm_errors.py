@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import unittest
 from unittest.mock import patch
 
 import httpx
+from sqlalchemy import create_engine
 
 from app.core.exceptions import ModelProtocolException, ProviderException
 from app.core.llm import _http_error_message, _http_error_retryable, chat_with_tools
 from app.core.llm_response import CompletionContentError, normalize_completion_content
+from app.core.settings import settings
+from app.telemetry.agent import agent_telemetry_scope
 
 
 def _response(status_code: int, text: str) -> httpx.Response:
@@ -17,6 +21,40 @@ def _response(status_code: int, text: str) -> httpx.Response:
 
 
 class LlmHttpErrorMessageTests(unittest.TestCase):
+    def test_provider_error_logs_include_scoped_identity_without_leaking_scope(self):
+        engine = create_engine("sqlite://")
+        self.addCleanup(engine.dispose)
+        response = httpx.Response(
+            503, text="busy", request=httpx.Request("POST", "https://fixture.invalid")
+        )
+        with (
+            patch.object(settings, "deepseek_api_key", "fixture-key"),
+            patch("app.core.llm.httpx.Client") as client,
+            self.assertLogs("forgeai.llm", level="WARNING") as logs,
+        ):
+            client.return_value.__enter__.return_value.post.return_value = response
+            with agent_telemetry_scope(
+                project_id=7,
+                build_run_id="run_7",
+                task_id="task_7",
+                execution_id="exec_7",
+                role="Architect",
+                bind=engine,
+            ):
+                with self.assertRaises(ProviderException):
+                    chat_with_tools(messages=[], tools=[])
+            logging.getLogger("forgeai.llm").warning("unscoped")
+        for field in (
+            "project=7",
+            "run=run_7",
+            "task=task_7",
+            "execution=exec_7",
+            "role=Architect",
+        ):
+            self.assertIn(field, logs.output[0])
+        self.assertNotIn("fixture-key", logs.output[0])
+        self.assertNotIn("run=run_7", logs.output[1])
+
     def test_provider_failure_has_service_status_not_client_error(self):
         self.assertEqual(ProviderException("network", retryable=True).status_code, 503)
         self.assertEqual(ProviderException("config", retryable=False).status_code, 502)

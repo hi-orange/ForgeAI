@@ -4,6 +4,7 @@ from app.models.agent_usage_event import AgentUsageEvent
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
 from app.models.deployment import Deployment
+from app.models.leader_dispatch_checkpoint import LeaderDispatchCheckpoint
 from app.models.plan import Plan
 from app.models.project import Project
 from app.models.project_message import ProjectMessage
@@ -26,6 +27,7 @@ __all__ = [
     "ProjectMessage",
     "ProjectMessageClassification",
     "BuildRun",
+    "LeaderDispatchCheckpoint",
     "ConfigurationItem",
     "Plan",
     "Task",

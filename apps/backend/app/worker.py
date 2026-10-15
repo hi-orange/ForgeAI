@@ -313,10 +313,8 @@ class DurableWorker:
             with SessionLocal() as db:
                 complete_job(db, job_id, self.worker_id)
         except Exception as exc:
-            if isinstance(exc, AppException):
-                logger.warning("workflow job stopped job_id=%s error=%s", job_id, exc)
-            else:
-                logger.exception("workflow job failed job_id=%s", job_id)
+            if not isinstance(exc, AppException):
+                logger.exception("workflow job attempt raised job_id=%s", job_id)
             with SessionLocal() as db:
                 fail_job(db, job_id, self.worker_id, exc)
         finally:

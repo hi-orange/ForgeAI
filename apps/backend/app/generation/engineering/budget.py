@@ -5,6 +5,8 @@ from typing import Any
 DEFAULT_CALL_BUDGET: dict[str, int] = {
     "max_model_turns": 80,
     "max_tool_calls": 120,
+    # Bounded inspection before a plan decision; each turn can batch 16 reads.
+    "max_planning_turns": 4,
     # Cascading first-error failures burn rounds quickly; keep a small hard cap
     # and rely on identical-failure / no-progress stop-loss for the rest.
     "max_repair_rounds": 3,

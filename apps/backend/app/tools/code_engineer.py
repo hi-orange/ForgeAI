@@ -13,7 +13,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.core.exceptions import AppException
-from app.generation.delivery import PlannedWorkItem
+from app.generation.delivery import DeliveryPlanError, PlannedWorkItem
+from app.generation.engineering.diagnostics import feedback
 from app.schemas.agent_action import (
     ToolCall,
     ToolDefinition,
@@ -82,6 +83,15 @@ class _Blocked(_Arguments):
     reason: str = Field(min_length=1, max_length=2000)
 
 
+class _Focus(_Arguments):
+    work_item_id: str = Field(min_length=1, max_length=100)
+    stalled_because: str = Field(min_length=1, max_length=1000)
+    next_change: str = Field(min_length=1, max_length=1000)
+    target_paths: list[str] = Field(min_length=1, max_length=8)
+    read_paths: list[str] = Field(default_factory=list, max_length=4)
+    verification: str = Field(min_length=1, max_length=500)
+
+
 class _Plan(_Arguments):
     items: list[PlannedWorkItem] = Field(min_length=1, max_length=100)
     reason: str = Field(min_length=1, max_length=2000)
@@ -89,6 +99,7 @@ class _Plan(_Arguments):
 
 _TOOL_ARGUMENTS: dict[str, type[_Arguments]] = {
     "update_delivery_plan": _Plan,
+    "update_work_item_focus": _Focus,
     "list_files": _List,
     "read_file": _Read,
     "search_code": _Search,
@@ -101,6 +112,10 @@ _TOOL_ARGUMENTS: dict[str, type[_Arguments]] = {
     "report_blocked": _Blocked,
 }
 _DESCRIPTIONS = {
+    "update_work_item_focus": (
+        "停滞时根据 working_memory 的实际动作说明原因和下一项具体改动；"
+        "声明目标文件、最多 4 个必要补读路径及验证方式。不是全量重规划，不能宣布完成。"
+    ),
     "update_delivery_plan": (
         "提交完整工程依赖图或调整剩余计划；先建立/验证视觉基础，再依赖它实现功能。"
         "需求可拆分，基础可共用；保留已完成项的全部定义，不提交 status/summary。"
@@ -147,13 +162,28 @@ def validate_tool_call(call: ToolCall) -> ToolCall:
 
 
 def rejected_tool(call: ToolCall, error: Exception) -> ToolExecutionResult:
-    return ToolExecutionResult(
-        tool_call_id=call.id,
-        name=call.name,
-        ok=False,
-        error_code="TOOL_REJECTED",
-        summary=str(error)[:2000],
-        arguments=call.arguments,
+    data = {}
+    if isinstance(error, DeliveryPlanError):
+        data = {
+            "diagnostic": error.diagnostic.model_dump(mode="json"),
+            "conflicts": error.diagnostic.issues,
+        }
+    elif isinstance(error, ValidationError):
+        data = {
+            "validation_errors": error.errors(
+                include_input=False, include_context=False, include_url=False
+            )
+        }
+    return feedback(
+        ToolExecutionResult(
+            tool_call_id=call.id,
+            name=call.name,
+            ok=False,
+            error_code="TOOL_REJECTED",
+            summary=str(error)[:2000],
+            arguments=call.arguments,
+            data=data,
+        )
     )
 
 

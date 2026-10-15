@@ -14,9 +14,10 @@ from app.core.exceptions import BusinessException, ModelProtocolException, Provi
 from app.core.llm_response import CompletionContentKind, normalize_completion_content
 from app.core.settings import settings
 from app.schemas.agent_action import ChatWithToolsResult, TokenUsage, ToolCall, ToolDefinition
-from app.telemetry.agent import record_model_turn
+from app.telemetry.agent import AgentLogFilter, record_model_turn
 
 logger = logging.getLogger("forgeai.llm")
+logger.addFilter(AgentLogFilter())
 
 
 def _text_length(value: object) -> int | None:

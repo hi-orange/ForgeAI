@@ -1036,6 +1036,7 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
         waiting = self.client.get(f"{self.base}/requirements")
         self.assertEqual(waiting.status_code, 200)
         self.assertEqual(waiting.json()["data"]["state"], "ready_for_delivery")
+        self.assertEqual(waiting.json()["data"]["error"], saved["error"])
         retry = self.client.post(f"{self.base}/requirements/continue")
         self.assertEqual(retry.status_code, 200, retry.text)
         self.assertEqual(
@@ -1043,6 +1044,8 @@ class RequirementsApiTests(ProductManagerWorkflowFixture):
             saved["result"]["configuration_item_id"],
         )
         self.assertIsNotNone(retry.json()["data"]["task_id"])
+        self.assertIsNone(retry.json()["data"]["error"])
+        self.assertIsNone(self.client.get(f"{self.base}/requirements").json()["data"]["error"])
         self.chat.assert_called_once()
 
     def test_http_rolls_back_failed_dispatch_transaction_before_returning_status(self):

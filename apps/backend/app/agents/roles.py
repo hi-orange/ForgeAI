@@ -84,6 +84,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
         allowed_tools=frozenset(
             {
                 "update_delivery_plan",
+                "update_work_item_focus",
                 "list_files",
                 "read_file",
                 "search_code",

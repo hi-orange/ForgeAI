@@ -15,6 +15,7 @@ from app.core.settings import settings
 from app.models.agent_decision_event import AgentDecisionEvent
 from app.models.build_run import BuildRun
 from app.models.deployment import Deployment
+from app.models.leader_dispatch_checkpoint import LeaderDispatchCheckpoint
 from app.models.plan import Plan
 from app.models.project import Project
 from app.models.task import Task, TaskRecipient
@@ -294,6 +295,21 @@ def fail_job(db: Session, job_id: str, worker_id: str, error: Exception) -> None
         payload={"attempt": job.attempt, "error": message, "retryable": retryable},
     )
     db.commit()
+    logger.warning(
+        "workflow job %s job_id=%s project=%s run=%s task=%s execution=%s "
+        "attempt=%s max_attempts=%s retryable=%s next_retry_at=%s error=%s",
+        "failed" if terminal else "retry_scheduled",
+        job.job_id,
+        job.project_id,
+        job.build_run_id,
+        job.task_id,
+        job.execution_id,
+        job.attempt,
+        job.max_attempts,
+        retryable,
+        None if terminal else job.available_at.isoformat() + "Z",
+        message,
+    )
 
 
 def recover_expired_jobs(db: Session) -> int:
@@ -615,6 +631,11 @@ def pause_jobs_for_run(
 ) -> int:
     """Release running leases while keeping jobs resumable behind a paused BuildRun."""
 
+    db.execute(
+        update(LeaderDispatchCheckpoint)
+        .where(LeaderDispatchCheckpoint.build_run_id == build_run_id)
+        .values(lease_owner=None, lease_expires_at=None)
+    )
     now = utc_now()
     jobs = list(
         db.scalars(
@@ -657,6 +678,11 @@ def pause_jobs_for_run(
 
 
 def cancel_jobs_for_run(db: Session, build_run_id: str, *, commit: bool = False) -> int:
+    db.execute(
+        update(LeaderDispatchCheckpoint)
+        .where(LeaderDispatchCheckpoint.build_run_id == build_run_id)
+        .values(lease_owner=None, lease_expires_at=None)
+    )
     jobs = list(
         db.scalars(
             select(WorkflowJob)

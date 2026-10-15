@@ -10,7 +10,7 @@ from app.generation.engineering.checkpoint import (
     append_activity,
     block_checkpoint,
     current_item,
-    repair_diagnostics,
+    record_check_failure,
 )
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.check_diagnostics import analyze_check_failure
@@ -98,6 +98,7 @@ def apply_check_outcome(
         round_number = int(rounds.get(work_item.id) or 0) + 1
         rounds[work_item.id] = round_number
         current["repair_rounds"] = rounds
+        record_check_failure(current, result, round_number=round_number)
         if repeated >= MAX_IDENTICAL_CHECK_FAILURES:
             block_checkpoint(
                 current,
@@ -123,12 +124,5 @@ def apply_check_outcome(
                 check_runtime_version=check_runtime_version,
             )
         else:
-            current["repair_context"] = {
-                "round": round_number,
-                "failed_check": result.model_dump(mode="json"),
-                "excerpt": excerpt,
-                "diagnostics": repair_diagnostics(failure),
-                "modified_files": list(current.get("modified_files") or []),
-            }
             current["active_file_plan"] = None
             current["active_plan_kind"] = None

@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -39,6 +40,7 @@ from app.schemas.project_message import ProjectMessageCreate
 from app.schemas.task import TaskCreate
 from app.schemas.test_report import QualityConclusion, TestReport
 from app.services import build_run as build_run_service
+from app.services import decision_event as decision_event_service
 from app.services import leader_next_action as leader_next_action_service
 from app.services import plan as plan_service
 from app.services import project as project_service
@@ -782,53 +784,136 @@ def dispatch_approved_requirements(
 ) -> Task:
     """Let Leader choose, then persist one validated next-role assignment."""
 
+    from app.services.leader_dispatch import (
+        claim_dispatch,
+        release_dispatch,
+        require_dispatch,
+        save_dispatch,
+    )
+    from app.telemetry.agent import agent_telemetry_scope
+
     project_service.get_user_project(db, user, project_id)
     _, _, source_plan, _ = load_approved_app_spec(db, project_id, run_id, approved_item_id)
+    run = build_run_service.get_user_build_run(db, user, project_id, run_id)
+    if run.stage != "pm":
+        # Approval replay after downstream work started must not re-enter Leader.
+        for recipient in (TaskRecipient.ARCHITECT, TaskRecipient.CODE_ENGINEER):
+            existing = find_dispatched_task(db, project_id, run_id, approved_item_id, recipient)
+            if existing is not None:
+                return existing
+        raise ConflictException("需求已进入其他阶段，请刷新进度")
     context = build_leader_context(
         db,
         project_id=project_id,
         run_id=run_id,
         target_message_id=source_plan.cause_message_id,
     )
-    from app.telemetry.agent import agent_telemetry_scope
-
-    with agent_telemetry_scope(
-        project_id=project_id,
-        build_run_id=run_id,
-        task_id=None,
-        execution_id=None,
-        role="Leader",
-        bind=db.get_bind(),
-    ):
-        outcome = leader_agent.lead_project_turn(
-            context,
-            instruction=(
-                "本轮只决定已批准 app_spec 的下一个角色。创建且分派一个任务。若命中 "
-                "external_integration、auth_or_permission、concurrency、persisted_contract_migration、"
-                "breaking_public_contract 任一标志，或新增超过 1 个相互关联业务实体，"
-                "交给 Architect；"
-                "仅当这些标志全为 false、最多影响 2 个既有业务模块且契约已明确时，才交给 "
-                "Code Engineer。任务 instructions 首句必须记录命中的 reason code。"
-                "任务只引用准确成果 "
-                f"{approved_item_id}，不得安排 Product Manager、Test Engineer 或未来任务。"
-            ),
-            max_turns=leader_agent.LEADER_SIMPLE_DISPATCH_TURNS,
-        )
-    path = _delivery_path_from_outcome(
-        outcome,
-        approved_item_id=approved_item_id,
-        cause_message_id=source_plan.cause_message_id,
+    instruction = (
+        "本轮只决定已批准 app_spec 的下一个角色。创建且分派一个任务。若命中 "
+        "external_integration、auth_or_permission、concurrency、persisted_contract_migration、"
+        "breaking_public_contract 任一标志，或新增超过 1 个相互关联业务实体，"
+        "交给 Architect；"
+        "仅当这些标志全为 false、最多影响 2 个既有业务模块且契约已明确时，才交给 "
+        "Code Engineer。任务 instructions 首句必须记录命中的 reason code。"
+        "任务只引用准确成果 "
+        f"{approved_item_id}，不得安排 Product Manager、Test Engineer 或未来任务。"
     )
-    if path == DeliveryPath.DIRECT:
-        return create_engineering_delivery_task(
+    saved, owner = claim_dispatch(
+        db,
+        user,
+        project_id,
+        run_id,
+        approved_item_id,
+        frozen_input={
+            "context": context.model_dump(mode="json"),
+            "instruction": instruction,
+            "max_turns": leader_agent.LEADER_SIMPLE_DISPATCH_TURNS,
+        },
+    )
+    decision_key = f"approval:{run_id}:{approved_item_id}"
+    frozen = saved.frozen_input
+    progress = dict(saved.tool_loop)
+
+    def save(progress_update: dict[str, Any]) -> None:
+        progress.clear()
+        progress.update(progress_update)
+        save_dispatch(db, user, project_id, run_id, approved_item_id, owner, progress)
+
+    try:
+        with agent_telemetry_scope(
+            project_id=project_id,
+            build_run_id=run_id,
+            task_id=None,
+            execution_id=None,
+            invocation_id=owner,
+            role="Leader",
+            bind=db.get_bind(),
+        ):
+            if progress.get("output"):
+                outcome = LeaderOutcome.model_validate(progress["output"])
+            else:
+                outcome = leader_agent.lead_project_turn(
+                    LeaderContext.model_validate(frozen["context"]),
+                    instruction=frozen["instruction"],
+                    max_turns=frozen["max_turns"],
+                    checkpoint=progress,
+                    on_checkpoint=save,
+                )
+        try:
+            path = _delivery_path_from_outcome(
+                outcome,
+                approved_item_id=approved_item_id,
+                cause_message_id=source_plan.cause_message_id,
+            )
+        except BusinessException as exc:
+            # A semantically invalid result is not a reusable dispatch decision.
+            # Keep spent turns/history and allow bounded correction on Continue.
+            corrected = {key: value for key, value in progress.items() if key != "output"}
+            corrected["history"] = [
+                *corrected.get("history", []),
+                {
+                    "role": "user",
+                    "content": f"分派结果未被应用：{exc}。请修正后重新提交。",
+                },
+            ]
+            save(corrected)
+            raise
+        # Persist the validated result before task/workspace side effects, including
+        # alternate agent implementations which do not call the checkpoint callback.
+        save({**progress, "output": outcome.model_dump(mode="json")})
+        require_dispatch(db, user, project_id, run_id, approved_item_id, owner)
+        decision_event_service.record_decision(
             db,
-            user,
-            project_id,
-            run_id,
-            approved_item_id,
-            allow_direct=True,
+            decision_key=decision_key,
+            project_id=project_id,
+            build_run_id=run_id,
+            action=leader_next_action_service.next_action_from_leader_outcome(outcome),
+            category=ProjectMessageCategory.PRODUCT_CHANGE.value,
         )
-    return create_architecture_task(db, user, project_id, run_id, approved_item_id)
+        require_dispatch(db, user, project_id, run_id, approved_item_id, owner)
+        if path == DeliveryPath.DIRECT:
+            task = create_engineering_delivery_task(
+                db,
+                user,
+                project_id,
+                run_id,
+                approved_item_id,
+                allow_direct=True,
+            )
+        else:
+            task = create_architecture_task(db, user, project_id, run_id, approved_item_id)
+        decision_event_service.mark_applied(db, decision_key)
+    except Exception as exc:
+        db.rollback()
+        try:
+            require_dispatch(db, user, project_id, run_id, approved_item_id, owner)
+            decision_event_service.mark_failed(db, decision_key, exc)
+        finally:
+            db.rollback()
+            release_dispatch(db, approved_item_id, owner)
+        raise
+    release_dispatch(db, approved_item_id, owner)
+    return task
 
 
 def dispatch_completed_design(

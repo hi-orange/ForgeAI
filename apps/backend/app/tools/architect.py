@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.core.exceptions import BusinessException, ConflictException
+from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.schemas.agent_action import (
     ToolCall,
     ToolDefinition,
@@ -315,7 +315,7 @@ def execute_architect_tool(
             ),
             None,
         )
-    except (BusinessException, ConflictException, OSError, ValueError) as exc:
+    except (BusinessException, ConflictException, NotFoundException, OSError, ValueError) as exc:
         return (
             ToolExecutionResult(
                 tool_call_id=call.id,

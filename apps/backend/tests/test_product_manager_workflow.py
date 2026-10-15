@@ -133,7 +133,9 @@ class ProductManagerWorkflowFixture(unittest.TestCase):
             )
         )
 
-        def route_approved(context, *, instruction, max_turns=None):
+        def route_approved(
+            context, *, instruction, max_turns=None, checkpoint=None, on_checkpoint=None
+        ):
             del instruction, max_turns
             approved_payload = next(
                 task.result["payload"]

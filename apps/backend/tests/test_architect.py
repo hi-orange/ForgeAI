@@ -409,3 +409,23 @@ class ArchitectTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MissingArchitectPathTests(unittest.TestCase):
+    def test_missing_file_is_feedback_and_next_path_can_succeed(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "exists.txt").write_text("evidence", encoding="utf-8")
+            state = ArchitectToolState(app_spec=valid_spec(), workspace_root=root)
+            missing, output = execute_architect_tool(
+                ToolCall(id="missing", name="editor_read", arguments={"target": "absent.txt"}),
+                state,
+            )
+            self.assertFalse(missing.ok)
+            self.assertEqual(missing.error_code, "TOOL_REJECTED")
+            self.assertIsNone(output)
+            present, _ = execute_architect_tool(
+                ToolCall(id="present", name="editor_read", arguments={"target": "exists.txt"}),
+                state,
+            )
+            self.assertTrue(present.ok)

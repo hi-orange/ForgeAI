@@ -377,14 +377,13 @@ def continue_requirements(db: Session, user: User, project_id: int) -> Requireme
         return continue_engineering(db, user, project_id, status.run_id)
 
     if status.state == "ready_for_delivery" and status.result:
-        task = leader_service.dispatch_approved_requirements(
+        _dispatch_approved_delivery(
             db,
             user,
             project_id,
             status.run_id,
             status.result.configuration_item_id,
         )
-        start_dispatched_delivery(db, user, project_id, status.run_id, task)
         return get_requirements_status(db, user, project_id)
 
     if status.state in CONTINUE_PM_STATES and status.message_id:
@@ -402,6 +401,44 @@ def continue_requirements(db: Session, user: User, project_id: int) -> Requireme
     raise BusinessException("当前没有可继续的构建步骤")
 
 
+DISPATCH_ERROR_PREFIX = "计划已批准，但自动分派下一步失败："
+
+
+def _dispatch_approved_delivery(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str,
+    approved_id: str,
+) -> None:
+    try:
+        task = leader_service.dispatch_approved_requirements(
+            db, user, project_id, run_id, approved_id
+        )
+        start_dispatched_delivery(db, user, project_id, run_id, task)
+    except Exception as exc:
+        db.rollback()
+        # An overlapping/stale request must not overwrite the owner's current status.
+        if not isinstance(exc, ConflictException):
+            run = lock_run(db, user, project_id, run_id)
+            if (
+                run.status == "running"
+                and run.stage == "pm"
+                and run.active_slot == 1
+                and run.paused_at is None
+            ):
+                detail = str(exc).strip() or exc.__class__.__name__
+                run.error = f"{DISPATCH_ERROR_PREFIX}{detail[:400]}"
+                db.commit()
+            else:
+                db.rollback()
+        raise
+    run = lock_run(db, user, project_id, run_id)
+    if run.status == "running" and (run.error or "").startswith(DISPATCH_ERROR_PREFIX):
+        run.error = None
+    db.commit()
+
+
 def approve_requirement_plan(
     db: Session,
     user: User,
@@ -414,17 +451,10 @@ def approve_requirement_plan(
 
     approved_id = persist_approved_requirements(db, user, project_id, run_id, item_id, approval)
     try:
-        task = leader_service.dispatch_approved_requirements(
-            db, user, project_id, run_id, approved_id
-        )
-        start_dispatched_delivery(db, user, project_id, run_id, task)
-    except Exception as exc:
-        # Approval is already committed. Keep the approved checkpoint recoverable so the
-        # client can continue/dispatch without treating the whole approve call as lost.
+        _dispatch_approved_delivery(db, user, project_id, run_id, approved_id)
+    except Exception:
+        # Approval remains committed; GET must retain the dispatch failure too.
         logger.exception("dispatch after approval failed project=%s run=%s", project_id, run_id)
-        # A failed flush/commit leaves SQLAlchemy's Session unusable until it is rolled back.
-        # The approval checkpoint was committed before dispatch, so rolling back here only
-        # discards the incomplete dispatch attempt and lets us return a recoverable status.
         db.rollback()
         status = get_requirements_status(db, user, project_id)
         if status.state in {
@@ -436,8 +466,6 @@ def approve_requirement_plan(
             "quality_pending",
             "quality_running",
         }:
-            detail = str(exc).strip() or exc.__class__.__name__
-            status.error = f"计划已批准，但自动分派下一步失败：{detail[:400]}"
             return status
         raise
     return get_requirements_status(db, user, project_id)
@@ -923,6 +951,8 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
     if run is None:
         return _attach_workspace_status(db, result)
     result.run_id = run.run_id
+    if run.stage == "pm" and (run.error or "").startswith(DISPATCH_ERROR_PREFIX):
+        result.error = run.error
     result.stage = BuildRunStage(run.stage) if run.stage else None
     plan = db.scalar(
         select(Plan).where(Plan.build_run_id == run.run_id).order_by(Plan.version.desc()).limit(1)

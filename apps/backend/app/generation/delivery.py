@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from app.core.exceptions import ConflictException
 from app.schemas.app_spec import AppSpec, RequirementId
+from app.schemas.engineering_diagnostic import EngineeringDiagnostic
 from app.schemas.system_design import SystemDesign
 from app.schemas.test_report import TestReport, VerificationStatus
 
@@ -117,46 +118,115 @@ def plan_quality_repair(spec: AppSpec, report: TestReport) -> list[WorkItem]:
     return items
 
 
+class DeliveryPlanError(ConflictException):
+    """All currently detectable violations, with an actionable location."""
+
+    def __init__(self, message: str, issues: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.diagnostic = EngineeringDiagnostic(
+            category="plan",
+            disposition="repair",
+            code="INVALID_DELIVERY_PLAN",
+            summary=message,
+            issues=issues,
+            verification=(
+                "修正完整 items 后重新调用 update_delivery_plan；保留全部获批需求与已完成项。"
+            ),
+        )
+
+
 def validate_delivery_plan(
     spec: AppSpec, items: list[WorkItem], design: SystemDesign | None = None
 ) -> None:
     feature_ids = {feature.id for feature in spec.features}
     if not feature_ids:
-        raise ConflictException("获批需求没有可实现的功能")
+        raise DeliveryPlanError("获批需求没有可实现的功能", [{"code": "NO_APPROVED_FEATURES"}])
     if not items or len(items) > 100:
-        raise ConflictException("工程计划必须包含 1 至 100 项")
+        raise DeliveryPlanError(
+            "工程计划必须包含 1 至 100 项", [{"code": "ITEM_COUNT", "actual": len(items)}]
+        )
     ids = [item.id for item in items]
     if len(ids) != len(set(ids)):
-        raise ConflictException("工作单元 id 重复")
+        raise DeliveryPlanError(
+            "工作单元 id 重复",
+            [
+                {"code": "DUPLICATE_ID", "work_item_id": key}
+                for key in sorted(set(ids))
+                if ids.count(key) > 1
+            ],
+        )
+    issues: list[dict[str, Any]] = []
     for item in items:
-        if not set(item.requirement_ids) <= feature_ids:
-            raise ConflictException("工程计划不能引用未获批功能")
-        if item.id in item.depends_on or not set(item.depends_on) <= set(ids):
-            raise ConflictException("工程依赖不能引用自身或不存在的任务")
+        unknown = set(item.requirement_ids) - feature_ids
+        invalid = set(item.depends_on) - (set(ids) - {item.id})
+        if unknown:
+            issues.append(
+                {
+                    "code": "UNAPPROVED_REQUIREMENT",
+                    "work_item_id": item.id,
+                    "field": "requirement_ids",
+                    "actual": sorted(unknown),
+                    "expected": "只能引用获批功能",
+                }
+            )
+        if invalid:
+            issues.append(
+                {
+                    "code": "INVALID_DEPENDENCY_TARGET",
+                    "work_item_id": item.id,
+                    "field": "depends_on",
+                    "actual": sorted(invalid),
+                    "expected": "引用存在且不是自身的工作项",
+                }
+            )
+    if issues:
+        raise DeliveryPlanError("工程计划引用了未获批功能、自身或不存在的任务", issues)
     ancestors: dict[str, set[str]] = {}
     remaining = {item.id: set(item.depends_on) for item in items}
     while remaining:
         ready = [key for key, deps in remaining.items() if deps <= ancestors.keys()]
         if not ready:
-            raise ConflictException("工程计划存在循环依赖")
+            raise DeliveryPlanError(
+                "工程计划存在循环依赖",
+                [
+                    {
+                        "code": "CYCLIC_DEPENDENCY",
+                        "work_item_id": key,
+                        "unresolved_dependencies": sorted(deps - ancestors.keys()),
+                        "expected": "检查这些未就绪节点的依赖方向并消除环；节点也可能仅被环阻塞",
+                    }
+                    for key, deps in remaining.items()
+                ],
+            )
         for key in ready:
             deps = remaining.pop(key)
             ancestors[key] = deps | {parent for dep in deps for parent in ancestors[dep]}
-    covered = {
-        req_id for item in items if item.kind == "feature" for req_id in item.requirement_ids
-    }
+    covered = {req for item in items if item.kind == "feature" for req in item.requirement_ids}
     if covered != feature_ids:
-        raise ConflictException("工程计划必须以功能任务覆盖全部获批功能，不能只交付基础设施")
+        issues.append(
+            {
+                "code": "MISSING_FEATURE_COVERAGE",
+                "missing_requirement_ids": sorted(feature_ids - covered),
+                "expected": "工程计划必须以功能任务覆盖全部获批功能，不能只交付基础设施",
+            }
+        )
     visual = {item.id for item in items if item.kind == "visual_foundation"}
     if not visual:
-        raise ConflictException("先规划视觉基础的建立或验证复用，再实现业务界面")
+        issues.append({"code": "MISSING_VISUAL_FOUNDATION", "expected": "先建立或验证复用视觉基础"})
     for item in items:
         if (
             item.kind == "feature"
             and item.status != "completed"
             and not (visual & ancestors[item.id])
         ):
-            raise ConflictException("功能任务必须依赖视觉基础；已有主题也须先验证复用")
+            issues.append(
+                {
+                    "code": "MISSING_VISUAL_DEPENDENCY",
+                    "work_item_id": item.id,
+                    "depends_on": item.depends_on,
+                    "expected": "功能任务必须依赖视觉基础",
+                }
+            )
     if design is not None:
         design.validate_requirement_dependencies(spec)
         by_id = {item.id: item for item in items}
@@ -173,9 +243,29 @@ def validate_delivery_plan(
                     and dependency.prerequisite_requirement_id in by_id[parent].requirement_ids
                     for parent in ancestors[item.id]
                 ):
-                    raise ConflictException(
-                        "工程计划缺少冻结设计要求的前置依赖：" + dependency.reason
+                    issues.append(
+                        {
+                            "code": "MISSING_REQUIREMENT_DEPENDENCY",
+                            "work_item_id": item.id,
+                            "prerequisite_requirement_id": dependency.prerequisite_requirement_id,
+                            "dependent_requirement_id": dependency.dependent_requirement_id,
+                            "depends_on": item.depends_on,
+                            "prerequisite_in_same_item": dependency.prerequisite_requirement_id
+                            in item.requirement_ids,
+                            "reason": dependency.reason,
+                            "expected": (
+                                "前置需求必须由非视觉基础的祖先工作项实现；同项包含不计作前置。"
+                            ),
+                            "suggested_action": (
+                                "若前置与后续在同项，拆分实现并建立 depends_on；"
+                                "否则补齐实际前置任务依赖。不要只添加需求标签。"
+                            ),
+                        }
                     )
+    if issues:
+        raise DeliveryPlanError(
+            "工程计划校验失败：检查全部 conflicts 中的覆盖、视觉基础及前置依赖", issues
+        )
 
 
 def replace_delivery_plan(
@@ -197,7 +287,18 @@ def replace_delivery_plan(
                     replacement.model_dump(exclude={"status", "summary"})
                 )
             ):
-                raise ConflictException("调整计划不能删除或改写已完成任务")
+                raise DeliveryPlanError(
+                    "调整计划不能删除或改写已完成任务",
+                    [
+                        {
+                            "code": "COMPLETED_ITEM_CHANGED",
+                            "work_item_id": old.id,
+                            "expected": PlannedWorkItem.model_validate(
+                                old.model_dump(exclude={"status", "summary"})
+                            ).model_dump(mode="json"),
+                        }
+                    ],
+                )
             replacement.status = old.status
             replacement.summary = old.summary
     validate_delivery_plan(spec, items, design)

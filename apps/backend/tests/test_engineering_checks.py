@@ -283,3 +283,75 @@ class EngineeringCheckTests(unittest.TestCase):
         )
         for item in visual.data["screenshots"]:
             self.assertTrue((self.root / item["path"]).is_file())
+
+    @unittest.skipUnless(
+        os.getenv("FORGEAI_TEST_DOCKER") == "1", "requires built check image and Docker"
+    )
+    def test_real_cross_file_route_and_migration_failures_reach_repair_context(self):
+        from app.generation.engineering.checkpoint import new_checkpoint
+        from app.orchestration.code_engineer import _EngineeringNodes
+
+        checkpoint = new_checkpoint()
+        caller = self.root / "frontend/src/regression.tsx"
+        caller.write_text(
+            "import { Link } from '@tanstack/react-router'\n"
+            'export function RegressionLink() { return <Link to="/regression">Open</Link> }\n',
+            encoding="utf-8",
+        )
+        failed = run_check(self.root, check_id="quick")
+        self.assertFalse(failed.ok, failed.model_dump())
+        _EngineeringNodes._remember_check(checkpoint, "quick", failed)
+        self.assertEqual(
+            checkpoint["diagnostic_state"]["check:quick"]["diagnostic"]["category"], "build"
+        )
+        self.assertTrue(
+            any(d["code"] == "TS2322" for d in checkpoint["repair_context"]["diagnostics"])
+        )
+        router = self.root / "frontend/src/router.tsx"
+        source = router.read_text(encoding="utf-8")
+        source = source.replace(
+            "const routeTree = rootRoute.addChildren([indexRoute])",
+            "const regressionRoute = createRoute({ getParentRoute: () => rootRoute, "
+            "path: '/regression', component: () => <div>Regression</div> })\n"
+            "const routeTree = rootRoute.addChildren([indexRoute, regressionRoute])",
+        )
+        router.write_text(source, encoding="utf-8")
+        passed = run_check(self.root, check_id="quick")
+        self.assertTrue(passed.ok, passed.model_dump())
+        _EngineeringNodes._remember_check(checkpoint, "quick", passed)
+        self.assertEqual(checkpoint["diagnostic_state"]["check:quick"]["status"], "resolved")
+        self.assertNotEqual(failed.data["source_hash"], passed.data["source_hash"])
+        self.assertIn('to="/regression"', caller.read_text(encoding="utf-8"))
+
+        model = self.root / "backend/app/models/meta.py"
+        model.write_text(
+            model.read_text(encoding="utf-8").replace(
+                "mapped_column(String(255), nullable=False)",
+                "mapped_column(String(255), nullable=False, index=True, unique=True)",
+            ),
+            encoding="utf-8",
+        )
+        failed = run_check(self.root, check_id="database")
+        self.assertFalse(failed.ok, failed.model_dump())
+        _EngineeringNodes._remember_check(checkpoint, "database", failed)
+        self.assertEqual(
+            checkpoint["diagnostic_state"]["check:database"]["diagnostic"]["category"], "database"
+        )
+        self.assertIn(
+            "ix_app_meta_value", checkpoint["repair_context"]["failed_check"]["data"]["output"]
+        )
+        migration = self.root / "backend/alembic/versions/0002_value_index.py"
+        migration.write_text(
+            'from alembic import op\nrevision = "0002_value_index"\n'
+            'down_revision = "0001_create_app_meta"\n'
+            "branch_labels = None\ndepends_on = None\n"
+            "def upgrade():\n"
+            '    op.create_index("ix_app_meta_value", "app_meta", ["value"], unique=True)\n'
+            'def downgrade():\n    op.drop_index("ix_app_meta_value", table_name="app_meta")\n',
+            encoding="utf-8",
+        )
+        passed = run_check(self.root, check_id="database")
+        self.assertTrue(passed.ok, passed.model_dump())
+        _EngineeringNodes._remember_check(checkpoint, "database", passed)
+        self.assertEqual(checkpoint["diagnostic_state"]["check:database"]["status"], "resolved")
+        self.assertNotEqual(failed.data["source_hash"], passed.data["source_hash"])

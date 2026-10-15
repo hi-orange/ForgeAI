@@ -24,11 +24,24 @@ class AgentTelemetryContext:
     execution_id: str | None
     role: str
     bind: Engine | Connection
+    invocation_id: str | None = None
 
 
 _context: ContextVar[AgentTelemetryContext | None] = ContextVar(
     "forgeai_agent_telemetry", default=None
 )
+
+
+class AgentLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        context = _context.get()
+        if context is not None:
+            record.msg = (
+                f"{record.msg} project={context.project_id} run={context.build_run_id} "
+                f"task={context.task_id} execution={context.execution_id} role={context.role} "
+                f"invocation={context.invocation_id}"
+            )
+        return True
 
 
 @contextmanager
@@ -40,9 +53,12 @@ def agent_telemetry_scope(
     execution_id: str | None,
     role: str,
     bind: Engine | Connection,
+    invocation_id: str | None = None,
 ):
     token = _context.set(
-        AgentTelemetryContext(project_id, build_run_id, task_id, execution_id, role, bind)
+        AgentTelemetryContext(
+            project_id, build_run_id, task_id, execution_id, role, bind, invocation_id
+        )
     )
     try:
         yield

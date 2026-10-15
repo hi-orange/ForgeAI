@@ -84,3 +84,60 @@ class CheckOutcomeTests(unittest.TestCase):
         with self.assertRaisesRegex(ConflictException, "hash"):
             self.apply(self.result(ok=True, source_hash=None))
         self.assertEqual(self.state, before)
+
+    def test_terminal_stop_retains_latest_check_not_previous_round(self):
+        for index in range(4):
+            result = self.result(source_hash=f"source-{index}")
+            result.data["output"] = f"src/file.ts(1,1): error TS2322: failure {index}"
+            self.apply(result)
+        self.assertEqual(self.state["blocked_reason_code"], "REPAIR_BUDGET_EXHAUSTED")
+        self.assertIn("failure 3", self.state["repair_context"]["excerpt"])
+        self.assertEqual(self.state["repair_context"]["round"], 4)
+
+    def test_manual_retry_preserves_newer_explicit_check_over_older_completion(self):
+        from app.generation.engineering.checkpoint import (
+            prepare_manual_repair_retry,
+            record_check_failure,
+        )
+
+        old = self.result()
+        self.state["plan_history"] = [{"check": old.model_dump(mode="json")}]
+        recent = self.result(source_hash="new-source")
+        recent.data["output"] = "FAILED: New upgrade operations detected: unique index differs"
+        record_check_failure(self.state, recent)
+        self.state.update(
+            outcome="blocked", blocked_reason="stopped", blocked_reason_code="NO_SOURCE_PROGRESS"
+        )
+        retried = prepare_manual_repair_retry({"checkpoint": self.state})
+        self.assertEqual(
+            retried["checkpoint"]["repair_context"]["failed_check"], recent.model_dump(mode="json")
+        )
+        self.assertIn(
+            "unique index", retried["checkpoint"]["repair_context"]["diagnostics"][0]["message"]
+        )
+
+    def test_recovery_does_not_resurrect_error_before_a_successful_check(self):
+        from app.generation.engineering.checkpoint import prepare_manual_repair_retry
+
+        self.state["plan_history"] = [
+            {"check": self.result().model_dump(mode="json")},
+            {"check": self.result(ok=True).model_dump(mode="json")},
+        ]
+        self.state.update(
+            outcome="blocked", blocked_reason="stopped", blocked_reason_code="NO_SOURCE_PROGRESS"
+        )
+        retried = prepare_manual_repair_retry({"checkpoint": self.state})
+        self.assertIsNone(retried["checkpoint"]["repair_context"])
+
+    def test_passing_same_check_clears_obsolete_diagnostic_without_completing_work(self):
+        from app.orchestration.code_engineer import _EngineeringNodes
+
+        _EngineeringNodes._remember_check(self.state, "database", self.result())
+        _EngineeringNodes._remember_check(self.state, "quick", self.result(ok=True))
+        self.assertIsNotNone(self.state["repair_context"])
+        _EngineeringNodes._remember_check(
+            self.state, "database", self.result(ok=True, source_hash="fixed")
+        )
+        self.assertIsNone(self.state["repair_context"])
+        self.assertEqual(self.state["work_items"][0]["status"], "pending")
+        self.assertEqual(self.state["outcome"], "running")

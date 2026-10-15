@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from collections.abc import Callable, Collection
 from copy import deepcopy
 from typing import Any, Protocol
@@ -16,6 +18,27 @@ from app.schemas.agent_action import (
     ToolDefinition,
     ToolExecutionResult,
 )
+from app.telemetry.agent import AgentLogFilter
+
+logger = logging.getLogger("forgeai.tools")
+logger.addFilter(AgentLogFilter())
+
+
+def log_tool_result(
+    role_name: str, turn: int, call: ToolCall, observation: ToolExecutionResult
+) -> None:
+    """Correlate tool outcomes without logging source bodies or raw arguments."""
+    logger.info(
+        "tool result role=%s turn=%s tool=%s call_id=%s ok=%s error_code=%s args_hash=%s",
+        role_name,
+        turn,
+        call.name,
+        call.id,
+        observation.ok,
+        observation.error_code,
+        hashlib.sha256(json.dumps(call.arguments, sort_keys=True).encode()).hexdigest()[:16],
+    )
+
 
 MAX_TOOL_RESULT_CHARS = 20_000
 
@@ -160,6 +183,7 @@ def run_bounded_tool_loop[AgentOutputT](
         output = None
         for call in result.tool_calls[:count]:
             observation, output = execute_tool(call)
+            log_tool_result(role_name, turn + 1, call, observation)
             if on_observation is not None:
                 on_observation(observation)
             observations.append(observation)

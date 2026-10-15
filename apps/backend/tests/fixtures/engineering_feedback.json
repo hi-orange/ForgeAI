@@ -1,0 +1,901 @@
+{
+  "spec": {
+    "goal": "做一个招聘网站：让求职者能浏览、搜索职位并投递申请，让招聘方（企业）能发布职位并查看收到的申请，从而在同一站点内完成「找工作」与「招人」的闭环。",
+    "target_users": [
+      "求职者：浏览职位、投递申请、跟踪自己的申请状态",
+      "招聘方/企业用户：发布与管理职位、查看并处理收到的申请",
+      "（默认）站点访客：未登录时也能浏览和搜索职位"
+    ],
+    "features": [
+      {
+        "id": "feat_job_browse",
+        "text": "职位浏览与搜索：访客无需登录即可按关键词、城市、职位类型筛选职位列表，列表显示职位名称、公司、地点、薪资范围与发布时间，并支持分页。"
+      },
+      {
+        "id": "feat_job_detail",
+        "text": "职位详情页：展示职位描述、任职要求、薪资、工作地点、公司简介与发布方信息，并提供「投递」入口。"
+      },
+      {
+        "id": "feat_auth",
+        "text": "账号注册与登录：求职者与招聘方分别注册登录，登录状态在刷新后保持，未登录用户执行投递或发布时被引导登录。"
+      },
+      {
+        "id": "feat_resume_profile",
+        "text": "求职者简历资料：填写并保存姓名、联系方式、期望职位、期望城市、工作经历与技能，可随时编辑，刷新后仍可读取。"
+      },
+      {
+        "id": "feat_apply",
+        "text": "投递职位：在职位详情页提交申请（可附一段求职留言），提交后写入后端并防止对同一职位重复投递。"
+      },
+      {
+        "id": "feat_my_applications",
+        "text": "我的投递记录：求职者查看自己投递过的职位列表及每条申请的状态（已投递/已查看/已拒绝/已录用），刷新后仍可读取。"
+      },
+      {
+        "id": "feat_company_job_manage",
+        "text": "招聘方职位管理：招聘方创建、编辑、上下架自己发布的职位，只能管理本企业发布的职位。"
+      },
+      {
+        "id": "feat_application_inbox",
+        "text": "申请收件箱：招聘方按职位查看收到的申请，看到申请人简历摘要与留言，并更新申请状态。"
+      },
+      {
+        "id": "feat_seed_data",
+        "text": "初始可浏览内容：站点预置一批可复现的开发种子数据（示例公司、职位、招聘方账号），使首次打开就有真实可搜索的职位列表，而非前端写死的假数据。"
+      }
+    ],
+    "data_requirements": [],
+    "interface_requirements": [],
+    "constraints": [],
+    "acceptance_criteria": [
+      {
+        "id": "ac_browse",
+        "text": "当访客在职位列表输入关键词或选择城市筛选时，应调用后端接口返回匹配职位并更新列表与分页结果。",
+        "source_ids": [
+          "feat_job_browse"
+        ]
+      },
+      {
+        "id": "ac_detail",
+        "text": "当访客从列表点击任一职位时，应打开该职位详情页并显示其描述、要求、薪资与公司信息。",
+        "source_ids": [
+          "feat_job_detail"
+        ]
+      },
+      {
+        "id": "ac_auth",
+        "text": "当用户注册或登录成功后刷新页面，应仍保持登录状态；未登录用户点击投递时应被引导至登录。",
+        "source_ids": [
+          "feat_auth"
+        ]
+      },
+      {
+        "id": "ac_resume",
+        "text": "当求职者保存简历资料后刷新页面，应能重新读取到已保存的姓名、联系方式与期望职位。",
+        "source_ids": [
+          "feat_resume_profile"
+        ]
+      },
+      {
+        "id": "ac_apply",
+        "text": "当求职者提交投递后，应收到成功反馈，该申请出现在「我的投递」中，且对同一职位再次投递被拒绝并给出提示。",
+        "source_ids": [
+          "feat_apply"
+        ]
+      },
+      {
+        "id": "ac_my_applications",
+        "text": "当求职者打开「我的投递」时，应列出其全部申请及当前状态，刷新后列表与状态保持一致。",
+        "source_ids": [
+          "feat_my_applications"
+        ]
+      },
+      {
+        "id": "ac_company_manage",
+        "text": "当招聘方创建或下架职位后，该职位应出现在求职者端列表或从列表消失；招聘方无法编辑其他企业的职位。",
+        "source_ids": [
+          "feat_company_job_manage"
+        ]
+      },
+      {
+        "id": "ac_inbox",
+        "text": "当招聘方在申请收件箱把某条申请状态改为「已查看」或「已拒绝」后，求职者端「我的投递」应显示更新后的状态。",
+        "source_ids": [
+          "feat_application_inbox"
+        ]
+      },
+      {
+        "id": "ac_seed",
+        "text": "当首次打开站点时，职位列表应展示来自后端种子数据的示例职位，且这些职位可被搜索与投递。",
+        "source_ids": [
+          "feat_seed_data"
+        ]
+      }
+    ],
+    "open_questions": []
+  },
+  "dependencies": [
+    {
+      "prerequisite_requirement_id": "feat_auth",
+      "dependent_requirement_id": "feat_resume_profile",
+      "reason": "简历属于登录用户，必须先有账号注册登录与 get_current_user 依赖，才能确定简历归属并做鉴权。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_auth",
+      "dependent_requirement_id": "feat_apply",
+      "reason": "投递需识别求职者身份并防止重复投递，依赖认证与角色校验契约。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_auth",
+      "dependent_requirement_id": "feat_my_applications",
+      "reason": "「我的投递」按当前登录用户过滤，依赖会话与用户解析。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_auth",
+      "dependent_requirement_id": "feat_company_job_manage",
+      "reason": "招聘方职位管理需登录并解析其 company_id 才能做所有权校验。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_auth",
+      "dependent_requirement_id": "feat_application_inbox",
+      "reason": "收件箱需按招聘方所属企业过滤申请，依赖认证与企业归属。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_job_browse",
+      "dependent_requirement_id": "feat_job_detail",
+      "reason": "详情页由列表点击进入，需先有职位查询与 job_id 契约。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_job_detail",
+      "dependent_requirement_id": "feat_apply",
+      "reason": "投递入口位于详情页，依赖职位详情接口与职位存在性校验。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_company_job_manage",
+      "dependent_requirement_id": "feat_application_inbox",
+      "reason": "收件箱按职位组织申请，需先有招聘方职位实体与自有职位列表契约。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_apply",
+      "dependent_requirement_id": "feat_my_applications",
+      "reason": "「我的投递」展示投递记录，依赖 Application 实体与投递写入契约。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_apply",
+      "dependent_requirement_id": "feat_application_inbox",
+      "reason": "收件箱读取的是投递产生的申请记录，依赖 Application 数据结构与状态字段。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_resume_profile",
+      "dependent_requirement_id": "feat_application_inbox",
+      "reason": "收件箱需展示申请人简历摘要，依赖 Resume 实体与读取契约。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_seed_data",
+      "dependent_requirement_id": "feat_job_browse",
+      "reason": "首次打开即有可搜索职位列表，依赖后端种子数据先行写入示例职位。"
+    },
+    {
+      "prerequisite_requirement_id": "feat_seed_data",
+      "dependent_requirement_id": "feat_apply",
+      "reason": "种子职位需可被投递，依赖种子数据提供真实 published 职位与示例账号。"
+    }
+  ],
+  "original": [
+    {
+      "id": "visual_foundation",
+      "title": "视觉基础：复用模板语义色/字体/间距，建立共享 UI 组件与状态样式",
+      "kind": "visual_foundation",
+      "requirement_ids": [
+        "feat_job_browse",
+        "feat_job_detail",
+        "feat_auth",
+        "feat_resume_profile",
+        "feat_apply",
+        "feat_my_applications",
+        "feat_company_job_manage",
+        "feat_application_inbox"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "frontend/src/index.css 保留模板语义色变量（--color-primary/--color-accent/--color-muted 等）并补充招聘站点所需的层级与状态样式",
+        "新增共享 UI 组件（按钮/输入/卡片/标签/分页/状态提示）供各页面复用，不引入外部图片依赖",
+        "加载态、空数据态、错误态有统一可复用呈现"
+      ],
+      "deliverables": [
+        "frontend/src/index.css（语义色与层级样式）",
+        "frontend/src/components/ui/*（共享组件）",
+        "frontend/src/components/states.tsx（加载/空/错误态）"
+      ]
+    },
+    {
+      "id": "backend_foundation",
+      "title": "后端基础：数据模型、Alembic 迁移、统一响应与错误处理、JWT 认证依赖",
+      "kind": "foundation",
+      "requirement_ids": [
+        "feat_auth",
+        "feat_seed_data"
+      ],
+      "depends_on": [
+        "visual_foundation"
+      ],
+      "acceptance": [
+        "backend/app/models 定义 User/Company/Job/Resume/Application，含 (job_id, applicant_id) 唯一约束与 status 枚举",
+        "Alembic 迁移 0002 创建全部业务表，本地 SQLite 可 upgrade head 成功",
+        "POST /api/v1/auth/register、/auth/login、GET /api/v1/auth/me 可用，密码 bcrypt 哈希，JWT 7 天有效",
+        "get_current_user 返回 401、require_role 返回 403，统一响应体 {code,msg,data}"
+      ],
+      "deliverables": [
+        "backend/app/models/{user,company,job,resume,application}.py",
+        "backend/alembic/versions/0002_*.py",
+        "backend/app/core/security.py",
+        "backend/app/api/deps.py",
+        "backend/app/api/auth.py",
+        "backend/app/schemas/auth.py"
+      ]
+    },
+    {
+      "id": "backend_jobs_public",
+      "title": "后端公开职位接口：列表搜索分页与详情",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_browse",
+        "feat_job_detail"
+      ],
+      "depends_on": [
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "GET /api/v1/jobs 支持 q/city/job_type/page/page_size，仅返回 status=published，响应含 items/total/page/page_size/total_pages",
+        "GET /api/v1/jobs/{id} 返回描述、要求、薪资、地点、公司简介与发布方信息，未发布或不存在返回 404"
+      ],
+      "deliverables": [
+        "backend/app/api/jobs.py",
+        "backend/app/schemas/job.py",
+        "backend/app/services/job_service.py"
+      ]
+    },
+    {
+      "id": "backend_seed",
+      "title": "后端幂等种子数据：示例公司、招聘方/求职者账号与 12+ 职位",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_seed_data"
+      ],
+      "depends_on": [
+        "backend_jobs_public"
+      ],
+      "acceptance": [
+        "应用启动时幂等写入示例公司、招聘方账号、求职者账号与 12+ 条 published 职位，重复启动不产生重复记录",
+        "种子职位可通过 GET /api/v1/jobs 搜索到"
+      ],
+      "deliverables": [
+        "backend/app/seed.py",
+        "backend/app/main.py（启动钩子）"
+      ]
+    },
+    {
+      "id": "backend_recruiter_jobs",
+      "title": "后端招聘方职位管理：创建/编辑/上下架与自有职位列表",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_company_job_manage"
+      ],
+      "depends_on": [
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "POST /api/v1/recruiter/jobs 创建本企业职位，非 recruiter 返回 403",
+        "PUT /api/v1/recruiter/jobs/{id} 可编辑与上下架，跨企业返回 403，不存在返回 404",
+        "GET /api/v1/recruiter/jobs 返回本企业全部职位（含 draft/closed）与 application_count"
+      ],
+      "deliverables": [
+        "backend/app/api/recruiter_jobs.py",
+        "backend/app/schemas/job.py（招聘方请求模型）"
+      ]
+    },
+    {
+      "id": "backend_resume",
+      "title": "后端简历资料：读取与 upsert 保存",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_resume_profile"
+      ],
+      "depends_on": [
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "GET /api/v1/me/resume 返回当前求职者简历或 null",
+        "PUT /api/v1/me/resume upsert 姓名/联系方式/期望职位/期望城市/工作经历/技能，非 seeker 返回 403"
+      ],
+      "deliverables": [
+        "backend/app/api/resume.py",
+        "backend/app/schemas/resume.py"
+      ]
+    },
+    {
+      "id": "backend_applications",
+      "title": "后端投递与我的投递：创建申请、重复投递 409、求职者申请列表",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_apply",
+        "feat_my_applications"
+      ],
+      "depends_on": [
+        "backend_jobs_public",
+        "backend_resume"
+      ],
+      "acceptance": [
+        "POST /api/v1/jobs/{id}/applications 写入 status=submitted 申请，未登录 401、非 seeker 403、职位未发布 404",
+        "同一职位重复投递返回 409（数据库唯一约束兜底 IntegrityError）",
+        "GET /api/v1/me/applications 返回当前求职者全部申请及状态与职位摘要，分页结构统一"
+      ],
+      "deliverables": [
+        "backend/app/api/applications.py",
+        "backend/app/schemas/application.py"
+      ]
+    },
+    {
+      "id": "backend_inbox",
+      "title": "后端申请收件箱：按职位查看申请与更新状态",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_application_inbox"
+      ],
+      "depends_on": [
+        "backend_recruiter_jobs",
+        "backend_applications"
+      ],
+      "acceptance": [
+        "GET /api/v1/recruiter/applications 按 job_id/status 筛选本企业职位收到的申请，含申请人简历摘要与留言",
+        "PATCH /api/v1/recruiter/applications/{id} 更新为 viewed/rejected/hired，跨企业 403、不存在 404",
+        "状态更新后 GET /api/v1/me/applications 立即反映新状态"
+      ],
+      "deliverables": [
+        "backend/app/api/recruiter_applications.py",
+        "backend/app/schemas/application.py（收件箱模型）"
+      ]
+    },
+    {
+      "id": "frontend_api_client",
+      "title": "前端 API 客户端与认证上下文：Bearer 注入、统一解包与错误映射、会话恢复",
+      "kind": "foundation",
+      "requirement_ids": [
+        "feat_auth",
+        "feat_job_browse",
+        "feat_job_detail",
+        "feat_resume_profile",
+        "feat_apply",
+        "feat_my_applications",
+        "feat_company_job_manage",
+        "feat_application_inbox"
+      ],
+      "depends_on": [
+        "visual_foundation",
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "frontend/src/lib/api.ts 注入 Bearer token、解包 {code,msg,data}、按状态码抛出可读错误、401 清理会话",
+        "认证上下文提供 user/login/register/logout，刷新后通过 GET /auth/me 恢复登录态",
+        "路由守卫：未登录访问受保护页面跳转 /login?redirect=..."
+      ],
+      "deliverables": [
+        "frontend/src/lib/api.ts",
+        "frontend/src/lib/auth.tsx",
+        "frontend/src/lib/types.ts"
+      ]
+    },
+    {
+      "id": "frontend_job_browse",
+      "title": "前端职位列表页：搜索、城市/类型筛选、分页与职位卡片",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_browse",
+        "feat_seed_data"
+      ],
+      "depends_on": [
+        "frontend_api_client",
+        "backend_seed"
+      ],
+      "acceptance": [
+        "首页/职位列表展示后端返回的职位卡片（名称、公司、地点、薪资、发布时间）",
+        "输入关键词或选择城市后调用 GET /api/v1/jobs 并更新列表与分页",
+        "加载/空/错误态有明确呈现"
+      ],
+      "deliverables": [
+        "frontend/src/routes/jobs.index.tsx",
+        "frontend/src/components/job-card.tsx",
+        "frontend/src/router.tsx（路由注册）"
+      ]
+    },
+    {
+      "id": "frontend_auth_pages",
+      "title": "前端登录/注册页与角色选择、登录后回跳",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_auth"
+      ],
+      "depends_on": [
+        "frontend_api_client"
+      ],
+      "acceptance": [
+        "注册页可选 seeker/recruiter，招聘方需填公司名",
+        "登录/注册成功后跳转 redirect 目标，刷新后仍保持登录",
+        "未登录点击投递被引导至 /login?redirect=..."
+      ],
+      "deliverables": [
+        "frontend/src/routes/login.tsx",
+        "frontend/src/routes/register.tsx"
+      ]
+    },
+    {
+      "id": "frontend_job_detail",
+      "title": "前端职位详情页与投递入口（含留言、重复投递提示）",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_detail",
+        "feat_apply"
+      ],
+      "depends_on": [
+        "frontend_job_browse",
+        "frontend_auth_pages",
+        "backend_applications"
+      ],
+      "acceptance": [
+        "详情页展示描述、要求、薪资、地点、公司简介与发布方信息",
+        "已登录求职者可填写留言并提交投递，成功有反馈，重复投递显示 409 提示",
+        "未登录点击投递跳转登录并回跳"
+      ],
+      "deliverables": [
+        "frontend/src/routes/jobs.$jobId.tsx",
+        "frontend/src/components/apply-dialog.tsx"
+      ]
+    },
+    {
+      "id": "frontend_seeker_area",
+      "title": "前端求职者区：简历资料表单与我的投递列表",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_resume_profile",
+        "feat_my_applications"
+      ],
+      "depends_on": [
+        "frontend_auth_pages",
+        "backend_resume",
+        "backend_applications"
+      ],
+      "acceptance": [
+        "简历表单保存后刷新仍能读取姓名、联系方式与期望职位",
+        "我的投递列出全部申请及状态标签，刷新后一致"
+      ],
+      "deliverables": [
+        "frontend/src/routes/me.resume.tsx",
+        "frontend/src/routes/me.applications.tsx"
+      ]
+    },
+    {
+      "id": "frontend_recruiter_area",
+      "title": "前端招聘方区：职位管理（创建/编辑/上下架）与申请收件箱",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_company_job_manage",
+        "feat_application_inbox"
+      ],
+      "depends_on": [
+        "frontend_auth_pages",
+        "backend_recruiter_jobs",
+        "backend_inbox"
+      ],
+      "acceptance": [
+        "职位管理页可创建/编辑/上下架本企业职位，创建或下架后求职者端列表相应出现或消失",
+        "收件箱按职位筛选申请，展示简历摘要与留言，可更新状态为已查看/已拒绝/已录用",
+        "状态更新后求职者端我的投递显示新状态"
+      ],
+      "deliverables": [
+        "frontend/src/routes/recruiter.jobs.tsx",
+        "frontend/src/routes/recruiter.applications.tsx"
+      ]
+    },
+    {
+      "id": "smoke_and_verify",
+      "title": "更新 smoke 契约并完成端到端联调验证",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_browse",
+        "feat_job_detail",
+        "feat_auth",
+        "feat_resume_profile",
+        "feat_apply",
+        "feat_my_applications",
+        "feat_company_job_manage",
+        "feat_application_inbox",
+        "feat_seed_data"
+      ],
+      "depends_on": [
+        "frontend_job_browse",
+        "frontend_job_detail",
+        "frontend_seeker_area",
+        "frontend_recruiter_area"
+      ],
+      "acceptance": [
+        "forgeai.smoke.json 覆盖健康检查、职位列表搜索、登录、投递与写后读取等真实业务接口与页面操作",
+        "run_check 的 quick 与 all 全部通过"
+      ],
+      "deliverables": [
+        "forgeai.smoke.json"
+      ]
+    }
+  ],
+  "repaired": [
+    {
+      "id": "visual_foundation",
+      "title": "视觉基础：复用模板语义色/字体/间距，建立共享 UI 组件与状态样式",
+      "kind": "visual_foundation",
+      "requirement_ids": [
+        "feat_job_browse",
+        "feat_job_detail",
+        "feat_auth",
+        "feat_resume_profile",
+        "feat_apply",
+        "feat_my_applications",
+        "feat_company_job_manage",
+        "feat_application_inbox"
+      ],
+      "depends_on": [],
+      "acceptance": [
+        "frontend/src/index.css 保留模板语义色变量（--color-primary/--color-accent/--color-muted 等）并补充招聘站点所需的层级与状态样式",
+        "新增共享 UI 组件（按钮/输入/卡片/标签/分页/状态提示）供各页面复用，不引入外部图片依赖",
+        "加载态、空数据态、错误态有统一可复用呈现"
+      ],
+      "deliverables": [
+        "frontend/src/index.css（语义色与层级样式）",
+        "frontend/src/components/ui/*（共享组件）",
+        "frontend/src/components/states.tsx（加载/空/错误态）"
+      ]
+    },
+    {
+      "id": "backend_foundation",
+      "title": "后端基础：数据模型、Alembic 迁移、统一响应与错误处理、JWT 认证依赖",
+      "kind": "foundation",
+      "requirement_ids": [
+        "feat_auth"
+      ],
+      "depends_on": [
+        "visual_foundation"
+      ],
+      "acceptance": [
+        "backend/app/models 定义 User/Company/Job/Resume/Application，含 (job_id, applicant_id) 唯一约束与 status 枚举",
+        "Alembic 迁移 0002 创建全部业务表，本地 SQLite 可 upgrade head 成功",
+        "POST /api/v1/auth/register、/auth/login、GET /api/v1/auth/me 可用，密码 bcrypt 哈希，JWT 7 天有效",
+        "get_current_user 返回 401、require_role 返回 403，统一响应体 {code,msg,data}"
+      ],
+      "deliverables": [
+        "backend/app/models/{user,company,job,resume,application}.py",
+        "backend/alembic/versions/0002_*.py",
+        "backend/app/core/security.py",
+        "backend/app/api/deps.py",
+        "backend/app/api/auth.py",
+        "backend/app/schemas/auth.py"
+      ]
+    },
+    {
+      "id": "backend_seed",
+      "title": "后端幂等种子数据：示例公司、招聘方/求职者账号与 12+ 职位",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_seed_data"
+      ],
+      "depends_on": [
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "应用启动时幂等写入示例公司、招聘方账号、求职者账号与 12+ 条 published 职位，重复启动不产生重复记录",
+        "种子职位可通过 GET /api/v1/jobs 搜索到"
+      ],
+      "deliverables": [
+        "backend/app/seed.py",
+        "backend/app/main.py（启动钩子）"
+      ]
+    },
+    {
+      "id": "backend_job_browse",
+      "title": "后端公开职位列表：关键词/城市/类型筛选与分页",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_browse"
+      ],
+      "depends_on": [
+        "backend_seed"
+      ],
+      "acceptance": [
+        "GET /api/v1/jobs 支持 q/city/job_type/page/page_size，仅返回 status=published，响应含 items/total/page/page_size/total_pages",
+        "种子职位可被关键词与城市筛选命中，分页字段正确"
+      ],
+      "deliverables": [
+        "backend/app/api/jobs.py",
+        "backend/app/schemas/job.py",
+        "backend/app/services/job_service.py"
+      ]
+    },
+    {
+      "id": "backend_job_detail",
+      "title": "后端职位详情接口",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_detail"
+      ],
+      "depends_on": [
+        "backend_job_browse"
+      ],
+      "acceptance": [
+        "GET /api/v1/jobs/{id} 返回职位描述、任职要求、薪资、工作地点、公司简介与发布方信息",
+        "未发布或不存在返回 404"
+      ],
+      "deliverables": [
+        "backend/app/api/jobs.py（详情路由）",
+        "backend/app/schemas/job.py（详情模型）"
+      ]
+    },
+    {
+      "id": "backend_recruiter_jobs",
+      "title": "后端招聘方职位管理：创建/编辑/上下架与自有职位列表",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_company_job_manage"
+      ],
+      "depends_on": [
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "POST /api/v1/recruiter/jobs 创建本企业职位，非 recruiter 返回 403",
+        "PUT /api/v1/recruiter/jobs/{id} 可编辑与上下架，跨企业返回 403，不存在返回 404",
+        "GET /api/v1/recruiter/jobs 返回本企业全部职位（含 draft/closed）与 application_count"
+      ],
+      "deliverables": [
+        "backend/app/api/recruiter_jobs.py",
+        "backend/app/schemas/job.py（招聘方请求模型）"
+      ]
+    },
+    {
+      "id": "backend_resume",
+      "title": "后端简历资料：读取与 upsert 保存",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_resume_profile"
+      ],
+      "depends_on": [
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "GET /api/v1/me/resume 返回当前求职者简历或 null",
+        "PUT /api/v1/me/resume upsert 姓名/联系方式/期望职位/期望城市/工作经历/技能，非 seeker 返回 403"
+      ],
+      "deliverables": [
+        "backend/app/api/resume.py",
+        "backend/app/schemas/resume.py"
+      ]
+    },
+    {
+      "id": "backend_apply",
+      "title": "后端投递职位：创建申请与重复投递 409",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_apply"
+      ],
+      "depends_on": [
+        "backend_job_detail",
+        "backend_resume"
+      ],
+      "acceptance": [
+        "POST /api/v1/jobs/{id}/applications 写入 status=submitted 申请，未登录 401、非 seeker 403、职位未发布 404",
+        "同一职位重复投递返回 409（数据库唯一约束兜底 IntegrityError）"
+      ],
+      "deliverables": [
+        "backend/app/api/applications.py",
+        "backend/app/schemas/application.py"
+      ]
+    },
+    {
+      "id": "backend_my_applications",
+      "title": "后端我的投递：求职者申请列表与状态",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_my_applications"
+      ],
+      "depends_on": [
+        "backend_apply"
+      ],
+      "acceptance": [
+        "GET /api/v1/me/applications 返回当前求职者全部申请及状态与职位摘要，分页结构统一",
+        "刷新后列表与状态保持一致"
+      ],
+      "deliverables": [
+        "backend/app/api/applications.py（我的投递路由）",
+        "backend/app/schemas/application.py（列表模型）"
+      ]
+    },
+    {
+      "id": "backend_inbox",
+      "title": "后端申请收件箱：按职位查看申请与更新状态",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_application_inbox"
+      ],
+      "depends_on": [
+        "backend_recruiter_jobs",
+        "backend_my_applications"
+      ],
+      "acceptance": [
+        "GET /api/v1/recruiter/applications 按 job_id/status 筛选本企业职位收到的申请，含申请人简历摘要与留言",
+        "PATCH /api/v1/recruiter/applications/{id} 更新为 viewed/rejected/hired，跨企业 403、不存在 404",
+        "状态更新后 GET /api/v1/me/applications 立即反映新状态"
+      ],
+      "deliverables": [
+        "backend/app/api/recruiter_applications.py",
+        "backend/app/schemas/application.py（收件箱模型）"
+      ]
+    },
+    {
+      "id": "frontend_api_client",
+      "title": "前端 API 客户端与认证上下文：Bearer 注入、统一解包与错误映射、会话恢复",
+      "kind": "foundation",
+      "requirement_ids": [
+        "feat_auth"
+      ],
+      "depends_on": [
+        "visual_foundation",
+        "backend_foundation"
+      ],
+      "acceptance": [
+        "frontend/src/lib/api.ts 注入 Bearer token、解包 {code,msg,data}、按状态码抛出可读错误、401 清理会话",
+        "认证上下文提供 user/login/register/logout，刷新后通过 GET /auth/me 恢复登录态",
+        "路由守卫：未登录访问受保护页面跳转 /login?redirect=..."
+      ],
+      "deliverables": [
+        "frontend/src/lib/api.ts",
+        "frontend/src/lib/auth.tsx",
+        "frontend/src/lib/types.ts"
+      ]
+    },
+    {
+      "id": "frontend_job_browse",
+      "title": "前端职位列表页：搜索、城市/类型筛选、分页与职位卡片",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_browse",
+        "feat_seed_data"
+      ],
+      "depends_on": [
+        "frontend_api_client",
+        "backend_job_browse"
+      ],
+      "acceptance": [
+        "首页/职位列表展示后端返回的职位卡片（名称、公司、地点、薪资、发布时间）",
+        "输入关键词或选择城市后调用 GET /api/v1/jobs 并更新列表与分页",
+        "加载/空/错误态有明确呈现"
+      ],
+      "deliverables": [
+        "frontend/src/routes/jobs.index.tsx",
+        "frontend/src/components/job-card.tsx",
+        "frontend/src/router.tsx（路由注册）"
+      ]
+    },
+    {
+      "id": "frontend_auth_pages",
+      "title": "前端登录/注册页与角色选择、登录后回跳",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_auth"
+      ],
+      "depends_on": [
+        "frontend_api_client"
+      ],
+      "acceptance": [
+        "注册页可选 seeker/recruiter，招聘方需填公司名",
+        "登录/注册成功后跳转 redirect 目标，刷新后仍保持登录",
+        "未登录点击投递被引导至 /login?redirect=..."
+      ],
+      "deliverables": [
+        "frontend/src/routes/login.tsx",
+        "frontend/src/routes/register.tsx"
+      ]
+    },
+    {
+      "id": "frontend_job_detail",
+      "title": "前端职位详情页与投递入口（含留言、重复投递提示）",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_detail",
+        "feat_apply"
+      ],
+      "depends_on": [
+        "frontend_job_browse",
+        "frontend_auth_pages",
+        "backend_apply"
+      ],
+      "acceptance": [
+        "详情页展示描述、要求、薪资、地点、公司简介与发布方信息",
+        "已登录求职者可填写留言并提交投递，成功有反馈，重复投递显示 409 提示",
+        "未登录点击投递跳转登录并回跳"
+      ],
+      "deliverables": [
+        "frontend/src/routes/jobs.$jobId.tsx",
+        "frontend/src/components/apply-dialog.tsx"
+      ]
+    },
+    {
+      "id": "frontend_seeker_area",
+      "title": "前端求职者区：简历资料表单与我的投递列表",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_resume_profile",
+        "feat_my_applications"
+      ],
+      "depends_on": [
+        "frontend_auth_pages",
+        "backend_resume",
+        "backend_my_applications"
+      ],
+      "acceptance": [
+        "简历表单保存后刷新仍能读取姓名、联系方式与期望职位",
+        "我的投递列出全部申请及状态标签，刷新后一致"
+      ],
+      "deliverables": [
+        "frontend/src/routes/me.resume.tsx",
+        "frontend/src/routes/me.applications.tsx"
+      ]
+    },
+    {
+      "id": "frontend_recruiter_area",
+      "title": "前端招聘方区：职位管理（创建/编辑/上下架）与申请收件箱",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_company_job_manage",
+        "feat_application_inbox"
+      ],
+      "depends_on": [
+        "frontend_auth_pages",
+        "backend_recruiter_jobs",
+        "backend_inbox"
+      ],
+      "acceptance": [
+        "职位管理页可创建/编辑/上下架本企业职位，创建或下架后求职者端列表相应出现或消失",
+        "收件箱按职位筛选申请，展示简历摘要与留言，可更新状态为已查看/已拒绝/已录用",
+        "状态更新后求职者端我的投递显示新状态"
+      ],
+      "deliverables": [
+        "frontend/src/routes/recruiter.jobs.tsx",
+        "frontend/src/routes/recruiter.applications.tsx"
+      ]
+    },
+    {
+      "id": "smoke_and_verify",
+      "title": "更新 smoke 契约并完成端到端联调验证",
+      "kind": "feature",
+      "requirement_ids": [
+        "feat_job_browse",
+        "feat_job_detail",
+        "feat_auth",
+        "feat_resume_profile",
+        "feat_apply",
+        "feat_my_applications",
+        "feat_company_job_manage",
+        "feat_application_inbox",
+        "feat_seed_data"
+      ],
+      "depends_on": [
+        "frontend_job_browse",
+        "frontend_job_detail",
+        "frontend_seeker_area",
+        "frontend_recruiter_area"
+      ],
+      "acceptance": [
+        "forgeai.smoke.json 覆盖健康检查、职位列表搜索、登录、投递与写后读取等真实业务接口与页面操作",
+        "run_check 的 quick 与 all 全部通过"
+      ],
+      "deliverables": [
+        "forgeai.smoke.json"
+      ]
+    }
+  ]
+}

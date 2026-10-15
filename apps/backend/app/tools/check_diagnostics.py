@@ -21,6 +21,10 @@ _TYPESCRIPT_ERROR = re.compile(
 _BROWSER_ERROR = re.compile(
     r"^BROWSER_CHECK_FAILED\s+(?P<check>\S+)\s+(?P<route>\S+):\s*(?P<message>.+)$"
 )
+_API_STATUS_ERROR = re.compile(
+    r"^(?:RuntimeError: )?API 联调失败 (?P<check>[^：]+)：期望 HTTP "
+    r"(?P<expected>\d+)，实际 (?P<actual>\d+)；(?P<detail>.*)$"
+)
 _TRACEBACK_FILE = re.compile(r'^\s*File\s+"(?P<path>[^"]+)",\s+line\s+(?P<line>\d+)')
 _PYTHON_EXCEPTION = re.compile(
     r"^(?:(?:[\w]+\.)+)?(?P<code>"
@@ -45,13 +49,15 @@ _PYTHON_ROOT_CODES = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class CheckDiagnostic:
-    kind: Literal["typescript", "python", "test", "browser", "runtime"]
+    kind: Literal["typescript", "python", "test", "browser", "runtime", "api"]
     message: str
     raw: str
     path: str | None = None
     line: int | None = None
     column: int | None = None
     code: str | None = None
+    expected: str | None = None
+    actual: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,7 +133,19 @@ def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
         browser_match = _BROWSER_ERROR.match(line)
         match = _TYPESCRIPT_ERROR.match(line)
         python_match = _PYTHON_EXCEPTION.match(line)
-        if browser_match:
+        api_match = _API_STATUS_ERROR.match(line)
+        if api_match:
+            diagnostics.append(
+                CheckDiagnostic(
+                    kind="api",
+                    code=api_match.group("check"),
+                    message=line,
+                    raw=line,
+                    expected=api_match.group("expected"),
+                    actual=api_match.group("actual"),
+                )
+            )
+        elif browser_match:
             diagnostics.append(
                 CheckDiagnostic(
                     kind="browser",
@@ -190,7 +208,7 @@ def check_output_excerpt(output: str, *, summary: str = "") -> str:
         primary = [
             item.raw
             for item in diagnostics
-            if item.kind in {"typescript", "browser", "test", "python"}
+            if item.kind in {"typescript", "browser", "test", "python", "api"}
             and item.code not in _PYTHON_ROOT_CODES
         ][-2:]
         # Surface import/module roots first so repair planners see the real cause.

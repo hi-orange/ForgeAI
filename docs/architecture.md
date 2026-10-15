@@ -196,7 +196,30 @@ gates.
   model turns. Invalid tool responses receive bounded correction feedback; provider retries retain
   progress and do not reset budgets. Read-only tool batches execute within role and call limits;
   state changes remain sequential. New context and valid plan changes count as engineering progress,
-  while repeated identical observations remain subject to the no-progress limit.
+  while repeated identical observations remain subject to the no-progress limit. Initial engineering
+  planning has a separate bounded inspection allowance; after it is spent, the engineer must submit
+  the dependency graph or report a concrete blocker. Source inspection remains available during
+  implementation. The current task, observed-file summary, diagnostics and prior recovery reason
+  follow historical tool exchanges in model context. Recovery never clears cumulative usage or
+  reopens planning inspection; only an explicit manual retry extends the total call allowance.
+  Budget exhaustion uses typed stop reasons, with old text-only records translated at the checkpoint
+  compatibility boundary.
+  Tools expose structured current diagnostics with locations, evidence, disposition and verification
+  targets. Plan validation reports all detectable conflicts without weakening frozen dependencies;
+  co-located prerequisite/dependent requirements still require explicit task separation under the
+  current graph contract. The checkpoint retains distinct raw failures and source-bound correction
+  attempts, while model context carries the latest plan/check exchanges and unresolved diagnostics.
+  Work-item memory retains actual changed paths, bounded source excerpts and recent actions beyond
+  the rolling tool history. Excerpts are hash-checked against the workspace before reuse; omitted,
+  truncated and stale evidence is explicit. Writes and model-authored next-action notes do not prove
+  completion. Repeated or excessive inspection triggers one bounded next-action correction per work
+  item before stopping. Correction permits declared targeted reads, source edits or an explicit block;
+  it never forces blind writes, changes approved scope or bypasses verification. Automatic recovery
+  preserves correction usage; an explicit no-progress retry starts with corrective planning, not just
+  extra call budget. The correction and all actions remain traceable in the fenced checkpoint/events.
+  Source writes invalidate check evidence; unrelated checks cannot close other failures, and only
+  independent QA resolves acceptance defects. Identical failed inputs have a bounded stop-loss that
+  survives automatic recovery. Diagnostic adapters never invent missing causes or grant write access.
 - An open BuildRun can await explicit recovery. User-facing status exposes the current job and retry
   schedule so queued recovery keeps polling while a stopped execution shows its cause and controls.
   Received model usage is metered before tool parsing, including malformed responses and Leader routing.

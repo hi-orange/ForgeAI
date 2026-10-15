@@ -393,7 +393,12 @@ class DurableWorkflowTests(unittest.TestCase):
                 payload={"user_id": self.user_id},
             )
             claim_next_job(db, "worker-a")
-            fail_job(db, job.job_id, "worker-a", RuntimeError("container stopped"))
+            with self.assertLogs("forgeai.workflow", level="WARNING") as logs:
+                fail_job(db, job.job_id, "worker-a", RuntimeError("container stopped"))
+            self.assertIn("retry_scheduled", logs.output[0])
+            self.assertIn("attempt=1", logs.output[0])
+            self.assertIn("next_retry_at=", logs.output[0])
+            self.assertIn(f"run={run.run_id}", logs.output[0])
             db.refresh(job)
             db.refresh(execution)
             self.assertEqual(job.status, "retry_wait")
@@ -424,12 +429,16 @@ class DurableWorkflowTests(unittest.TestCase):
                 payload={"user_id": self.user_id},
             )
             claim_next_job(db, "worker-a")
-            fail_job(
-                db,
-                job.job_id,
-                "worker-a",
-                WorkflowBlockedException("等待用户显式继续"),
-            )
+            with self.assertLogs("forgeai.workflow", level="WARNING") as logs:
+                fail_job(
+                    db,
+                    job.job_id,
+                    "worker-a",
+                    WorkflowBlockedException("等待用户显式继续"),
+                )
+            self.assertIn("workflow job failed", logs.output[0])
+            self.assertIn("retryable=False", logs.output[0])
+            self.assertIn("next_retry_at=None", logs.output[0])
             db.refresh(job)
             db.refresh(execution)
             self.assertEqual(job.status, "failed")
