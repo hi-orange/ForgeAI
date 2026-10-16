@@ -59,6 +59,33 @@ class LlmHttpErrorMessageTests(unittest.TestCase):
         self.assertEqual(ProviderException("network", retryable=True).status_code, 503)
         self.assertEqual(ProviderException("config", retryable=False).status_code, 502)
 
+    def test_length_response_is_rejected_even_if_first_tool_json_is_complete(self):
+        payload = {
+            "model": "test",
+            "usage": {"total_tokens": 120},
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "partial_batch",
+                                "type": "function",
+                                "function": {"name": "editor_write", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        with (
+            patch("app.core.llm._post_chat", return_value=payload),
+            patch("app.core.llm.record_model_turn") as meter,
+        ):
+            with self.assertRaisesRegex(ModelProtocolException, "MODEL_OUTPUT_TRUNCATED"):
+                chat_with_tools(messages=[], tools=[])
+        meter.assert_called_once()
+
     def test_invalid_tool_arguments_are_metered_before_protocol_failure(self):
         payload = {
             "model": "test-model",

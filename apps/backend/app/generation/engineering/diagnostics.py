@@ -76,6 +76,10 @@ def feedback(result: ToolExecutionResult, *, check_id: str | None = None) -> Too
             diagnostic.verification = "重新读取当前源码与 hash，再修改或执行原检查。"
         if analysis:
             diagnostic.fingerprint = analysis.fingerprint
+    if result.name == "model_response":
+        diagnostic.verification = (
+            "依据本轮 available_tools 提交合法工具调用；写入或状态变更单独调用。"
+        )
     if not diagnostic.fingerprint:
         diagnostic.fingerprint = _digest([diagnostic.category, diagnostic.code, diagnostic.issues])
     return result.model_copy(
@@ -100,10 +104,11 @@ def record_feedback(
     scope = _scope(result, check_id)
     states = checkpoint.setdefault("diagnostic_state", {})
     if result.ok:
-        if scope in states and (not check_id or result.data.get("source_hash")):
-            states[scope].update(
+        if (scope in states or check_id) and (not check_id or result.data.get("source_hash")):
+            states.setdefault(scope, {}).update(
                 status="resolved",
                 verification_source_hash=result.data.get("source_hash"),
+                verification_status="current",
                 repeated_attempts=0,
             )
         return result
@@ -118,14 +123,16 @@ def record_feedback(
     if check_id:
         arguments = {"check_id": check_id}
     identity = _digest(
-        [arguments, diagnostic.get("source_hash") or checkpoint.get("source_version", 0)]
+        [arguments, result.data.get("available_tools")]
+        if result.name == "model_response"
+        else [arguments, diagnostic.get("source_hash") or checkpoint.get("source_version", 0)]
     )
     previous = states.get(scope, {})
     repeated = (
         int(previous.get("repeated_attempts", 0)) + 1
         if previous.get("input_fingerprint") == identity
         and previous.get("diagnostic", {}).get("fingerprint") == diagnostic["fingerprint"]
-        and previous.get("status") != "resolved"
+        and previous.get("status") not in {"resolved", "superseded"}
         else 1
     )
     states[scope] = {
@@ -134,7 +141,10 @@ def record_feedback(
         "input_fingerprint": identity,
         "repeated_attempts": repeated,
         "source_version": checkpoint.get("source_version", 0),
+        "verification_status": "current",
     }
+    if result.name == "model_response":
+        states[scope]["available_tools"] = result.data.get("available_tools")
     # Store distinct raw feedback once. Repeated calls remain in the activity stream.
     history = checkpoint.setdefault("diagnostic_history", [])
     evidence_id = _digest([scope, identity, diagnostic["fingerprint"]])
@@ -156,26 +166,59 @@ def record_feedback(
     return result.model_copy(update={"data": {**result.data, "correction": guidance}})
 
 
+def reconcile_protocol_diagnostic(checkpoint: dict[str, Any], available: list[str]) -> None:
+    """Protocol refusals apply only to the capabilities offered for that response."""
+    state = checkpoint.get("diagnostic_state", {}).get("tool:model_response:")
+    if state and state.get("status") == "open" and state.get("available_tools") != available:
+        state.update(status="superseded", repeated_attempts=0)
+
+
+def resolve_protocol_diagnostic(checkpoint: dict[str, Any]) -> None:
+    """A validated model tool call resolves response format/selection, not tool failures."""
+    state = checkpoint.get("diagnostic_state", {}).get("tool:model_response:")
+    if state and state.get("status") == "open":
+        state.update(status="resolved", repeated_attempts=0)
+
+
 def invalidate_source_evidence(checkpoint: dict[str, Any]) -> None:
     checkpoint["source_version"] = int(checkpoint.get("source_version", 0)) + 1
     checkpoint["check_cache"] = {}
     for scope, state in checkpoint.get("diagnostic_state", {}).items():
         if scope.startswith("check:"):
-            state["status"] = "needs_verification"
+            state["verification_status"] = "needs_verification"
+            if state.get("status") != "resolved":
+                state["status"] = "needs_verification"
     repair = checkpoint.get("repair_context")
     if isinstance(repair, dict):
         repair["requires_recheck"] = True
+
+
+def check_verification(checkpoint: dict[str, Any]) -> list[dict[str, Any]]:
+    """Last outcome and current validity are separate facts, never revived errors."""
+    return [
+        {
+            "check_id": scope.removeprefix("check:"),
+            "last_outcome": "passed" if state.get("status") == "resolved" else "failed",
+            "source_hash": state.get("verification_source_hash")
+            if state.get("status") == "resolved"
+            else state.get("diagnostic", {}).get("source_hash"),
+            "verification_status": state.get("verification_status", "current"),
+        }
+        for scope, state in checkpoint.get("diagnostic_state", {}).items()
+        if scope.startswith("check:")
+    ]
 
 
 def active_diagnostics(checkpoint: dict[str, Any]) -> list[dict[str, Any]]:
     """Model projection; raw outputs and repeated plans stay in the checkpoint."""
     rows = []
     for scope, state in checkpoint.get("diagnostic_state", {}).items():
-        if state.get("status") == "resolved":
+        if state.get("status") in {"resolved", "superseded"}:
             continue
         rows.append(
             {
                 "scope": scope,
+                "historical": state.get("verification_status") == "needs_verification",
                 **{
                     key: state.get(key)
                     for key in ("status", "diagnostic", "repeated_attempts", "source_version")

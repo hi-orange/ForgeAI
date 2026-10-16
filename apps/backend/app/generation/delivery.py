@@ -20,6 +20,14 @@ class PlannedWorkItem(BaseModel):
 
     id: RequirementId
     requirement_ids: list[RequirementId] = Field(min_length=1, max_length=50)
+    provides_requirement_ids: list[RequirementId] = Field(
+        default_factory=list,
+        max_length=50,
+        description=(
+            "明确提供的前置能力，必须是 requirement_ids 的子集并有 acceptance/deliverables；"
+            "视觉基础的需求关联默认不提供业务能力。声明后完成该项必须通过集成检查。"
+        ),
+    )
     title: PlanText
     kind: Literal["foundation", "visual_foundation", "feature"] = "feature"
     depends_on: list[RequirementId] = Field(default_factory=list, max_length=100)
@@ -159,6 +167,21 @@ def validate_delivery_plan(
     for item in items:
         unknown = set(item.requirement_ids) - feature_ids
         invalid = set(item.depends_on) - (set(ids) - {item.id})
+        invalid_provisions = set(item.provides_requirement_ids) - set(item.requirement_ids)
+        if invalid_provisions or (
+            item.provides_requirement_ids and (not item.acceptance or not item.deliverables)
+        ):
+            issues.append(
+                {
+                    "code": "INVALID_REQUIREMENT_PROVISION",
+                    "work_item_id": item.id,
+                    "field": "provides_requirement_ids",
+                    "unlinked_requirement_ids": sorted(invalid_provisions),
+                    "expected": (
+                        "只能声明关联需求中的真实前置能力，并填写 acceptance 与 deliverables"
+                    ),
+                }
+            )
         if unknown:
             issues.append(
                 {
@@ -180,7 +203,7 @@ def validate_delivery_plan(
                 }
             )
     if issues:
-        raise DeliveryPlanError("工程计划引用了未获批功能、自身或不存在的任务", issues)
+        raise DeliveryPlanError("工程计划的需求关联、能力声明或依赖引用无效", issues)
     ancestors: dict[str, set[str]] = {}
     remaining = {item.id: set(item.depends_on) for item in items}
     while remaining:
@@ -239,8 +262,15 @@ def validate_delivery_plan(
                 ):
                     continue
                 if not any(
-                    by_id[parent].kind != "visual_foundation"
-                    and dependency.prerequisite_requirement_id in by_id[parent].requirement_ids
+                    dependency.prerequisite_requirement_id
+                    in (
+                        by_id[parent].provides_requirement_ids
+                        or (
+                            by_id[parent].requirement_ids
+                            if by_id[parent].kind != "visual_foundation"
+                            else []
+                        )
+                    )
                     for parent in ancestors[item.id]
                 ):
                     issues.append(
@@ -253,12 +283,22 @@ def validate_delivery_plan(
                             "prerequisite_in_same_item": dependency.prerequisite_requirement_id
                             in item.requirement_ids,
                             "reason": dependency.reason,
+                            "linked_ancestor_ids": sorted(
+                                parent
+                                for parent in ancestors[item.id]
+                                if dependency.prerequisite_requirement_id
+                                in by_id[parent].requirement_ids
+                            ),
                             "expected": (
-                                "前置需求必须由非视觉基础的祖先工作项实现；同项包含不计作前置。"
+                                "前置能力必须由祖先工作项提供；视觉基础仅关联需求不算提供能力。"
+                                "同项包含不计作前置。"
                             ),
                             "suggested_action": (
-                                "若前置与后续在同项，拆分实现并建立 depends_on；"
-                                "否则补齐实际前置任务依赖。不要只添加需求标签。"
+                                "若视觉基础确实实现此前置，"
+                                "在其 provides_requirement_ids 声明该需求，"
+                                "并给出可检查的 acceptance/deliverables；"
+                                "否则依赖真正实现此前置的任务。"
+                                "同项包含前后置时拆分任务。不要仅添加关联标签。"
                             ),
                         }
                     )

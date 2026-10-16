@@ -66,6 +66,7 @@ def generate_system_design(
     saved = (checkpoint or {}).get("state", {})
     if saved.get("draft"):
         state.draft = SystemDesign.model_validate(saved["draft"])
+    state.draft_sections = dict(saved.get("draft_sections") or {})
     state.inspection_keys = set(saved.get("inspection_keys", []))
     state.inspection_count = len(state.inspection_keys)
     if checkpoint and checkpoint.get("output"):
@@ -88,6 +89,7 @@ def generate_system_design(
         export_state=lambda: {
             "draft": state.draft.model_dump(mode="json") if state.draft else None,
             "inspection_keys": sorted(state.inspection_keys),
+            "draft_sections": state.draft_sections,
         },
         batch_read_tools={"read_artifact", "editor_read", "terminal_list", "terminal_run"},
     )

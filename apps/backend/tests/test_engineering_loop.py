@@ -34,6 +34,30 @@ def turn(name, **arguments):
 
 
 class EngineeringLoopTests(EngineeringClaimTests):
+    def test_thinking_response_survives_provider_interruption_in_checkpoint(self):
+        self._start()
+        calls = 0
+
+        def decide(*, work_item, observations, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ProviderException("fixture interruption", retryable=True)
+            return self._implement(work_item=work_item, observations=observations).model_copy(
+                update={"reasoning_content": "opaque checkpoint fixture"}
+            )
+
+        self.model.side_effect = decide
+        with self.assertRaises(ProviderException):
+            self._run()
+        checkpoint = self._checkpoint()
+        saved = checkpoint["model_responses"][0]
+        self.assertEqual(saved["model_turn"], 1)
+        self.assertEqual(saved["result"]["reasoning_content"], "opaque checkpoint fixture")
+        self.assertEqual(checkpoint["observations"][-1]["model_turn"], 1)
+        self.assertEqual(checkpoint["observations"][-1]["tool_call_id"], "action")
+        self.assertEqual(checkpoint["model_turns"], 2)
+
     def test_read_batches_gather_new_context_without_stopping_before_planning(self):
         self._start()
         for index in range(18):
@@ -57,7 +81,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "generated")
         self.assertEqual(self._checkpoint()["model_turns"], 9)
-        self.assertEqual(len(self._checkpoint()["context_fingerprints"]), 18)
+        self.assertEqual(len(self._checkpoint()["read_coverage"]), 18)
 
     def test_repeated_identical_read_is_still_bounded(self):
         self._start()
@@ -267,82 +291,199 @@ class EngineeringLoopTests(EngineeringClaimTests):
             data={"source_hash": source_snapshot(root)[1], "check_id": check_id},
         )
 
-    def test_stalled_implementation_corrects_once_then_passes_real_completion_gates(self):
+    def test_repeated_reads_keep_tools_and_then_use_completion_gates(self):
         self._start()
-        read_count = 0
-        focus_seen = False
+        batches = 0
+        observed_tools = []
 
         def decide(*, work_item, observations, engineering_context, tools, **kwargs):
-            nonlocal read_count, focus_seen
+            nonlocal batches
             if work_item.id != "visual":
                 return self._implement(work_item=work_item, observations=observations)
-            memory = engineering_context["working_memory"]
             names = {tool.name for tool in tools}
-            if "update_work_item_focus" in names:
-                self.assertEqual(names, {"update_work_item_focus", "report_blocked"})
-                self.assertEqual(read_count, 1)  # One batch was cut off before all 16 reads.
-                self.assertEqual(memory["inspection_steps"], 7)
-                self.assertTrue(memory["source_evidence"])
-                focus_seen = True
-                return turn(
-                    "update_work_item_focus",
-                    work_item_id="visual",
-                    stalled_because="Repeated the same read without implementing",
-                    next_change="Create the visual source",
-                    target_paths=["generated/visual.py"],
-                    read_paths=[],
-                    verification="complete_work_item quick check",
-                )
-            if not focus_seen:
-                read_count += 1
+            observed_tools.append(names)
+            self.assertEqual(names, set(engineering_context["available_tools"]))
+            self.assertNotIn("update_work_item_focus", names)
+            if batches < 2:
+                batches += 1
                 return ChatWithToolsResult(
                     tool_calls=[
-                        ToolCall(id=f"r{i}", name="read_file", arguments={"path": "README.md"})
+                        ToolCall(
+                            id=f"r{batches}_{i}", name="read_file", arguments={"path": "README.md"}
+                        )
                         for i in range(16)
                     ]
                 )
+            self.assertEqual(
+                engineering_context["working_memory"]["inspection_steps"],
+                32 if not any(o.name == "write_file" for o in observations) else 0,
+            )
             return self._implement(work_item=work_item, observations=observations)
 
         (self.root / "README.md").write_text("Source evidence", encoding="utf-8")
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "generated")
-        checkpoint = self._checkpoint()
-        self.assertTrue(focus_seen)
-        self.assertEqual(checkpoint["work_memory"]["visual"]["correction"]["phase"], "applied")
+        self.assertTrue(all(names == observed_tools[0] for names in observed_tools))
         self.assertEqual(
             [c.kwargs["check_id"] for c in self.checks.call_args_list],
-            ["quick", "quick", "quick", "all"],
+            ["quick", "quick", "all", "quick", "all"],
         )
         self.assertEqual(
-            len([a for a in checkpoint["activity"] if a["name"] == "work_item_stalled"]), 1
+            len([a for a in self._checkpoint()["activity"] if a["name"] == "read_file"]), 32
         )
 
-    def test_invalid_focus_returns_feedback_instead_of_pausing_execution(self):
+    def test_repeated_implementation_reads_stop_at_total_model_budget(self):
         self._start()
-        focused = 0
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, self.execution.execution_id)
+            snapshot = read_frozen_input_snapshot(row)
+            snapshot["call_budget"]["max_model_turns"] = 16
+            row.draft = snapshot
+            flag_modified(row, "draft")
+            db.commit()
+        (self.root / "README.md").write_text("evidence", encoding="utf-8")
 
         def decide(*, work_item, observations, tools, **kwargs):
-            nonlocal focused
-            if work_item.id != "visual":
+            if work_item.id == "engineering_plan":
                 return self._implement(work_item=work_item, observations=observations)
-            if "update_work_item_focus" in {t.name for t in tools}:
-                focused += 1
-                return turn(
-                    "update_work_item_focus",
-                    work_item_id="wrong",
-                    stalled_because="Repeated reads",
-                    next_change="Implement",
-                    target_paths=["x.py"],
-                    read_paths=[],
-                    verification="quick",
-                )
+            self.assertIn("write_file", {t.name for t in tools})
             return turn("read_file", path="README.md")
 
-        (self.root / "README.md").write_text("Source evidence", encoding="utf-8")
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "blocked")
-        self.assertEqual(focused, 3)
-        self.assertEqual(self._checkpoint()["blocked_reason_code"], "REPEATED_TOOL_FAILURE")
+        checkpoint = self._checkpoint()
+        self.assertEqual(checkpoint["model_turns"], 16)
+        self.assertEqual(checkpoint["work_memory"]["visual"]["inspection_steps"], 15)
+        self.assertEqual(checkpoint["blocked_reason_code"], "MODEL_BUDGET_EXHAUSTED")
+
+    def test_nonfinal_feature_requires_real_integration_check(self):
+        self._start()
+
+        def fail_integration(root, *, check_id, tool_call_id):
+            result = self._passing_check(root, check_id=check_id, tool_call_id=tool_call_id)
+            if check_id == "all":
+                return result.model_copy(
+                    update={
+                        "ok": False,
+                        "error_code": "CHECK_FAILED",
+                        "summary": "business API returned 422",
+                        "data": {
+                            **result.data,
+                            "output": "RuntimeError: API 联调失败：期望 HTTP 201，实际 422",
+                        },
+                    }
+                )
+            return result
+
+        self.checks.side_effect = fail_integration
+        self.assertEqual(self._run()["outcome"], "blocked")
+        items = self._checkpoint()["work_items"]
+        self.assertEqual(items[0]["status"], "completed")
+        self.assertEqual(items[1]["status"], "pending")
+        self.assertEqual(items[2]["status"], "pending")
+        self.assertTrue(any(c.kwargs["check_id"] == "all" for c in self.checks.call_args_list))
+
+    def test_verified_visual_provider_releases_dependent_work(self):
+        self._start()
+
+        def decide(*, work_item, observations, **kwargs):
+            result = self._implement(work_item=work_item, observations=observations)
+            if work_item.id == "engineering_plan":
+                visual = result.tool_calls[0].arguments["items"][0]
+                visual["provides_requirement_ids"] = visual["requirement_ids"][:1]
+                visual["acceptance"] = ["Visual contract passes in the running app"]
+                visual["deliverables"] = ["Design tokens and smoke visual contract"]
+            return result
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(
+            [c.kwargs["check_id"] for c in self.checks.call_args_list],
+            ["quick", "all", "quick", "all", "quick", "all"],
+        )
+        self.assertTrue(all(i["status"] == "completed" for i in self._checkpoint()["work_items"]))
+
+    def test_visual_prerequisite_is_not_completed_when_integration_fails(self):
+        self._start()
+
+        def decide(*, work_item, observations, **kwargs):
+            result = self._implement(work_item=work_item, observations=observations)
+            if work_item.id == "engineering_plan":
+                visual = result.tool_calls[0].arguments["items"][0]
+                visual["provides_requirement_ids"] = visual["requirement_ids"][:1]
+                visual["acceptance"] = ["Visual contract passes in the running app"]
+                visual["deliverables"] = ["Design tokens and smoke visual contract"]
+            return result
+
+        def fail_integration(root, *, check_id, tool_call_id):
+            result = self._passing_check(root, check_id=check_id, tool_call_id=tool_call_id)
+            if check_id == "all":
+                return result.model_copy(
+                    update={"ok": False, "error_code": "CHECK_FAILED", "summary": "Missing tokens"}
+                )
+            return result
+
+        self.model.side_effect = decide
+        self.checks.side_effect = fail_integration
+        self.assertEqual(self._run()["outcome"], "blocked")
+        items = self._checkpoint()["work_items"]
+        self.assertTrue(all(i["status"] == "pending" for i in items))
+        self.assertEqual(
+            [c.kwargs["check_id"] for c in self.checks.call_args_list[:2]], ["quick", "all"]
+        )
+
+    def test_repeated_implementation_reads_get_guidance_then_stop_without_tool_ban(self):
+        self._start()
+        (self.root / "README.md").write_text("same evidence", encoding="utf-8")
+        guided = []
+
+        def decide(*, work_item, observations, tools, engineering_context, **kwargs):
+            if work_item.id == "engineering_plan":
+                return self._implement(work_item=work_item, observations=observations)
+            self.assertIn("read_file", {t.name for t in tools})
+            self.assertIn("write_file", {t.name for t in tools})
+            if engineering_context["progress_guidance"]:
+                guided.append(engineering_context["progress_guidance"])
+            return turn("read_file", path="README.md", end_line=len(guided) + 10)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "blocked")
+        self.assertGreaterEqual(len(guided), 3)
+        checkpoint = self._checkpoint()
+        self.assertEqual(checkpoint["blocked_reason_code"], "NO_SOURCE_PROGRESS")
+        self.assertLess(checkpoint["tool_calls"], 120)
+
+    def test_valid_model_call_resolves_protocol_refusal_and_keeps_audit(self):
+        self._start()
+        attempts = 0
+
+        def decide(*, work_item, observations, engineering_context, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return turn("retired_tool")
+            if attempts == 2:
+                diagnostic = engineering_context["active_diagnostics"][0]["diagnostic"]
+                self.assertIn("available_tools", diagnostic["verification"])
+                self.assertNotIn("重新执行 model_response", diagnostic["verification"])
+            else:
+                self.assertFalse(
+                    any(
+                        d["scope"] == "tool:model_response:"
+                        for d in engineering_context["active_diagnostics"]
+                    )
+                )
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        checkpoint = self._checkpoint()
+        self.assertEqual(
+            checkpoint["diagnostic_state"]["tool:model_response:"]["status"], "resolved"
+        )
+        self.assertTrue(
+            any(h["scope"] == "tool:model_response:" for h in checkpoint["diagnostic_history"])
+        )
 
     @staticmethod
     def _implement(*, work_item, observations, **kwargs):
@@ -406,7 +547,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertEqual(result["outcome"], "generated")
         self.assertEqual(
             [c.kwargs["check_id"] for c in self.checks.call_args_list],
-            ["quick", "quick", "quick", "all"],
+            ["quick", "quick", "all", "quick", "all"],
         )
         self.assertEqual(result["model_turns"], 7)
         for feature in valid_spec()["features"]:

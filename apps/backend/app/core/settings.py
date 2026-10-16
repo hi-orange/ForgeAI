@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
+    code_engineer_thinking: bool = False
 
     # Optional Volcengine Ark / Seedream image generation. The capability stays
     # disabled until a dedicated key is configured; it never reuses the chat key.

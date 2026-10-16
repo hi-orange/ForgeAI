@@ -80,6 +80,7 @@ class ChatWithToolsResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content: str | None = None
+    reasoning_content: str | None = Field(default=None, repr=False)
     tool_calls: list[ToolCall] = Field(default_factory=list)
     finish_reason: str | None = None
     model: str | None = None
@@ -91,6 +92,7 @@ class ToolExecutionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool_call_id: str
+    model_turn: int | None = None
     name: str
     ok: bool
     error_code: str | None = None

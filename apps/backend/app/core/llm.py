@@ -311,6 +311,7 @@ def chat_with_tools(
     temperature: float = 0.2,
     max_tokens: int = 4096,
     timeout: float = 120.0,
+    thinking: bool = False,
 ) -> ChatWithToolsResult:
     """带 tools 的一轮对话；允许只有 tool_calls、content 为空。"""
     body: dict[str, object] = {
@@ -332,6 +333,18 @@ def chat_with_tools(
             for tool in tools
         ],
     }
+    if thinking:
+        body["thinking"] = {"type": "enabled"}
+        body["reasoning_effort"] = "high"
+        body.pop("temperature", None)
+        # Legacy non-thinking exchanges have no reasoning to replay. Do not
+        # mutate checkpoint-owned dictionaries or invent reasoning for them.
+        body["messages"] = [
+            {"reasoning_content": "", **message}
+            if message.get("role") == "assistant"
+            else dict(message)
+            for message in messages
+        ]
     started = time.perf_counter()
     data = _post_chat(body, timeout=timeout)
     # Meter the received response before parsing tool arguments. Invalid output is
@@ -353,7 +366,18 @@ def chat_with_tools(
     )
     record_model_turn(measured, round((time.perf_counter() - started) * 1000))
     try:
+        if choice.get("finish_reason") == "length":
+            raise BusinessException(
+                "MODEL_OUTPUT_TRUNCATED：响应达到输出上限，本轮全部工具均未执行。"
+                "此前成功的工具结果保持有效；下一次需缩小参数体积。"
+            )
         result = parse_agent_action(data)
+        reasoning = message.get("reasoning_content")
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise BusinessException("模型 reasoning_content 格式异常")
+        if thinking and (result.protocol != "native" or reasoning is None):
+            raise BusinessException("思考工具响应缺少原生调用或 reasoning_content，未执行工具")
+        result = result.model_copy(update={"reasoning_content": reasoning})
     except (BusinessException, ValidationError, TypeError, AttributeError) as exc:
         logger.warning(
             "LLM invalid tool response: model=%s finish_reason=%s usage=%s error=%s",
@@ -364,11 +388,14 @@ def chat_with_tools(
         )
         raise ModelProtocolException(str(exc)) from exc
     logger.info(
-        "LLM tool turn: model=%s finish_reason=%s tool_calls=%s content_length=%s usage=%s",
+        "LLM tool turn: model=%s finish_reason=%s tool_calls=%s content_length=%s "
+        "thinking=%s reasoning_length=%s usage=%s",
         result.model or data.get("model"),
         result.finish_reason,
         [call.name for call in result.tool_calls],
         _text_length(result.content),
+        thinking,
+        _text_length(result.reasoning_content),
         result.usage.model_dump() if result.usage else None,
     )
     return result

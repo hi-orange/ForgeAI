@@ -1,4 +1,4 @@
-"""Working evidence survives history rollover; stalls get bounded corrective action."""
+"""Working evidence survives history rollover; observations never restrict tools."""
 
 import json
 import tempfile
@@ -8,7 +8,6 @@ from pathlib import Path
 from test_product_manager_workflow import valid_spec
 
 from app.agents.code_engineer import build_code_engineer_messages
-from app.core.exceptions import ConflictException
 from app.generation.delivery import WorkItem
 from app.generation.engineering.checkpoint import (
     load_checkpoint,
@@ -16,19 +15,14 @@ from app.generation.engineering.checkpoint import (
     prepare_manual_repair_retry,
 )
 from app.generation.engineering.work_memory import (
-    FOCUS_TOOL,
-    MAX_RECOVERY_ACTIONS,
-    accept_focus,
-    correction,
+    implementation_stalled,
     item_memory,
+    progress_guidance,
+    record_progress,
     record_result,
-    request_correction,
-    tool_names,
-    validate_action,
-    validate_focus,
     working_context,
 )
-from app.schemas.agent_action import ToolCall, ToolExecutionResult
+from app.schemas.agent_action import ToolExecutionResult
 from app.schemas.app_spec import AppSpec
 from app.tools.files import read_file
 from app.tools.paths import sha256_bytes
@@ -41,25 +35,6 @@ class WorkMemoryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.c = new_checkpoint()
         self.c.update(current_work_item_id="auth", needs_delivery_plan=False)
-        self.args = dict(
-            work_item_id="auth",
-            stalled_because="Repeated inspection",
-            next_change="Implement endpoint",
-            target_paths=["auth.py"],
-            read_paths=["user.py"],
-            verification="Run backend check",
-        )
-        self.names = {
-            FOCUS_TOOL,
-            "read_file",
-            "search_code",
-            "list_files",
-            "write_file",
-            "run_check",
-            "complete_work_item",
-            "report_blocked",
-            "update_delivery_plan",
-        }
 
     def read(self, path="user.py", content="VALUE = 1"):
         (self.root / path).write_text(content, encoding="utf-8")
@@ -67,10 +42,224 @@ class WorkMemoryTests(unittest.TestCase):
         record_result(self.c, result)
         return result
 
-    def focus(self):
-        request_correction(self.c, "Repeated reads")
-        validate_focus(self.c, self.args, self.root)
-        accept_focus(self.c, self.args)
+    def test_actual_coverage_not_requested_range_defines_new_information(self):
+        (self.root / "a.py").write_text("a\nb\nc\nd\n", encoding="utf-8")
+        for start, end in [(1, 2), (3, 4)]:
+            record_progress(
+                self.c, read_file(self.root, path="a.py", start_line=start, end_line=end)
+            )
+            self.assertEqual(self.c["no_progress_steps"], 0)
+        for end in [4, 40, 400]:
+            record_progress(self.c, read_file(self.root, path="a.py", end_line=end))
+        self.assertEqual(self.c["no_progress_steps"], 3)
+        self.assertEqual(self.c["read_coverage"]["a.py"]["ranges"], [[1, 4]])
+        (self.root / "a.py").write_text("a\nb\nc\nchanged\n", encoding="utf-8")
+        record_progress(self.c, read_file(self.root, path="a.py", start_line=4))
+        self.assertEqual(self.c["no_progress_steps"], 0)
+        self.assertEqual(self.c["steps_without_delivery"], 6)
+
+    def test_text_omitted_from_model_context_is_not_marked_as_already_read(self):
+        body = "".join(f"{i:03d}:" + "x" * 95 + "\n" for i in range(100))
+        observation = ToolExecutionResult(
+            tool_call_id="read",
+            name="read_file",
+            ok=True,
+            summary="read",
+            data={
+                "path": "large.py",
+                "content_hash": "h",
+                "start_line": 1,
+                "end_line": 100,
+                "content": body,
+            },
+        )
+        record_progress(self.c, observation)
+        self.assertEqual(self.c["read_coverage"]["large.py"]["ranges"], [[1, 60]])
+        tail = observation.model_copy(
+            update={
+                "data": {
+                    **observation.data,
+                    "start_line": 61,
+                    "content": "".join(body.splitlines(keepends=True)[60:]),
+                }
+            }
+        )
+        record_progress(self.c, tail)
+        self.assertEqual(self.c["no_progress_steps"], 0)
+        self.assertEqual(self.c["read_coverage"]["large.py"]["ranges"], [[1, 100]])
+        record_progress(self.c, tail)
+        self.assertEqual(self.c["no_progress_steps"], 1)
+
+    def test_guidance_survives_recovery_and_has_grace_before_stopping(self):
+        observation = self.read()
+        for _ in range(32):
+            record_progress(self.c, observation)
+        self.assertIsNotNone(progress_guidance(self.c))
+        self.assertFalse(implementation_stalled(self.c))
+        self.c.update(progress_guidance_turn=10, model_turns=12)
+        loaded = load_checkpoint(json.loads(json.dumps({"checkpoint": self.c})))
+        self.assertFalse(implementation_stalled(loaded))
+        loaded["model_turns"] = 13
+        self.assertTrue(implementation_stalled(loaded))
+        record_progress(loaded, observation, changed=True)
+        self.assertIsNone(progress_guidance(loaded))
+        self.assertFalse(implementation_stalled(loaded))
+
+    def test_new_reads_do_not_hide_missing_implementation_and_cached_check_is_not_progress(self):
+        for i in range(50):
+            record_progress(self.c, self.read(path=f"new_{i}.py"))
+        self.c.update(progress_guidance_turn=1, model_turns=4)
+        self.assertEqual(self.c["no_progress_steps"], 0)
+        self.assertTrue(implementation_stalled(self.c))
+        check = ToolExecutionResult(
+            tool_call_id="c",
+            name="run_check",
+            ok=True,
+            summary="pass",
+            data={"check_id": "quick", "source_hash": "checked"},
+        )
+        record_progress(self.c, check)
+        self.assertIsNone(progress_guidance(self.c))
+        for _ in range(12):
+            record_progress(self.c, check)
+        self.assertIsNotNone(progress_guidance(self.c))
+
+    def test_complementary_ranges_survive_alternation_and_history_rollover(self):
+        path = "large.py"
+        body = "".join(f"LINE_{i:03d} = {i}\n" for i in range(1, 312))
+        (self.root / path).write_text(body, encoding="utf-8")
+        observations = []
+        for start, end in [(1, 120), (240, 311)] * 8:
+            result = read_file(self.root, path=path, start_line=start, end_line=end).model_copy(
+                update={"arguments": {"path": path, "start_line": start, "end_line": end}}
+            )
+            record_result(self.c, result)
+            observations.append(result)
+        context = working_context(self.c, self.root)
+        spec = AppSpec.model_validate(valid_spec())
+        messages = build_code_engineer_messages(
+            spec=spec,
+            work_item=WorkItem(id="auth", title="Auth", requirement_ids=[spec.features[0].id]),
+            system_design=None,
+            engineering_context={"working_memory": context},
+            observations=observations,
+        )
+        native = [json.loads(m["content"]) for m in messages if m["role"] == "tool"]
+        self.assertEqual(len(native), 2)
+        self.assertIn("LINE_001", str(native))
+        self.assertIn("LINE_311", str(native))
+        restored = load_checkpoint(json.loads(json.dumps({"checkpoint": self.c})))
+        evidence = working_context(restored, self.root)["source_evidence"]
+        self.assertEqual(
+            {(e["start_line"], e["end_line"]) for e in evidence}, {(1, 120), (240, 311)}
+        )
+        self.assertIn("LINE_001", str(evidence))
+        self.assertIn("LINE_311", str(evidence))
+
+    def range_read(self, start, end):
+        result = read_file(self.root, path="large.py", start_line=start, end_line=end).model_copy(
+            update={"arguments": {"path": "large.py", "start_line": start, "end_line": end}}
+        )
+        record_result(self.c, result)
+        return result
+
+    def test_new_source_version_replaces_all_cached_ranges(self):
+        (self.root / "large.py").write_text("OLD_HEAD\nmiddle\nOLD_TAIL\n", encoding="utf-8")
+        old = [self.range_read(1, 1), self.range_read(3, 3)]
+        (self.root / "large.py").write_text("NEW_HEAD\nmiddle\nNEW_TAIL\n", encoding="utf-8")
+        # An external change is not silently merged with the prior version.
+        new = self.range_read(1, 1)
+        context = working_context(self.c, self.root)
+        self.assertNotIn("OLD_", str(context["source_evidence"]))
+        self.assertNotIn("NEW_TAIL", str(context["source_evidence"]))
+        spec = AppSpec.model_validate(valid_spec())
+        messages = build_code_engineer_messages(
+            spec=spec,
+            work_item=WorkItem(id="auth", title="Auth", requirement_ids=[spec.features[0].id]),
+            system_design=None,
+            engineering_context={"working_memory": context},
+            observations=[*old, new],
+        )
+        native = [m["content"] for m in messages if m["role"] == "tool"]
+        self.assertEqual(len(native), 1)
+        self.assertNotIn("OLD_", str(native))
+        self.assertIn("NEW_HEAD", str(native))
+
+    def test_range_cache_and_model_context_remain_bounded(self):
+        body = "".join(f"{i:03d}:" + "x" * 96 + "\n" for i in range(600))
+        (self.root / "large.py").write_text(body, encoding="utf-8")
+        for start in range(1, 600, 50):
+            self.range_read(start, start + 49)
+        fragments = self.c["source_evidence"]["large.py"]["fragments"]
+        self.assertLessEqual(sum(len(e["content"]) for e in fragments), 24000)
+        for i in range(8):
+            self.read(f"other{i}.py", "y" * 6000)
+        context = working_context(self.c, self.root)
+        self.assertLessEqual(sum(len(e["content"]) for e in context["source_evidence"]), 24000)
+        self.assertTrue(context["omitted_evidence_ranges"])
+        # Version knowledge survives omission from the text budget.
+        self.assertIn("large.py", context["source_hashes"])
+
+    def test_legacy_range_migration_recovers_history_and_preserves_stop_state(self):
+        (self.root / "large.py").write_text("HEAD\nmiddle\nTAIL\n", encoding="utf-8")
+        head, tail = self.range_read(1, 1), self.range_read(3, 3)
+        self.c.update(
+            schema_version=15,
+            outcome="blocked",
+            model_turns=72,
+            tool_calls=97,
+            blocked_reason_code="MODEL_BUDGET_EXHAUSTED",
+        )
+        # Schema 15 kept only the latest range for each path.
+        self.c["source_evidence"] = {"large.py": {**tail.data, "model_turn": 71}}
+        self.c["observations"] = [head.model_dump(mode="json"), tail.model_dump(mode="json")]
+        loaded = load_checkpoint({"checkpoint": self.c})
+        context = working_context(loaded, self.root)
+        self.assertEqual(
+            {(e["start_line"], e["end_line"]) for e in context["source_evidence"]}, {(1, 1), (3, 3)}
+        )
+        self.assertEqual(
+            (loaded["model_turns"], loaded["tool_calls"], loaded["outcome"]), (72, 97, "blocked")
+        )
+        self.assertEqual(load_checkpoint({"checkpoint": loaded}), loaded)
+
+    def test_legacy_migration_does_not_revive_reads_before_a_write(self):
+        old = self.read("large.py", "OLD_HEAD\nOLD_TAIL\n")
+        raw = b"NEW_HEAD\nNEW_TAIL\n"
+        (self.root / "large.py").write_bytes(raw)
+        self.c.update(
+            schema_version=15,
+            observations=[old.model_dump(mode="json")],
+            observed_hashes={"large.py": sha256_bytes(raw)},
+        )
+        self.c["source_evidence"] = {
+            "large.py": {
+                "path": "large.py",
+                "content": raw.decode(),
+                "content_hash": sha256_bytes(raw),
+                "start_line": 1,
+                "end_line": 2,
+                "line_count": 2,
+            }
+        }
+        loaded = load_checkpoint({"checkpoint": self.c})
+        self.assertNotIn("OLD_", str(working_context(loaded, self.root)))
+        self.assertIn("NEW_HEAD", str(working_context(loaded, self.root)))
+
+    def test_failed_read_feedback_survives_with_valid_ranges(self):
+        success = self.read("large.py", "HEAD\nTAIL\n")
+        failure = read_file(self.root, path="large.py", start_line=10, end_line=20)
+        spec = AppSpec.model_validate(valid_spec())
+        messages = build_code_engineer_messages(
+            spec=spec,
+            work_item=WorkItem(id="auth", title="Auth", requirement_ids=[spec.features[0].id]),
+            system_design=None,
+            engineering_context={"working_memory": working_context(self.c, self.root)},
+            observations=[success, failure],
+        )
+        native = [json.loads(m["content"]) for m in messages if m["role"] == "tool"]
+        self.assertEqual(len(native), 2)
+        self.assertTrue(any(not e["ok"] for e in native))
 
     def test_evidence_and_progress_survive_rollover_and_recovery(self):
         self.read()
@@ -144,68 +333,39 @@ class WorkMemoryTests(unittest.TestCase):
         self.assertTrue(context["omitted_evidence_paths"])
         self.assertTrue(any(x["content_truncated"] for x in context["source_evidence"]))
 
-    def test_stall_requires_focus_before_any_more_reads(self):
-        for i in range(12):
-            self.read(f"f{i}.py")
-        self.assertEqual(correction(self.c)["phase"], "awaiting_focus")
-        self.assertEqual(tool_names(self.c, self.names), {FOCUS_TOOL, "report_blocked"})
-        with self.assertRaises(ConflictException):
-            validate_action(
-                self.c,
-                ToolCall(id="r", name="read_file", arguments={"path": "user.py"}),
-                self.names,
+    def test_legacy_focus_upgrade_keeps_audit_and_does_not_resume_or_reset(self):
+        for phase in ["awaiting_focus", "acting", "exhausted"]:
+            checkpoint = new_checkpoint()
+            checkpoint.update(
+                schema_version=14,
+                current_work_item_id="auth",
+                outcome="blocked",
+                blocked_reason_code="NO_SOURCE_PROGRESS",
+                model_turns=40,
+                tool_calls=90,
             )
-
-    def test_correction_reads_are_targeted_bounded_and_durable(self):
-        self.focus()
-        with self.assertRaises(ConflictException):
-            validate_action(
-                self.c,
-                ToolCall(id="r", name="read_file", arguments={"path": "unrelated.py"}),
-                self.names,
+            item_memory(checkpoint).update(
+                correction={"phase": phase, "read_calls_remaining": 0},
+                correction_used=True,
             )
-        for _ in range(4):
-            call = ToolCall(id="r", name="read_file", arguments={"path": "user.py"})
-            validate_action(self.c, call, self.names)
-            self.read()
-            self.c = json.loads(json.dumps(self.c))
-        self.assertNotIn("read_file", tool_names(self.c, self.names))
-        self.assertIn("report_blocked", tool_names(self.c, self.names))
-        self.assertIn("write_file", tool_names(self.c, self.names))
-        self.assertEqual(correction(self.c)["read_calls_remaining"], 0)
+            checkpoint["pending_tool"] = {"name": "update_work_item_focus"}
+            item_memory(checkpoint)["recent_actions"] = [
+                {"tool": "update_work_item_focus", "summary": "old restriction"},
+                {"tool": "model_response", "summary": "old refusal"},
+                {"tool": "read_file", "summary": "current source"},
+            ]
+            loaded = load_checkpoint({"checkpoint": checkpoint})
+            context = working_context(loaded, self.root)
+            self.assertNotIn("correction", context)
+            self.assertEqual([a["tool"] for a in context["recent_actions"]], ["read_file"])
+            self.assertNotIn("pending_tool", loaded)
+            self.assertEqual(loaded["legacy_pending_tool"]["name"], "update_work_item_focus")
+            self.assertEqual(item_memory(loaded)["legacy_correction"]["phase"], phase)
+            self.assertEqual(loaded["outcome"], "blocked")
+            self.assertEqual((loaded["model_turns"], loaded["tool_calls"]), (40, 90))
+            self.assertEqual(load_checkpoint({"checkpoint": loaded}), loaded)
 
-    def test_noop_checks_cannot_extend_correction_forever(self):
-        self.focus()
-        result = ToolExecutionResult(
-            tool_call_id="check",
-            name="run_check",
-            ok=True,
-            summary="same check",
-            data={"source_hash": "same"},
-        )
-        outcomes = [record_result(self.c, result) for _ in range(MAX_RECOVERY_ACTIONS)]
-        self.assertEqual(outcomes[-1], "exhausted")
-        self.assertEqual(correction(self.c)["phase"], "exhausted")
-
-    def test_correction_note_does_not_complete_or_reset_usage(self):
-        self.c.update(model_turns=40, tool_calls=80, no_progress_steps=6)
-        self.focus()
-        self.assertEqual(self.c["outcome"], "running")
-        self.assertEqual(self.c["no_progress_steps"], 6)
-        self.assertEqual(self.c["model_turns"], 40)
-        self.assertEqual(self.c["tool_calls"], 80)
-
-    def test_focus_rejects_other_item_and_paths_outside_workspace(self):
-        request_correction(self.c, "stalled")
-        for override in [
-            {"work_item_id": "other"},
-            {"target_paths": ["../outside.py"]},
-            {"read_paths": ["F:/outside.py"]},
-        ]:
-            with self.assertRaises(ConflictException):
-                validate_focus(self.c, {**self.args, **override}, self.root)
-
-    def test_explicit_stall_retry_keeps_evidence_and_requires_changed_approach(self):
+    def test_explicit_stall_retry_keeps_evidence_without_forced_focus(self):
         self.read()
         self.c.update(
             outcome="blocked",
@@ -215,18 +375,17 @@ class WorkMemoryTests(unittest.TestCase):
             tool_calls=90,
         )
         retried = prepare_manual_repair_retry({"checkpoint": self.c})["checkpoint"]
-        self.assertEqual(retried["model_turns"], 40)
-        self.assertEqual(retried["tool_calls"], 90)
+        self.assertEqual((retried["model_turns"], retried["tool_calls"]), (40, 90))
         self.assertIn("user.py", retried["source_evidence"])
-        self.assertEqual(correction(retried)["phase"], "awaiting_focus")
-        self.assertEqual(tool_names(retried, self.names), {FOCUS_TOOL, "report_blocked"})
+        self.assertNotIn("correction", working_context(retried, self.root))
+        self.assertTrue(retried["recovery_context"]["historical"])
+        self.assertEqual(retried["outcome"], "running")
 
-    def test_work_item_switch_does_not_inherit_other_items_stall(self):
-        self.focus()
+    def test_work_item_switch_keeps_memory_separate(self):
+        self.read()
         self.c["current_work_item_id"] = "jobs"
-        self.assertEqual(correction(self.c), {})
+        self.assertEqual(item_memory(self.c)["inspection_steps"], 0)
         self.assertEqual(item_memory(self.c)["changed_files"], {})
-        self.assertIn("search_code", tool_names(self.c, self.names))
 
     def test_messages_supply_evidence_once_and_remove_stale_reads(self):
         result = self.read()
@@ -284,7 +443,7 @@ class WorkMemoryTests(unittest.TestCase):
         del self.c["work_memory"]
         del self.c["source_evidence"]
         loaded = load_checkpoint({"checkpoint": self.c})
-        self.assertEqual(loaded["schema_version"], 14)
+        self.assertEqual(loaded["schema_version"], 17)
         self.assertEqual(loaded["outcome"], "blocked")
         self.assertEqual((loaded["model_turns"], loaded["tool_calls"]), (166, 250))
 

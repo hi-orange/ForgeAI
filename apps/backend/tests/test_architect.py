@@ -80,6 +80,98 @@ def valid_design() -> dict:
 
 
 class ArchitectTests(unittest.TestCase):
+    def test_partial_draft_survives_interruption_and_submits_without_repeating_design(self):
+        progress = []
+        design = valid_design()
+        keys = list(design)
+        first = {key: design[key] for key in keys[:3]}
+        second = {key: design[key] for key in keys[3:]}
+        with TemporaryDirectory() as directory:
+            with patch.object(
+                architect_agent,
+                "chat_with_tools",
+                side_effect=[
+                    ChatWithToolsResult(tool_calls=[ToolCall(id="r", name="read_artifact")]),
+                    ChatWithToolsResult(
+                        tool_calls=[
+                            ToolCall(id="p", name="editor_patch", arguments={"sections": first})
+                        ]
+                    ),
+                    BusinessException("interrupted"),
+                ],
+            ):
+                with self.assertRaisesRegex(BusinessException, "interrupted"):
+                    architect_agent.generate_system_design(
+                        spec=valid_spec(),
+                        workspace_root=Path(directory),
+                        on_checkpoint=progress.append,
+                    )
+            saved = progress[-1]
+            self.assertEqual(saved["state"]["draft_sections"], first)
+            self.assertEqual(saved["turns"], 3)
+            with patch.object(
+                architect_agent,
+                "chat_with_tools",
+                side_effect=[
+                    ChatWithToolsResult(
+                        tool_calls=[
+                            ToolCall(id="p2", name="editor_patch", arguments={"sections": second})
+                        ]
+                    ),
+                    ChatWithToolsResult(tool_calls=[ToolCall(id="s", name="write_system_design")]),
+                ],
+            ):
+                result = architect_agent.generate_system_design(
+                    spec=valid_spec(),
+                    workspace_root=Path(directory),
+                    checkpoint=saved,
+                    on_checkpoint=progress.append,
+                )
+            self.assertEqual(result.model_dump(mode="json"), design)
+            self.assertEqual(progress[-1]["turns"], 5)
+
+    def test_patch_is_atomic_and_submission_still_checks_full_frozen_contract(self):
+        with TemporaryDirectory() as directory:
+            state = ArchitectToolState(app_spec=valid_spec(), workspace_root=Path(directory))
+
+            def call(name, **arguments):
+                return execute_architect_tool(
+                    ToolCall(id="x", name=name, arguments=arguments), state
+                )
+
+            call("editor_patch", sections={"architecture_overview": "first"})
+            result, _ = call(
+                "editor_patch", sections={"architecture_overview": "changed", "modules": []}
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(state.draft_sections, {"architecture_overview": "first"})
+            self.assertFalse(call("write_system_design")[0].ok)
+            call("read_artifact")
+            self.assertFalse(call("write_system_design")[0].ok)
+            call("editor_patch", sections=valid_design())
+            result, _ = call(
+                "editor_patch",
+                sections={"architecture_notes": ["Additional risk"]},
+                append_lists=True,
+            )
+            self.assertTrue(result.ok)
+            self.assertEqual(len(state.draft_sections["architecture_notes"]), 2)
+            call(
+                "editor_patch",
+                sections={
+                    "implementation_dependencies": [
+                        {
+                            "prerequisite_requirement_id": "unknown",
+                            "dependent_requirement_id": "feat_track",
+                            "reason": "invalid reference",
+                        }
+                    ]
+                },
+            )
+            self.assertFalse(call("write_system_design")[0].ok)
+            call("editor_patch", sections={"implementation_dependencies": []})
+            self.assertTrue(call("write_system_design")[0].ok)
+
     def test_recovers_design_draft_and_inspections_without_restarting_tool_loop(self):
         progress = []
         initial = [
@@ -170,6 +262,7 @@ class ArchitectTests(unittest.TestCase):
                     "read_artifact",
                     "editor_read",
                     "editor_write",
+                    "editor_patch",
                     "terminal_list",
                     "terminal_run",
                     "write_system_design",

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypedDict, cast
@@ -50,25 +48,19 @@ from app.generation.engineering.diagnostics import (
     MAX_IDENTICAL_TOOL_FAILURES,
     acceptance_feedback,
     active_diagnostics,
+    check_verification,
     invalidate_source_evidence,
+    reconcile_protocol_diagnostic,
     record_feedback,
+    resolve_protocol_diagnostic,
 )
 from app.generation.engineering.work_memory import (
-    FOCUS_TOOL,
-    accept_focus,
-    correction,
-    validate_focus,
+    implementation_stalled,
+    progress_guidance,
+    record_progress,
     working_context,
 )
-from app.generation.engineering.work_memory import (
-    record_result as record_work_result,
-)
-from app.generation.engineering.work_memory import (
-    tool_names as focused_tool_names,
-)
-from app.generation.engineering.work_memory import (
-    validate_action as validate_focused_action,
-)
+from app.generation.engineering.work_memory import record_result as record_work_result
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.user import User
 from app.schemas.agent_action import ToolCall, ToolExecutionResult
@@ -116,7 +108,6 @@ class _WorkflowState(_WorkflowInputState, total=False):
 
 
 class _WorkflowUpdate(TypedDict, total=False):
-    yield_decision: bool
     outcome: str
     current_work_item_id: str | None
     model_turns: int
@@ -171,11 +162,6 @@ class _EngineeringNodes:
     @staticmethod
     def _result(checkpoint: dict[str, Any]) -> _WorkflowUpdate:
         return {
-            "yield_decision": correction(checkpoint).get("phase") == "awaiting_focus"
-            or (
-                correction(checkpoint).get("phase") == "acting"
-                and correction(checkpoint).get("read_calls_remaining", 0) <= 0
-            ),
             "outcome": str(checkpoint.get("outcome") or "running"),
             "current_work_item_id": checkpoint.get("current_work_item_id"),
             "model_turns": int(checkpoint.get("model_turns") or 0),
@@ -313,13 +299,6 @@ class _EngineeringNodes:
         if isinstance(loaded, dict):
             return cast(_WorkflowUpdate, loaded)
         snapshot, checkpoint, spec, system_design, work_item, root = loaded
-        self._persist_waiting(
-            state,
-            name="decide_action",
-            label="Choose engineering action",
-            detail=work_item.title,
-            reserve_model=True,
-        )
         tools = [
             tool
             for tool in CODE_ENGINEER_TOOLS
@@ -346,8 +325,16 @@ class _EngineeringNodes:
             tools = [
                 tool for tool in tools if tool.name in {"update_delivery_plan", "report_blocked"}
             ]
-        allowed_focus = focused_tool_names(checkpoint, {tool.name for tool in tools})
-        tools = [tool for tool in tools if tool.name in allowed_focus]
+        available = sorted(tool.name for tool in tools)
+        reconcile_protocol_diagnostic(checkpoint, available)
+        self._persist_waiting(
+            state,
+            name="decide_action",
+            label="Choose engineering action",
+            detail=work_item.title,
+            reserve_model=True,
+            available_tools=available,
+        )
         try:
             decision = decide_next_action(
                 spec=spec,
@@ -355,6 +342,11 @@ class _EngineeringNodes:
                 work_item=work_item,
                 tools=tools,
                 engineering_context={
+                    "available_tools": available,
+                    "thinking_enabled": checkpoint.get(
+                        "thinking_enabled", settings.code_engineer_thinking
+                    ),
+                    "model_responses": checkpoint.get("model_responses", []),
                     "needs_delivery_plan": checkpoint.get("needs_delivery_plan", False),
                     "planning_turns_remaining": max(
                         0,
@@ -376,6 +368,8 @@ class _EngineeringNodes:
                     ],
                     "repair_context": checkpoint.get("repair_context"),
                     "active_diagnostics": active_diagnostics(checkpoint),
+                    "check_verification": check_verification(checkpoint),
+                    "progress_guidance": progress_guidance(checkpoint),
                     "quality_report": snapshot.get("quality_report"),
                     "acceptance_test_plan": snapshot.get("acceptance_test_plan"),
                     "acceptance_test_hash": snapshot.get("acceptance_test_hash"),
@@ -397,16 +391,32 @@ class _EngineeringNodes:
             call = ToolCall(
                 id=f"protocol_{checkpoint.get('model_turns', 0)}", name="model_response"
             )
-            return self._record_action(state, call, PreparedAction(rejected_tool(call, exc)), root)
+            result = rejected_tool(call, exc)
+            result = result.model_copy(
+                update={"data": {**result.data, "available_tools": available}}
+            )
+            return self._record_action(state, call, PreparedAction(result), root)
         except ProviderException:
             # The durable worker owns provider backoff and retryability. Preserve
             # this checkpoint instead of converting a network failure into a product block.
             raise
         except BusinessException as exc:
             return self._persist_failure(state, str(exc))
+        if decision.reasoning_content is not None:
+            with self._session_factory() as db:
+                execution, current_snapshot, current = _locked_current(db, state)
+                current["model_responses"] = [
+                    *(current.get("model_responses") or []),
+                    {
+                        "model_turn": current["model_turns"],
+                        "result": decision.model_dump(mode="json"),
+                    },
+                ][-24:]
+                current_snapshot["checkpoint"] = current
+                _save_snapshot(db, execution.execution_id, current_snapshot)
         for call in decision.tool_calls:
             update = self._execute_call(state, snapshot, checkpoint, work_item, root, call)
-            if update.get("outcome") != "running" or update.get("yield_decision"):
+            if update.get("outcome") != "running":
                 return update
         return update
 
@@ -433,15 +443,12 @@ class _EngineeringNodes:
                 current_snapshot["checkpoint"] = current
                 _save_snapshot(db, execution.execution_id, current_snapshot)
                 return self._result(current)
+            resolve_protocol_diagnostic(current)
             current["tool_calls"] = int(current.get("tool_calls") or 0) + 1
             current["pending_tool"] = call.model_dump(mode="json")
             current_snapshot["checkpoint"] = current
             _save_snapshot(db, execution.execution_id, current_snapshot)
             checkpoint = current
-        try:
-            validate_focused_action(checkpoint, call, {tool.name for tool in CODE_ENGINEER_TOOLS})
-        except ConflictException as exc:
-            return self._record_action(state, call, PreparedAction(rejected_tool(call, exc)), root)
         if checkpoint.get("needs_delivery_plan") and call.name in MUTATING_TOOLS | {
             "complete_work_item",
             "run_check",
@@ -449,7 +456,7 @@ class _EngineeringNodes:
             action = PreparedAction(
                 rejected_tool(call, ValueError("先提交有效工程依赖计划，再执行源码任务"))
             )
-        elif call.name in {"update_delivery_plan", FOCUS_TOOL}:
+        elif call.name == "update_delivery_plan":
             action = PreparedAction(
                 ToolExecutionResult(
                     tool_call_id=call.id,
@@ -489,19 +496,8 @@ class _EngineeringNodes:
         with self._session_factory() as db:
             execution, snapshot, current = _locked_current(db, state)
             result = commit_action(action, root, revision_id=execution.execution_id)
+            result = result.model_copy(update={"model_turn": current["model_turns"]})
             progressed = False
-            if call.name == FOCUS_TOOL and result.ok:
-                try:
-                    validate_focus(current, call.arguments, root)
-                    accept_focus(current, call.arguments)
-                    result = result.model_copy(
-                        update={
-                            "summary": "下一步已记录；有限补读后实现并验证，缺少条件可报告阻断",
-                            "data": {"correction": correction(current)},
-                        }
-                    )
-                except (ConflictException, ValueError, OSError) as exc:
-                    result = rejected_tool(call, exc)
             if call.name == "update_delivery_plan" and result.ok:
                 try:
                     if snapshot.get("quality_report") is not None:
@@ -551,23 +547,12 @@ class _EngineeringNodes:
                 )
             else:
                 result = record_feedback(current, result)
+            result = result.model_copy(update={"model_turn": current["model_turns"]})
             current.pop("pending_tool", None)
             history = list(current.get("observations") or [])
             history.append(result.model_dump(mode="json"))
             current["observations"] = history[-24:]
             hashes = dict(current.get("observed_hashes") or {})
-            if result.ok and call.name in {"read_file", "list_files", "search_code"}:
-                fingerprint = hashlib.sha256(
-                    json.dumps(
-                        [call.name, call.arguments, result.data],
-                        sort_keys=True,
-                        ensure_ascii=False,
-                    ).encode()
-                ).hexdigest()
-                seen = list(current.get("context_fingerprints") or [])
-                progressed = fingerprint not in seen
-                if progressed:
-                    current["context_fingerprints"] = [*seen, fingerprint]
             if result.ok and call.name == "read_file":
                 path = result.data.get("path")
                 digest = result.data.get("content_hash")
@@ -586,19 +571,8 @@ class _EngineeringNodes:
             if changed:
                 current["revision_id"] = execution.execution_id
                 invalidate_source_evidence(current)
-            if changed or progressed:
-                current["no_progress_steps"] = 0
-            else:
-                current["no_progress_steps"] = int(current.get("no_progress_steps") or 0) + 1
-            stall = record_work_result(current, result, updates=action.updates)
-            if stall == "requested":
-                append_activity(
-                    current,
-                    name="work_item_stalled",
-                    label="Adjust next action",
-                    detail=correction(current)["reason"],
-                    ok=False,
-                )
+            record_progress(current, result, changed=bool(changed), plan_changed=progressed)
+            record_work_result(current, result, updates=action.updates)
             log_tool_result("Code Engineer", int(current["model_turns"]), call, result)
             append_activity(
                 current, name=call.name, label=call.name, detail=result.summary, ok=result.ok
@@ -620,16 +594,16 @@ class _EngineeringNodes:
                     if call.name == "run_check"
                     else "REPEATED_TOOL_FAILURE",
                 )
-            elif stall == "exhausted":
-                block_checkpoint(
-                    current,
-                    "当前工作项已进行一次有界纠偏，仍未形成源码进展，停止本次执行",
-                    reason_code="NO_SOURCE_PROGRESS",
-                )
             elif current.get("needs_delivery_plan") and current["no_progress_steps"] >= 12:
                 block_checkpoint(
                     current,
                     "连续 12 个工具动作没有新证据、计划或源码进展，停止本次执行",
+                    reason_code="NO_SOURCE_PROGRESS",
+                )
+            if current.get("outcome") == "running" and implementation_stalled(current):
+                block_checkpoint(
+                    current,
+                    "已提供当前事实指导，仍持续没有源码或验证进展；保留现场等待显式继续",
                     reason_code="NO_SOURCE_PROGRESS",
                 )
             snapshot["checkpoint"] = current
@@ -746,10 +720,16 @@ class _EngineeringNodes:
         label: str,
         detail: str,
         reserve_model: bool = False,
+        available_tools: list[str] | None = None,
     ) -> None:
         with self._session_factory() as db:
             execution, snapshot, checkpoint = _locked_current(db, state)
+            if available_tools is not None:
+                reconcile_protocol_diagnostic(checkpoint, available_tools)
+            if reserve_model and progress_guidance(checkpoint) is not None:
+                checkpoint.setdefault("progress_guidance_turn", int(checkpoint["model_turns"]) + 1)
             if reserve_model:
+                checkpoint.setdefault("thinking_enabled", settings.code_engineer_thinking)
                 checkpoint["model_turns"] = int(checkpoint.get("model_turns") or 0) + 1
                 if checkpoint.get("needs_delivery_plan"):
                     checkpoint["planning_turns"] = int(checkpoint.get("planning_turns") or 0) + 1
@@ -819,12 +799,14 @@ class _EngineeringNodes:
 
         final_result: ToolExecutionResult | None = None
         result = quick_result
-        if quick_result.ok and is_final_work_item:
+        if quick_result.ok and (
+            is_final_work_item or work_item.kind == "feature" or work_item.provides_requirement_ids
+        ):
             self._persist_waiting(
                 state,
-                name="run_final_check",
-                label="Run final checks",
-                detail="所有工作项已生成，执行完整构建、迁移和真实前后端冒烟",
+                name="run_final_check" if is_final_work_item else "run_integration_check",
+                label="Run final checks" if is_final_work_item else "Run integration checks",
+                detail=f"验证工作项“{work_item.title}”的构建、迁移和真实前后端冒烟",
             )
             final_result = self._run_check(
                 root,
@@ -930,8 +912,10 @@ class _EngineeringNodes:
                 final_excerpt = "" if final_failure is None else final_failure.excerpt
                 append_activity(
                     current,
-                    name="final_check_result",
-                    label="Final checks passed" if final_result.ok else "Final checks failed",
+                    name="final_check_result" if is_final_work_item else "integration_check_result",
+                    label="Integration checks passed"
+                    if final_result.ok
+                    else "Integration checks failed",
                     detail=(
                         final_result.summary
                         if final_result.ok
@@ -942,6 +926,7 @@ class _EngineeringNodes:
 
             # Attribute verification evidence to the item being checked before advancing.
             record_work_result(current, result)
+            record_progress(current, result)
             apply_check_outcome(
                 current,
                 work_item=work_item,
@@ -953,6 +938,7 @@ class _EngineeringNodes:
             observation = result.model_copy(
                 update={
                     "tool_call_id": pending.get("id", result.tool_call_id),
+                    "model_turn": current["model_turns"],
                     "name": "complete_work_item",
                     "arguments": pending.get("arguments", {}),
                 }
@@ -973,6 +959,8 @@ class _EngineeringNodes:
             ][-24:]
             if result.ok:
                 current["no_progress_steps"] = 0
+                current["steps_without_delivery"] = 0
+                current.pop("progress_guidance_turn", None)
             current_snapshot["checkpoint"] = current
             _save_snapshot(db, execution.execution_id, current_snapshot)
             renew_execution_lease(db, state["task_id"], execution.execution_id)

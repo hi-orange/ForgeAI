@@ -62,6 +62,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
                 "read_artifact",
                 "editor_read",
                 "editor_write",
+                "editor_patch",
                 "terminal_list",
                 "terminal_run",
                 "write_system_design",
@@ -84,7 +85,6 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
         allowed_tools=frozenset(
             {
                 "update_delivery_plan",
-                "update_work_item_focus",
                 "list_files",
                 "read_file",
                 "search_code",

@@ -1,12 +1,15 @@
 """Dependency scheduling is independent of PRD order and protected on replan."""
 
+import json
 import unittest
 from copy import deepcopy
+from pathlib import Path
 
 from test_architect import valid_design
 
 from app.core.exceptions import ConflictException
 from app.generation.delivery import (
+    DeliveryPlanError,
     PlannedWorkItem,
     WorkItem,
     replace_delivery_plan,
@@ -128,6 +131,76 @@ class DeliveryDependencyTests(unittest.TestCase):
         items[0].depends_on = ["theme"]
         with self.assertRaises(ConflictException):
             replace_delivery_plan(dependency_spec(), items, [], dependency_design())
+
+    def test_real_visual_prerequisite_plan_has_an_explicit_repair_path(self):
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures/visual_prerequisite_plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        spec = AppSpec.model_validate(fixture["spec"])
+        design = SystemDesign.model_validate(
+            {**valid_design(), "implementation_dependencies": fixture["dependencies"]}
+        )
+        items = [PlannedWorkItem.model_validate(i) for i in fixture["original"]]
+        with self.assertRaises(DeliveryPlanError) as raised:
+            replace_delivery_plan(spec, items, [], design)
+        issues = raised.exception.diagnostic.issues
+        self.assertEqual({i["code"] for i in issues}, {"MISSING_REQUIREMENT_DEPENDENCY"})
+        self.assertEqual({i["prerequisite_requirement_id"] for i in issues}, {"feat_visual"})
+        for issue in issues:
+            self.assertIn("visual_foundation", issue["linked_ancestor_ids"])
+            self.assertIn("provides_requirement_ids", issue["suggested_action"])
+        visual = next(i for i in items if i.id == "visual_foundation")
+        visual.provides_requirement_ids = ["feat_visual"]
+        rows = replace_delivery_plan(spec, items, [], design)
+        self.assertEqual(current_item(rows)["id"], visual.id)
+        self.assertTrue(all(i["status"] == "pending" for i in rows))
+        self.assertEqual(rows[0]["provides_requirement_ids"], ["feat_visual"])
+        # Planning and evidence declarations grant no completion or check results.
+        self.assertTrue(all(i["summary"] is None for i in rows))
+        # Real nonvisual dependencies remain mandatory in the same recorded plan.
+        next(i for i in items if i.id == "jobs_public_api").depends_on = [visual.id]
+        with self.assertRaises(DeliveryPlanError):
+            replace_delivery_plan(spec, items, [], design)
+
+    def test_provisions_require_linked_scope_and_verifiable_deliverables(self):
+        for mutation in ("unlinked", "unknown", "no_acceptance", "no_deliverables"):
+            with self.subTest(mutation=mutation):
+                items = dependency_items()
+                visual = items[-1]
+                visual.provides_requirement_ids = ["login"]
+                visual.acceptance = ["A real session survives refresh"]
+                visual.deliverables = ["Session API and integration probe"]
+                if mutation == "unlinked":
+                    visual.requirement_ids = ["dashboard"]
+                elif mutation == "unknown":
+                    visual.provides_requirement_ids = ["payments"]
+                elif mutation == "no_acceptance":
+                    visual.acceptance = []
+                else:
+                    visual.deliverables = []
+                with self.assertRaises(DeliveryPlanError) as raised:
+                    replace_delivery_plan(dependency_spec(), items, [], dependency_design())
+                self.assertIn(
+                    "INVALID_REQUIREMENT_PROVISION",
+                    {i["code"] for i in raised.exception.diagnostic.issues},
+                )
+
+    def test_explicit_provision_still_requires_an_ancestor(self):
+        items = dependency_items()
+        items[0].depends_on = ["theme"]
+        items[1].provides_requirement_ids = ["login"]
+        items[1].acceptance = ["Session survives refresh"]
+        items[1].deliverables = ["Session API"]
+        with self.assertRaises(DeliveryPlanError):
+            replace_delivery_plan(dependency_spec(), items, [], dependency_design())
+        items[0].depends_on = ["auth"]
+        rows = replace_delivery_plan(dependency_spec(), items, [], dependency_design())
+        rows[1]["status"] = "completed"
+        items[1].provides_requirement_ids = []
+        with self.assertRaisesRegex(ConflictException, "已完成"):
+            replace_delivery_plan(dependency_spec(), items, rows, dependency_design())
 
     def test_completed_nodes_are_immutable_and_pending_can_be_split(self):
         items = dependency_items()

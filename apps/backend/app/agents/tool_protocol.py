@@ -97,6 +97,8 @@ def append_tool_batch_exchange(
             ],
         }
     )
+    if result.reasoning_content is not None:
+        messages[-1]["reasoning_content"] = result.reasoning_content
     messages.extend(
         {
             "role": "tool",

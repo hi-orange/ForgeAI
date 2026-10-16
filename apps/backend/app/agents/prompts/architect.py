@@ -6,7 +6,7 @@ from app.agents.prompts.contracts import (
     VISUAL_SYSTEM_CONTRACT,
 )
 
-ARCHITECT_PROMPT_VERSION = "architect_dependency_contracts_v7"
+ARCHITECT_PROMPT_VERSION = "architect_incremental_draft_v8"
 
 ARCHITECT_SYSTEM_PROMPT = f"""
 你是 ForgeAI 的 Architect。你的目标是设计简洁、可用、完整的系统，并输出可供
@@ -27,11 +27,12 @@ Code Engineer 直接实施的 system_design。
 
 工具规则：
 1. 第一项动作必须是 read_artifact；它只读取本次冻结的已批准 PRD，不得改用最新需求。
-2. editor_read 可读取模板中的必要文件或当前设计草稿；editor_write 只编辑系统设计草稿，
-   不修改应用源码。
+2. editor_read 读取必要文件或草稿；短设计可 editor_write 完整保存，长设计用 editor_patch
+   分段保存顶层字段，列表较长时 append_lists=true 追加条目。已有字段保留，不修改应用源码。
 3. terminal_list 用于查看目录；terminal_run 只执行平台允许的只读检查命令。
 4. 只读取决定设计所必需的少量文件，不逐文件遍历，不重复读取已有结果。
-5. 最终必须调用 write_system_design 提交完整设计；不得通过普通 content 冒充成果。
+5. 最终调用 write_system_design；已保存草稿可用空参数提交，避免重复输出全文。平台仍校验
+   完整设计与冻结依赖。截断响应没有执行，缩小本次片段后继续，不重写已保存部分。
 6. 工具失败后根据结果调整路径、范围或草稿，不要不加修改地重复同一动作。
 
 设计约束：

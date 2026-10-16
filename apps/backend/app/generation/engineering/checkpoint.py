@@ -17,7 +17,7 @@ from app.schemas.agent_action import ToolExecutionResult
 from app.tools.check_diagnostics import CheckFailureAnalysis, analyze_check_failure
 
 CHECKPOINT_KIND = "engineering_checkpoint"
-CHECKPOINT_SCHEMA_VERSION = 14
+CHECKPOINT_SCHEMA_VERSION = 17
 EXECUTION_MODE = "evidence_tool_loop_v1"
 
 
@@ -144,10 +144,59 @@ def load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
             no_progress_steps=0,
         )
         checkpoint.pop("pending_tool", None)
-    elif previous_schema < 14:
+    if previous_schema < 15:
+        # Keep old focus plans as audit data only. Migration never resumes a run.
+        for memory in checkpoint["work_memory"].values():
+            if "correction" in memory:
+                memory["legacy_correction"] = memory.pop("correction")
+            memory.pop("correction_used", None)
+        pending = checkpoint.get("pending_tool")
+        if isinstance(pending, dict) and pending.get("name") == "update_work_item_focus":
+            checkpoint["legacy_pending_tool"] = checkpoint.pop("pending_tool")
+        for scope, state in checkpoint["diagnostic_state"].items():
+            if scope == "tool:model_response:" or scope.startswith("tool:update_work_item_focus:"):
+                if state.get("status") == "open":
+                    state["status"] = "superseded"
+        recovery = checkpoint.get("recovery_context")
+        if isinstance(recovery, dict):
+            recovery["historical"] = True
+    if previous_schema < 16:
         from app.generation.engineering.work_memory import seed_source_evidence
 
         seed_source_evidence(checkpoint)
+    if previous_schema < 17:
+        for scope, state in checkpoint["diagnostic_state"].items():
+            if scope.startswith("check:") and state.get("status") == "needs_verification":
+                state["verification_status"] = "needs_verification"
+                # Older invalidation overwrote resolved; only a recorded success
+                # can restore it. A later failure replaced this entire record.
+                if state.get("verification_source_hash"):
+                    state["status"] = "resolved"
+        repair = checkpoint.get("repair_context")
+        if (
+            isinstance(repair, dict)
+            and checkpoint["diagnostic_state"]
+            .get(f"check:{repair.get('check_id')}", {})
+            .get("status")
+            == "resolved"
+        ):
+            checkpoint["repair_context"] = None
+        from app.generation.engineering.work_memory import record_progress
+
+        # Recover actual ranges without touching usage, stop reasons or outcomes.
+        for row in checkpoint.get("observations", []):
+            if row.get("name") == "read_file" and row.get("ok"):
+                before = checkpoint.get("no_progress_steps", 0)
+                record_progress(checkpoint, ToolExecutionResult.model_validate(row))
+                checkpoint["no_progress_steps"] = before
+        checkpoint["steps_without_delivery"] = max(
+            int(checkpoint.get("steps_without_delivery", 0)),
+            int(
+                checkpoint.get("work_memory", {})
+                .get(str(checkpoint.get("current_work_item_id") or ""), {})
+                .get("inspection_steps", 0)
+            ),
+        )
     return checkpoint
 
 
@@ -212,6 +261,7 @@ def seed_repair_from_last_check(checkpoint: dict[str, Any]) -> None:
 
 def remember_recovery(checkpoint: dict[str, Any]) -> None:
     checkpoint["recovery_context"] = {
+        "historical": True,
         "reason": checkpoint.get("blocked_reason"),
         "reason_code": engineering_stop_reason(checkpoint),
         "model_turns": int(checkpoint.get("model_turns") or 0),
@@ -253,10 +303,6 @@ def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
         raise ConflictException("当前工程执行不需要人工重新修复")
 
     remember_recovery(checkpoint)
-    if engineering_stop_reason(checkpoint) == "NO_SOURCE_PROGRESS":
-        from app.generation.engineering.work_memory import prepare_stall_retry
-
-        prepare_stall_retry(checkpoint)
     current_item_id = str(checkpoint.get("current_work_item_id") or "")
     for key in ("failure_streaks", "repair_rounds"):
         values = checkpoint.get(key)
@@ -280,6 +326,8 @@ def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
     retry_number = int(checkpoint.get("manual_repair_attempts") or 0) + 1
     checkpoint["manual_repair_attempts"] = retry_number
     checkpoint["no_progress_steps"] = 0
+    checkpoint["steps_without_delivery"] = 0
+    checkpoint.pop("progress_guidance_turn", None)
     checkpoint["outcome"] = "running"
     checkpoint["blocked_reason"] = None
     checkpoint.pop("blocked_reason_code", None)

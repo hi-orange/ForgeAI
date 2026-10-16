@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
 from app.schemas.agent_action import (
@@ -65,6 +65,27 @@ ARCHITECT_TOOLS: list[ToolDefinition] = [
         },
     ),
     ToolDefinition(
+        name="editor_patch",
+        description=(
+            "分段保存系统设计草稿，仅替换提供的顶层字段；append_lists=true 时追加列表条目。"
+            "已有字段保留，最后用 write_system_design({}) 校验并提交已保存草稿。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "sections": {
+                    "type": "object",
+                    "properties": _SYSTEM_DESIGN_SCHEMA["properties"],
+                    "additionalProperties": False,
+                    "minProperties": 1,
+                },
+                "append_lists": {"type": "boolean", "default": False},
+            },
+            "required": ["sections"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
         name="terminal_list",
         description="在受限工作区内查看目录和文本文件清单。",
         parameters={
@@ -95,11 +116,11 @@ ARCHITECT_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="write_system_design",
-        description="提交最终完整 system_design，作为 Architect 的正式成果。",
+        description="提交最终完整 system_design；省略参数时校验并提交已保存草稿。",
         parameters={
             "type": "object",
             "properties": {"system_design": _SYSTEM_DESIGN_SCHEMA},
-            "required": ["system_design"],
+            "required": [],
             "additionalProperties": False,
         },
     ),
@@ -111,6 +132,7 @@ class ArchitectToolState:
     app_spec: AppSpec
     workspace_root: Path
     draft: SystemDesign | None = None
+    draft_sections: dict[str, Any] = field(default_factory=dict)
     inspection_count: int = 0
     inspection_keys: set[str] = field(default_factory=set)
 
@@ -213,12 +235,15 @@ def execute_architect_tool(
                 result = ToolExecutionResult(
                     tool_call_id=call.id,
                     name=call.name,
-                    ok=state.draft is not None,
-                    error_code=None if state.draft is not None else "DRAFT_NOT_FOUND",
-                    summary="已读取系统设计草稿" if state.draft else "系统设计草稿尚未创建",
+                    ok=bool(state.draft_sections) or state.draft is not None,
+                    error_code=None if state.draft_sections or state.draft else "DRAFT_NOT_FOUND",
+                    summary="已读取系统设计草稿"
+                    if state.draft_sections or state.draft
+                    else "系统设计草稿尚未创建",
                     data={
                         "system_design": (
-                            state.draft.model_dump(mode="json") if state.draft else None
+                            state.draft_sections
+                            or (state.draft.model_dump(mode="json") if state.draft else None)
                         )
                     },
                     arguments=dict(call.arguments),
@@ -244,13 +269,52 @@ def execute_architect_tool(
             return result.model_copy(
                 update={"name": call.name, "arguments": dict(call.arguments)}
             ), None
+        if call.name == "editor_patch":
+            sections = call.arguments.get("sections")
+            append = call.arguments.get("append_lists", False)
+            if (
+                not isinstance(sections, dict)
+                or not sections
+                or type(append) is not bool
+                or set(call.arguments) - {"sections", "append_lists"}
+                or set(sections) - SystemDesign.model_fields.keys()
+            ):
+                raise BusinessException("只允许修改非空的系统设计顶层字段")
+            candidate = dict(
+                state.draft_sections or (state.draft.model_dump(mode="json") if state.draft else {})
+            )
+            for key, value in sections.items():
+                if append and isinstance(value, list):
+                    value = [*candidate.get(key, []), *value]
+                adapter = TypeAdapter(SystemDesign.model_fields[key].rebuild_annotation())
+                candidate[key] = adapter.dump_python(
+                    adapter.validate_python(value, strict=True), mode="json"
+                )
+            # Commit the entire patch only after every supplied field validates.
+            state.draft_sections = candidate
+            state.draft = None
+            return ToolExecutionResult(
+                tool_call_id=call.id,
+                name=call.name,
+                ok=True,
+                summary="已保存设计片段；最终提交仍需完整契约校验",
+                data={"saved_sections": sorted(candidate), "updated_sections": sorted(sections)},
+                arguments=dict(call.arguments),
+            ), None
         if call.name in {"editor_write", "write_system_design"}:
             if (
                 call.name == "write_system_design"
                 and "artifact:app_spec" not in state.inspection_keys
             ):
                 raise BusinessException("提交设计前必须 read_artifact 读取本轮冻结 PRD")
-            design = _design_from_call(call)
+            design = (
+                SystemDesign.model_validate(
+                    state.draft_sections
+                    or (state.draft.model_dump(mode="json") if state.draft else None)
+                )
+                if call.name == "write_system_design" and "system_design" not in call.arguments
+                else _design_from_call(call)
+            )
             design.validate_requirement_dependencies(state.app_spec)
             for interface in design.interfaces:
                 if interface.kind == "http" and (
@@ -261,6 +325,7 @@ def execute_architect_tool(
                 ):
                     raise BusinessException("HTTP 设计必须提供有效 method 和绝对 API path")
             state.draft = design
+            state.draft_sections = design.model_dump(mode="json")
             result = ToolExecutionResult(
                 tool_call_id=call.id,
                 name=call.name,

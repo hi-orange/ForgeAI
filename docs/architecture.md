@@ -153,7 +153,16 @@ The runtime validates exact approved feature coverage, unique task ids, existing
 acyclicity and frozen architecture dependencies. A visual foundation establishes or verifies reuse of
 shared design tokens before feature work; it does not force a redesign of existing applications.
 Authentication is added only when approved, not detected with title keywords or inserted as a universal
-template. The scheduler selects only pending nodes whose prerequisites completed platform checks.
+template. Requirement links express traceability, not proof that a shared visual task implements every
+linked business capability. A work item may explicitly declare `provides_requirement_ids`, a subset of
+its linked approved requirements, with acceptance and deliverables. These declarations can satisfy
+architecture prerequisite edges only through ancestors. Visual foundations without declarations do not
+provide business prerequisites; nonvisual legacy items retain their existing linked-requirement
+interpretation when the optional field is empty. A nonempty declaration is the item's explicit provider
+set. It never grants feature coverage or completion: all approved requirements still need feature work,
+and declared providers must pass the same source-bound `all` integration gate before dependents run.
+Structural validation cannot establish the truth of a declared capability; smoke and independent QA
+remain necessary. The scheduler selects only pending nodes whose prerequisites completed platform checks.
 Ready-node ordering is an engineering plan choice, not the PRD's list position.
 
 Replanning may adjust pending nodes but cannot remove or redefine completed nodes, invent completion
@@ -162,6 +171,42 @@ unfinished feature queues require a dependency plan before further writes while 
 work and counters; completed runs remain immutable. QA repair retains its narrow defect scope and does
 not recreate the whole application plan. Structural graph validation cannot prove the model identified
 every semantic dependency; source checks and independent acceptance remain necessary.
+
+Feature work items represent runnable user capabilities and may span frontend, backend and database.
+Foundations validate only their own available contracts; they must not require a downstream feature
+that depends on them. Each feature or explicitly declared prerequisite provider completion runs quick checks and the existing
+`all` integration runner against the same source identity. Engineering extends the mutable smoke manifest with the
+current capability and retains probes for already implemented behavior; unimplemented scenarios enter
+with their owning work item. Final completion still requires `all` and independent QA. Passing smoke
+proves only the probes executed, not semantic coverage of every approved requirement.
+
+Engineering check outcomes and freshness are separate facts. Source changes invalidate cached checks
+and mark recorded evidence as requiring revalidation; they never reopen a previously resolved defect.
+Only an actual failed check can reopen that defect. Previous failures may guide investigation but are
+explicitly historical after source changes. Model context excludes superseded failure exchanges while
+durable audit history keeps them. Independent QA defects can only be resolved by independent QA.
+
+Engineering tracks returned file-version/range coverage separately from source and verification
+progress. Changing read arguments, rereading overlapping ranges, or replaying a cached check does not
+create new progress. Continued inspection receives one replaceable current-state guidance note, with
+all implementation tools still available. After a grace period, continued lack of source/check
+progress pauses the attempt under the existing recoverable stop policy. These thresholds are bounded
+engineering heuristics to evaluate, not a semantic proof that investigation is unnecessary. Automatic
+recovery preserves counters and guidance; only explicit retry grants another bounded attempt.
+
+Architect may save validated top-level design sections incrementally and append bounded list entries.
+The checkpoint preserves these incomplete drafts across interruptions. Final submission validates the
+complete assembled design and frozen dependencies; saving sections alone never completes architecture.
+Code Engineer may opt into provider thinking through `CODE_ENGINEER_THINKING`; its mode is
+retained in the execution checkpoint. Provider reasoning is opaque protocol state, stored with its
+original assistant tool batch before execution and replayed only with matching results. Model-turn
+identity prevents reused call ids from mixing batches. History compaction omits a whole native batch
+when its results are incomplete; it never truncates reasoning or duplicates it into tool results or
+user instructions. Logs record mode and length, not reasoning text. Existing nonthinking checkpoints
+remain readable, and enabling thinking does not change source isolation, gates or retry budgets.
+Responses truncated by the provider execute no tools and retain metered usage. Recovery reduces the
+next operation size while retaining previously saved sections, rather than resubmitting the full draft.
+
 
 ### Workflow ownership
 
@@ -196,7 +241,7 @@ gates.
   model turns. Invalid tool responses receive bounded correction feedback; provider retries retain
   progress and do not reset budgets. Read-only tool batches execute within role and call limits;
   state changes remain sequential. New context and valid plan changes count as engineering progress,
-  while repeated identical observations remain subject to the no-progress limit. Initial engineering
+  while repeated identical observations remain visible as evidence. Initial engineering
   planning has a separate bounded inspection allowance; after it is spent, the engineer must submit
   the dependency graph or report a concrete blocker. Source inspection remains available during
   implementation. The current task, observed-file summary, diagnostics and prior recovery reason
@@ -210,13 +255,20 @@ gates.
   current graph contract. The checkpoint retains distinct raw failures and source-bound correction
   attempts, while model context carries the latest plan/check exchanges and unresolved diagnostics.
   Work-item memory retains actual changed paths, bounded source excerpts and recent actions beyond
-  the rolling tool history. Excerpts are hash-checked against the workspace before reuse; omitted,
-  truncated and stale evidence is explicit. Writes and model-authored next-action notes do not prove
-  completion. Repeated or excessive inspection triggers one bounded next-action correction per work
-  item before stopping. Correction permits declared targeted reads, source edits or an explicit block;
-  it never forces blind writes, changes approved scope or bypasses verification. Automatic recovery
-  preserves correction usage; an explicit no-progress retry starts with corrective planning, not just
-  extra call budget. The correction and all actions remain traceable in the fenced checkpoint/events.
+  the rolling tool history. Source evidence is keyed by path, source hash and read range: complementary
+  ranges coexist, identical range reads are deduplicated, and a new source version replaces all old
+  fragments. The latest native exchange for each range remains visible. Recovery can seed compatible
+  ranges from saved observations without resetting usage or resuming a stopped run. Per-file cached
+  text and aggregate projected source text are bounded; omitted ranges are explicit. Source versions
+  remain known even when their text is omitted from the context budget.
+  Excerpts are hash-checked against the workspace before reuse; omitted,
+  truncated and stale evidence is explicit. Writes do not prove completion. Repeated inspection
+  during implementation does not disable tools or require a model-authored correction plan; total
+  call budgets still bound execution. Historical focus state is retained only for audit on upgrade.
+  Protocol refusals apply to the tool set offered for that response: a changed set supersedes them,
+  and a validated model tool call resolves them without clearing unrelated failures. Protocol errors
+  are current diagnostics, not fictitious tool-call history. Recovery reasons are explicitly historical;
+  each decision receives the actual current tool list. Migration never resumes a stopped execution.
   Source writes invalidate check evidence; unrelated checks cannot close other failures, and only
   independent QA resolves acceptance defects. Identical failed inputs have a bounded stop-loss that
   survives automatic recovery. Diagnostic adapters never invent missing causes or grant write access.
