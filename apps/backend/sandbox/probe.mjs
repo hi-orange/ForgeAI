@@ -1,5 +1,6 @@
 import playwright from '/opt/visual/node_modules/playwright-core/index.js'
 import fs from 'node:fs/promises'
+import { expectedResourceError, matchesResponse } from './smoke_responses.mjs'
 
 const { chromium } = playwright
 const [baseUrl, manifestPath] = process.argv.slice(2)
@@ -86,7 +87,7 @@ try {
         // Keep malformed or absent console locations visible as real evidence.
       }
       if (message.type() === 'error' && !isMissingFavicon && consoleErrors.length < 20) {
-        consoleErrors.push(text.slice(0, 500))
+        consoleErrors.push({ text: text.slice(0, 500), url: locationUrl })
       }
     })
     page.on('pageerror', (error) => {
@@ -94,8 +95,13 @@ try {
     })
     page.on('response', (response) => {
       const url = new URL(response.url())
-      if (url.pathname.startsWith('/api/')) {
-        apiResponses.push({ path: url.pathname, status: response.status() })
+      if (url.origin === new URL(baseUrl).origin && url.pathname.startsWith('/api/')) {
+        apiResponses.push({
+          path: url.pathname + url.search,
+          method: response.request().method(),
+          status: response.status(),
+          url: url.href,
+        })
       }
     })
 
@@ -115,17 +121,32 @@ try {
         await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
       }
       for (const expected of check.expect_api || []) {
-        const matches = apiResponses.filter((item) => item.path.startsWith(expected))
-        if (!matches.length) errors.push(`missing frontend API request: ${expected}`)
-        else if (matches.every((item) => item.status >= 400)) {
-          errors.push(`frontend API request failed: ${expected}`)
+        if (!apiResponses.some((item) => matchesResponse(expected, item))) {
+          errors.push(`missing expected frontend API response: ${JSON.stringify(expected)}`)
+        }
+      }
+      for (const response of apiResponses.filter((item) => item.status >= 400)) {
+        if (
+          !(check.expect_api || []).some(
+            (expected) => typeof expected === 'object' && matchesResponse(expected, response),
+          )
+        ) {
+          errors.push(
+            `unexpected API error: ${response.method} ${response.path} ${response.status}`,
+          )
         }
       }
       const overflow = await page.evaluate(
         () => document.documentElement.scrollWidth > window.innerWidth + 1,
       )
       if (overflow) errors.push('horizontal viewport overflow')
-      errors.push(...consoleErrors.map((item) => `console: ${item}`))
+      errors.push(
+        ...consoleErrors
+          .filter(
+            (item) => !expectedResourceError(item, apiResponses, check.expect_api || [], baseUrl),
+          )
+          .map((item) => `console: ${item.text}`),
+      )
       errors.push(...pageErrors.map((item) => `page: ${item}`))
     } catch (error) {
       errors.push(String(error).slice(0, 1000))

@@ -6,7 +6,6 @@ import base64
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,9 +13,11 @@ from pathlib import Path
 ROOT = Path("/tmp/app")
 MAX_FILE_BYTES = 2 * 1024 * 1024
 RESULT_MARKER = "FORGEAI_DEPENDENCY_RESULT="
-PACKAGE_SPEC = re.compile(
-    r"^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._+-]*(?:@[^;\s|&<>`$()]+)?$"
+_spec = importlib.util.spec_from_file_location(
+    "forgeai_dependency_specs", Path(__file__).with_name("dependency_specs.py")
 )
+_specs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_specs)
 
 
 def _load_check_controller():
@@ -44,8 +45,10 @@ def _request():
         raise ValueError("依赖列表无效")
     if action != "sync" and not packages:
         raise ValueError("依赖列表不能为空")
-    if any(not isinstance(item, str) or not PACKAGE_SPEC.fullmatch(item) for item in packages):
-        raise ValueError("依赖规格无效")
+    for item in packages:
+        if not isinstance(item, str):
+            raise ValueError("依赖规格无效")
+        _specs.validate_package_spec(item, manager, action)
     if action == "sync" and (manager != "npm" or packages):
         raise ValueError("sync 只支持 npm 空依赖列表")
     return value["files"], manager, action, packages

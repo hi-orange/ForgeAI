@@ -7,7 +7,6 @@ import binascii
 import hashlib
 import json
 import os
-import re
 import subprocess
 from pathlib import Path
 from typing import Any, Literal
@@ -18,6 +17,7 @@ from app.core.settings import settings
 from app.runtime.docker import get_docker_sandbox_runtime
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.paths import safe_path_under_root
+from sandbox.dependency_specs import validate_package_spec
 
 Manager = Literal["npm", "uv"]
 Action = Literal["add", "remove"]
@@ -28,40 +28,16 @@ MAX_OUTPUT_CHARS = 12_000
 MAX_RESULT_BYTES = 2 * 1024 * 1024
 INSTALL_TIMEOUT_SECONDS = 180
 DEPENDENCY_RUNTIME_LABEL = "org.forgeai.dependency-runtime-version"
-DEPENDENCY_RUNTIME_VERSION = "2"
+DEPENDENCY_RUNTIME_VERSION = "3"
 _RESULT_MARKER = b"FORGEAI_DEPENDENCY_RESULT="
 
-_PACKAGE_SPEC = re.compile(
-    r"^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._+-]*(?:@[^;\s|&<>`$()]+)?$"
-)
-_BLOCKED_SUBSTRINGS = (
-    "..",
-    ";",
-    "|",
-    "&",
-    "`",
-    "$",
-    "\n",
-    "\r",
-    ">",
-    "<",
-    "$(",
-    "curl",
-    "wget",
-    "apt",
-    "yum",
-    "brew",
-    "sudo",
-    "powershell",
-    "cmd.exe",
-)
 _RESULT_PATHS: dict[Manager, tuple[str, ...]] = {
     "npm": ("frontend/package.json", "frontend/package-lock.json"),
     "uv": ("backend/pyproject.toml", "backend/uv.lock"),
 }
 
 
-def _normalize_packages(raw: Any) -> list[str]:
+def _normalize_packages(raw: Any, manager: str, action: str) -> list[str]:
     if not isinstance(raw, list) or not raw:
         raise BusinessException("packages 必须是非空数组")
     if len(raw) > MAX_PACKAGES:
@@ -71,11 +47,10 @@ def _normalize_packages(raw: Any) -> list[str]:
         if not isinstance(item, str):
             raise BusinessException("packages 每项必须是字符串")
         spec = item.strip()
-        if not spec or not _PACKAGE_SPEC.fullmatch(spec):
-            raise BusinessException(f"非法包名或版本规格：{item!r}")
-        lowered = spec.lower()
-        if any(token in lowered for token in _BLOCKED_SUBSTRINGS):
-            raise BusinessException(f"拒绝不安全的依赖规格：{item!r}")
+        try:
+            validate_package_spec(spec, manager, action)
+        except ValueError as exc:
+            raise BusinessException(f"{exc}：{item!r}") from exc
         packages.append(spec)
     return packages
 
@@ -357,7 +332,7 @@ def install_project_dependency(
         chosen_manager, chosen_target = _validate_pairing(str(manager), str(target))
         if action not in {"add", "remove"}:
             raise BusinessException("action 只允许 add 或 remove")
-        package_list = _normalize_packages(packages)
+        package_list = _normalize_packages(packages, manager, action)
         return _execute(
             workspace_root=workspace_root,
             manager=chosen_manager,

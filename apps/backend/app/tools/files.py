@@ -491,12 +491,13 @@ def apply_patch_batch(
         ok=False,
         summary="",
     )
-    if not 2 <= len(writes) <= 8:
+    if not 1 <= len(writes) <= 8:
         return result.model_copy(
-            update={"error_code": "INVALID_BATCH", "summary": "批量写入必须包含 2～8 个文件"}
+            update={"error_code": "INVALID_BATCH", "summary": "写入必须包含 1～8 个文件"}
         )
     prepared: list[dict[str, object]] = []
     seen: set[str] = set()
+    total_bytes = 0
     try:
         for row in writes:
             path = str(row.get("path") or "").replace("\\", "/").strip()
@@ -508,6 +509,9 @@ def apply_patch_batch(
                 raise ConflictException(f"{path} 的 expected_hash 无效")
             seen.add(path)
             payload = content.encode("utf-8")
+            total_bytes += len(payload)
+            if total_bytes > MAX_WRITE_BYTES:
+                raise ConflictException("写入总量超过上限，请按当前功能拆分")
             if len(payload) > MAX_WRITE_BYTES:
                 raise ConflictException(f"{path} 写入内容超过上限")
             target = safe_path_under_root(root, path, allow_create=True)
@@ -582,7 +586,7 @@ def apply_patch_batch(
     return result.model_copy(
         update={
             "ok": True,
-            "summary": f"已原子写入 {len(files)} 个关联文件",
+            "summary": f"已写入 {len(files)} 个文件",
             "data": {"files": files},
         }
     )

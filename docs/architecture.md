@@ -94,6 +94,9 @@ Role names denote ownership and decision boundaries, not four interchangeable ch
   mandatory model-generated file plan and no nested whole-file writer model. The platform stages
   mutations, fences commits by active execution and original bytes, retains recoverable revisions,
   bounds cost/no-progress, and verifies completion requests. The final source still needs independent QA.
+  Source creation and whole-file replacement use one bounded write interface for one or more files.
+  Related writes share preflight validation and fenced commit; local replacements remain a separate
+  operation. File count does not define a distinct workflow or justify implementing future work.
 - Test Engineer designs scenarios from approved acceptance, adapts bounded API/browser scripts to
   observed interfaces, executes them and judges the exact source/test snapshot. It separates product
   defects, script errors, unavailable infrastructure, missing evidence and contract challenges.
@@ -174,11 +177,40 @@ every semantic dependency; source checks and independent acceptance remain neces
 
 Feature work items represent runnable user capabilities and may span frontend, backend and database.
 Foundations validate only their own available contracts; they must not require a downstream feature
-that depends on them. Each feature or explicitly declared prerequisite provider completion runs quick checks and the existing
-`all` integration runner against the same source identity. Engineering extends the mutable smoke manifest with the
+that depends on them. Completion selects a single check from platform-observed source changes.
+Known source foundations may use `quick`; changes limited to source styles or public raster images
+relative to the last passing `all` snapshot may use `frontend`. Business, persistence, permission,
+configuration, unknown changes and unresolved runtime failures use `all`. Explicit prerequisite
+providers, independent QA repairs and the final work item always require `all`. Missing baselines
+fall back to full verification. Local success retains pending integration and cannot publish a final
+code result. Engineering extends the mutable smoke manifest with the
 current capability and retains probes for already implemented behavior; unimplemented scenarios enter
 with their owning work item. Final completion still requires `all` and independent QA. Passing smoke
 proves only the probes executed, not semantic coverage of every approved requirement.
+
+The `all` runner performs syntax and TypeScript checks once, followed by frontend build, migrations,
+API smoke and browser smoke in the same container. A failed early stage prevents costly later stages.
+Check cache reuse requires both exact source hash and runtime version. Host elapsed time and bounded
+runner phase observations distinguish execution from cache reuse; timings are diagnostic data, never
+quality authority. A targeted repair recheck cannot resolve a broader failed gate. A passing `all`
+may resolve the narrower checks it actually includes, with explicit coverage and source provenance.
+
+Engineering reuses the template's API envelope/error handling and database/migration primitives.
+Authentication remains opt-in to approved intent. After backend contracts are implemented,
+`generate_api_client` exports the actual FastAPI OpenAPI in an isolated container and invokes the
+image-pinned generator with platform-owned configuration. It owns `frontend/openapi.json` and
+`frontend/src/client/`; business wrappers remain outside that directory. Generated changes and obsolete
+file removal use the same execution fence and recoverable revisions, additionally comparing the full
+input source hash before commit. Once adopted, a changed backend or generator runtime invalidates the
+client contract and requires regeneration before checks. Client generation itself proves no acceptance.
+
+Smoke manifest validation shares one contract across staged writes, source-snapshot preflight and
+the isolated runner. Quantity errors identify the case and actual limits before dependency setup or
+database migration. Long journeys and additional cases share a bounded aggregate action budget and
+wall-clock timeout. Explicit UI-only cases require observable assertions; integration cases retain
+API evidence. Expected HTTP failures match an exact method, local path and status. Only the matching
+observed browser resource error is exempted; unexpected responses, application console errors and
+script errors still fail. Frontend compilation precedes runtime database setup.
 
 Engineering check outcomes and freshness are separate facts. Source changes invalidate cached checks
 and mark recorded evidence as requiring revalidation; they never reopen a previously resolved defect.
@@ -193,6 +225,9 @@ all implementation tools still available. After a grace period, continued lack o
 progress pauses the attempt under the existing recoverable stop policy. These thresholds are bounded
 engineering heuristics to evaluate, not a semantic proof that investigation is unnecessary. Automatic
 recovery preserves counters and guidance; only explicit retry grants another bounded attempt.
+Outstanding failed checks also retain a separate bounded counter across edits and observations.
+Only a passing result for that check clears it; unrelated passing checks and arbitrary source edits
+cannot indefinitely defer a recoverable stop. This remains a heuristic, not proof of product progress.
 
 Architect may save validated top-level design sections incrementally and append bounded list entries.
 The checkpoint preserves these incomplete drafts across interruptions. Final submission validates the
@@ -206,7 +241,6 @@ user instructions. Logs record mode and length, not reasoning text. Existing non
 remain readable, and enabling thinking does not change source isolation, gates or retry budgets.
 Responses truncated by the provider execute no tools and retain metered usage. Recovery reduces the
 next operation size while retaining previously saved sections, rather than resubmitting the full draft.
-
 
 ### Workflow ownership
 

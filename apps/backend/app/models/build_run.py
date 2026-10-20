@@ -119,7 +119,7 @@ class BuildRun(Base):
     paused_at: Mapped[datetime | None] = mapped_column(
         DateTime,
         nullable=True,
-        comment="用户离开项目页面时的暂停时间；NULL 表示可被 Worker 领取",
+        comment="用户暂停构建的时间；NULL 表示可被 Worker 领取",
     )
     active_slot: Mapped[int | None] = mapped_column(
         SmallInteger,

@@ -47,8 +47,8 @@ class ProviderException(BusinessException):
 class ModelProtocolException(ProviderException):
     """A received response failed validation; a bounded loop can request correction."""
 
-    def __init__(self, msg: str) -> None:
-        super().__init__(msg, retryable=True)
+    def __init__(self, msg: str, *, data: Any = None) -> None:
+        super().__init__(msg, retryable=True, data=data)
         self.status_code = self.code = 502
 
 

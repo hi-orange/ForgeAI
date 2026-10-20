@@ -58,6 +58,8 @@ class CheckDiagnostic:
     code: str | None = None
     expected: str | None = None
     actual: str | None = None
+    symbol: str | None = None
+    related_module: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -158,6 +160,11 @@ def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
                 )
             )
         elif match:
+            message = match.group("message")
+            export = re.search(
+                r"""Module\s+['"](.+?)['"]\s+has no exported member\s+['"]([^'"]+)['"]""",
+                message,
+            )
             diagnostics.append(
                 CheckDiagnostic(
                     kind="typescript",
@@ -165,8 +172,10 @@ def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
                     line=int(match.group("line")),
                     column=int(match.group("column")),
                     code=match.group("code").upper(),
-                    message=match.group("message"),
+                    message=message,
                     raw=line,
+                    symbol=export.group(2) if export else None,
+                    related_module=export.group(1).strip('"') if export else None,
                 )
             )
         elif python_match:
@@ -190,6 +199,41 @@ def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
         elif "FAILED:" in line:
             diagnostics.append(CheckDiagnostic(kind="test", message=line, raw=line))
     return tuple(diagnostics)
+
+
+def repair_verification(result: ToolExecutionResult) -> dict[str, Any]:
+    """Recommend the narrowest useful recheck; never turn it into delivery evidence."""
+    if result.error_code == "API_CLIENT_STALE":
+        return {"tool": "generate_api_client", "then": "complete_work_item", "delivery_pass": False}
+    failed = str(result.data.get("check_id") or "all")
+    diagnostics = extract_check_diagnostics(str(result.data.get("output") or ""))
+    actionable = [d for d in diagnostics if d.code != "CalledProcessError"]
+    check_id = failed if failed in {"quick", "database", "backend", "frontend", "all"} else "all"
+    if actionable and all(
+        d.kind == "typescript" or d.code in {"SyntaxError", "IndentationError"} for d in actionable
+    ):
+        check_id = "quick"
+    elif actionable and all(d.code in {"ImportError", "ModuleNotFoundError"} for d in actionable):
+        check_id = "backend"
+    return {
+        "tool": "run_check",
+        "check_id": check_id,
+        "failed_check_id": failed,
+        "then": "complete_work_item",
+        "delivery_pass": False,
+        "targets": [
+            {
+                "path": f"frontend/{d.path}"
+                if d.kind == "typescript" and d.path and d.path.startswith("src/")
+                else d.path,
+                "line": d.line,
+                "symbol": d.symbol,
+                "related_module": d.related_module,
+            }
+            for d in actionable
+            if d.path
+        ][:20],
+    }
 
 
 def check_output_excerpt(output: str, *, summary: str = "") -> str:

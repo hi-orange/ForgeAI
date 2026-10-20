@@ -26,7 +26,7 @@ from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutio
 from app.schemas.app_spec import AppSpec
 from app.services.engineering import read_frozen_input_snapshot
 from app.services.engineering.completion import complete_code_engineer_task
-from app.tools.checks import source_snapshot
+from app.tools.checks import CHECK_RUNTIME_VERSION, source_snapshot
 
 
 def turn(name, **arguments):
@@ -288,7 +288,11 @@ class EngineeringLoopTests(EngineeringClaimTests):
             name="run_check",
             ok=True,
             summary="passed",
-            data={"source_hash": source_snapshot(root)[1], "check_id": check_id},
+            data={
+                "source_hash": source_snapshot(root)[1],
+                "check_id": check_id,
+                "runtime_version": CHECK_RUNTIME_VERSION,
+            },
         )
 
     def test_repeated_reads_keep_tools_and_then_use_completion_gates(self):
@@ -326,7 +330,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertTrue(all(names == observed_tools[0] for names in observed_tools))
         self.assertEqual(
             [c.kwargs["check_id"] for c in self.checks.call_args_list],
-            ["quick", "quick", "all", "quick", "all"],
+            ["quick", "all", "all"],
         )
         self.assertEqual(
             len([a for a in self._checkpoint()["activity"] if a["name"] == "read_file"]), 32
@@ -346,7 +350,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         def decide(*, work_item, observations, tools, **kwargs):
             if work_item.id == "engineering_plan":
                 return self._implement(work_item=work_item, observations=observations)
-            self.assertIn("write_file", {t.name for t in tools})
+            self.assertIn("write_files", {t.name for t in tools})
             return turn("read_file", path="README.md")
 
         self.model.side_effect = decide
@@ -399,7 +403,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertEqual(self._run()["outcome"], "generated")
         self.assertEqual(
             [c.kwargs["check_id"] for c in self.checks.call_args_list],
-            ["quick", "all", "quick", "all", "quick", "all"],
+            ["all", "all", "all"],
         )
         self.assertTrue(all(i["status"] == "completed" for i in self._checkpoint()["work_items"]))
 
@@ -428,9 +432,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertEqual(self._run()["outcome"], "blocked")
         items = self._checkpoint()["work_items"]
         self.assertTrue(all(i["status"] == "pending" for i in items))
-        self.assertEqual(
-            [c.kwargs["check_id"] for c in self.checks.call_args_list[:2]], ["quick", "all"]
-        )
+        self.assertEqual([c.kwargs["check_id"] for c in self.checks.call_args_list], ["all"])
 
     def test_repeated_implementation_reads_get_guidance_then_stop_without_tool_ban(self):
         self._start()
@@ -441,7 +443,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
             if work_item.id == "engineering_plan":
                 return self._implement(work_item=work_item, observations=observations)
             self.assertIn("read_file", {t.name for t in tools})
-            self.assertIn("write_file", {t.name for t in tools})
+            self.assertIn("write_files", {t.name for t in tools})
             if engineering_context["progress_guidance"]:
                 guided.append(engineering_context["progress_guidance"])
             return turn("read_file", path="README.md", end_line=len(guided) + 10)
@@ -510,12 +512,18 @@ class EngineeringLoopTests(EngineeringClaimTests):
                     ],
                 ],
             )
-        path = f"generated/{work_item.id}.py"
+        path = (
+            "frontend/src/visual.ts" if work_item.id == "visual" else f"generated/{work_item.id}.py"
+        )
         if not any(
             o.ok and o.name == "write_file" and o.arguments.get("path") == path
             for o in observations
         ):
-            return turn("write_file", path=path, content="VALUE = 1\n")
+            return turn(
+                "write_file",
+                path=path,
+                content="export const VALUE = 1\n" if work_item.id == "visual" else "VALUE = 1\n",
+            )
         return turn("complete_work_item", work_item_id=work_item.id, summary="Implemented feature")
 
     def _start(self):
@@ -547,7 +555,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertEqual(result["outcome"], "generated")
         self.assertEqual(
             [c.kwargs["check_id"] for c in self.checks.call_args_list],
-            ["quick", "quick", "all", "quick", "all"],
+            ["quick", "all", "all"],
         )
         self.assertEqual(result["model_turns"], 7)
         for feature in valid_spec()["features"]:
@@ -753,7 +761,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "generated")
         self.assertTrue(repaired)
-        self.assertIn("VALUE = 2", (self.root / "generated/visual.py").read_text())
+        self.assertIn("VALUE = 2", (self.root / "frontend/src/visual.ts").read_text())
 
     def test_repeated_failed_completion_is_bounded(self):
         self._start()
@@ -763,7 +771,12 @@ class EngineeringLoopTests(EngineeringClaimTests):
             ok=False,
             summary="same failure",
             error_code="CHECK_FAILED",
-            data={"source_hash": source_snapshot(root)[1], "output": "same error"},
+            data={
+                "source_hash": source_snapshot(root)[1],
+                "output": "same error",
+                "check_id": kwargs["check_id"],
+                "runtime_version": CHECK_RUNTIME_VERSION,
+            },
         )
         self.assertEqual(self._run()["outcome"], "blocked")
         self.assertEqual(self.checks.call_count, 1)
@@ -831,7 +844,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
 
         with patch("app.orchestration.code_engineer.prepare_action", side_effect=stage_then_pause):
             self.assertEqual(self._run()["outcome"], "paused")
-        self.assertFalse((self.root / "generated/visual.py").exists())
+        self.assertFalse((self.root / "frontend/src/visual.ts").exists())
 
     def test_listing_files_is_read_only_evidence_not_a_write_result(self):
         self._start()
@@ -898,6 +911,8 @@ class EngineeringLoopTests(EngineeringClaimTests):
             {tool.name for tool in CODE_ENGINEER_TOOLS}, CODE_ENGINEER_PROFILE.allowed_tools
         )
         self.assertNotIn("write_new_code", CODE_ENGINEER_PROFILE.allowed_tools)
+        self.assertNotIn("write_file", CODE_ENGINEER_PROFILE.allowed_tools)
+        self.assertIn("write_files", CODE_ENGINEER_PROFILE.allowed_tools)
 
     def test_empty_tool_allowlist_is_not_replaced_by_default_permissions(self):
         spec = AppSpec.model_validate(valid_spec())

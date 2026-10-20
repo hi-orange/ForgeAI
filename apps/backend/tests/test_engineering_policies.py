@@ -40,6 +40,7 @@ class CheckOutcomeTests(unittest.TestCase):
                 "source_hash": source_hash,
                 "output": "feature.py: unknown name",
                 "check_id": "all",
+                "runtime_version": "test-runtime",
             },
         )
 

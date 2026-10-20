@@ -367,9 +367,34 @@ def chat_with_tools(
     record_model_turn(measured, round((time.perf_counter() - started) * 1000))
     try:
         if choice.get("finish_reason") == "length":
-            raise BusinessException(
-                "MODEL_OUTPUT_TRUNCATED：响应达到输出上限，本轮全部工具均未执行。"
-                "此前成功的工具结果保持有效；下一次需缩小参数体积。"
+            counts = usage if isinstance(usage, dict) else {}
+            details = counts.get("completion_tokens_details")
+            details = details if isinstance(details, dict) else {}
+            reasoning_tokens = details.get("reasoning_tokens")
+            completion_tokens = counts.get("completion_tokens")
+            reasoning_exhausted = (
+                type(reasoning_tokens) is int
+                and type(completion_tokens) is int
+                and 0 < completion_tokens <= reasoning_tokens
+                and not message.get("tool_calls")
+                and not message.get("content")
+            )
+            kind = "reasoning_budget" if reasoning_exhausted else "output_truncated"
+            advice = (
+                "供应商计数显示思考耗尽输出预算，尚无工具输出；"
+                "请直接选择一个最小必要动作，避免重复分析。"
+                if reasoning_exhausted
+                else "响应达到输出上限；若工具参数被截断，请缩小下一次操作和参数体积。"
+            )
+            raise ModelProtocolException(
+                "MODEL_OUTPUT_TRUNCATED：本轮全部工具均未执行。此前成功的工具结果保持有效。"
+                + advice,
+                data={
+                    "finish_reason": "length",
+                    "truncation_kind": kind,
+                    "completion_tokens": completion_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                },
             )
         result = parse_agent_action(data)
         reasoning = message.get("reasoning_content")
@@ -386,6 +411,8 @@ def chat_with_tools(
             usage,
             exc,
         )
+        if isinstance(exc, ModelProtocolException):
+            raise
         raise ModelProtocolException(str(exc)) from exc
     logger.info(
         "LLM tool turn: model=%s finish_reason=%s tool_calls=%s content_length=%s "

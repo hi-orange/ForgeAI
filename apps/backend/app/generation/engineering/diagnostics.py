@@ -9,7 +9,7 @@ from typing import Any
 from app.schemas.agent_action import ToolExecutionResult
 from app.schemas.engineering_diagnostic import EngineeringDiagnostic
 from app.schemas.test_report import TestReport, VerificationStatus
-from app.tools.check_diagnostics import analyze_check_failure
+from app.tools.check_diagnostics import analyze_check_failure, repair_verification
 
 MAX_IDENTICAL_TOOL_FAILURES = 3
 
@@ -76,6 +76,19 @@ def feedback(result: ToolExecutionResult, *, check_id: str | None = None) -> Too
             diagnostic.verification = "重新读取当前源码与 hash，再修改或执行原检查。"
         if analysis:
             diagnostic.fingerprint = analysis.fingerprint
+        if is_check:
+            plan = repair_verification(result)
+            diagnostic.verification = (
+                (
+                    "先 generate_api_client 更新接口契约，再请求 complete_work_item"
+                    if plan["tool"] == "generate_api_client"
+                    else f"修改后先 run_check(check_id={plan['check_id']}) 定向复验，"
+                    "再 complete_work_item；"
+                    "局部通过不解除原完整检查失败，也不代表业务验收通过"
+                )
+                if diagnostic.disposition == "repair"
+                else diagnostic.verification
+            )
     if result.name == "model_response":
         diagnostic.verification = (
             "依据本轮 available_tools 提交合法工具调用；写入或状态变更单独调用。"
@@ -83,7 +96,12 @@ def feedback(result: ToolExecutionResult, *, check_id: str | None = None) -> Too
     if not diagnostic.fingerprint:
         diagnostic.fingerprint = _digest([diagnostic.category, diagnostic.code, diagnostic.issues])
     return result.model_copy(
-        update={"data": {**result.data, "diagnostic": diagnostic.model_dump(mode="json")}}
+        update={
+            "data": {
+                **result.data,
+                "diagnostic": diagnostic.model_dump(mode="json"),
+            }
+        }
     )
 
 

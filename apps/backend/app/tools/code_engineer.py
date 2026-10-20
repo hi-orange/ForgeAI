@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.core.exceptions import AppException
 from app.generation.delivery import DeliveryPlanError, PlannedWorkItem
@@ -56,6 +56,20 @@ class _Edit(_Arguments):
     expected_hash: str = Field(min_length=1)
 
 
+class _BatchWrite(_Arguments):
+    writes: list[_Write] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def bounded_payload(self) -> _BatchWrite:
+        if sum(len(row.content.encode("utf-8")) for row in self.writes) > 262144:
+            raise ValueError("批量源码总量不得超过 256 KiB，请按当前功能拆分")
+        return self
+
+
+class _GenerateClient(_Arguments):
+    pass
+
+
 class _Image(_Arguments):
     path: str = Field(min_length=1)
     prompt: str = Field(min_length=1, max_length=4000)
@@ -94,6 +108,8 @@ _TOOL_ARGUMENTS: dict[str, type[_Arguments]] = {
     "read_file": _Read,
     "search_code": _Search,
     "write_file": _Write,
+    "write_files": _BatchWrite,
+    "generate_api_client": _GenerateClient,
     "edit_file_by_replace": _Edit,
     "generate_image": _Image,
     "install_project_dependency": _Dependency,
@@ -117,14 +133,25 @@ _DESCRIPTIONS = {
     "edit_file_by_replace": (
         "局部修改：old_text 必须唯一匹配，expected_hash 必须来自读取；冲突后重新读取。"
     ),
+    "write_files": (
+        "创建或整体改写 1～8 个当前工作项相关文件，总量最多 256 KiB；单文件也用本工具。"
+        "已有文件必须先读取并提供"
+        " expected_hash。所有文件校验后一起提交，冲突则整批不提交。"
+        "局部单文件修改用 edit_file_by_replace。"
+    ),
     "generate_image": ("生成图片到 frontend/public/；返回实际路径，只有配置图片服务时可用。"),
+    "generate_api_client": (
+        "从当前 FastAPI app.main:app 在隔离容器导出 OpenAPI；使用固定模板生成"
+        " frontend/openapi.json 和 frontend/src/client/ 类型及 SDK。该目录完全由生成器管理，"
+        "会移除旧生成文件；业务封装放 src/lib/。后端接口就绪或变更后调用，生成本身不代表检查通过。"
+    ),
     "install_project_dependency": (
         "在隔离容器解析 npm/uv 项目依赖，更新清单和锁文件；禁止系统安装。"
     ),
     "run_check": "运行隔离检查获取证据；检查不等于完成任务，源码变化后旧证据失效。",
     "complete_work_item": (
-        "请求平台校验并完成当前工作项；平台执行 quick，feature、声明前置能力及最后一项还执行"
-        " all，失败返回证据继续修复。"
+        "平台按实际源码变更选择 quick/frontend/all；业务和高风险变更执行 all，"
+        "最终项、前置能力和 QA 修复必须 all。局部检查通过不能替代最终独立验收。"
     ),
     "report_blocked": "缺少必要信息或当前约束无法满足时报告事实；不能伪造完成。",
 }
@@ -133,10 +160,19 @@ CODE_ENGINEER_TOOLS = [
         name=name, description=_DESCRIPTIONS[name], parameters=inline_model_json_schema(model)
     )
     for name, model in _TOOL_ARGUMENTS.items()
+    # Accept old checkpoint calls, but expose only the unified write tool to the model.
+    if name != "write_file"
 ]
 ALLOWED_TOOL_NAMES = frozenset(_TOOL_ARGUMENTS)
 MUTATING_TOOLS = frozenset(
-    {"write_file", "edit_file_by_replace", "generate_image", "install_project_dependency"}
+    {
+        "write_file",
+        "write_files",
+        "edit_file_by_replace",
+        "generate_image",
+        "install_project_dependency",
+        "generate_api_client",
+    }
 )
 
 
@@ -178,11 +214,18 @@ def execute_tool_call(call: ToolCall, *, workspace_root: Path) -> ToolExecutionR
     try:
         call = validate_tool_call(call)
         args = call.arguments
+        if call.name in {"write_file", "write_files"}:
+            writes = args["writes"] if call.name == "write_files" else [args]
+            result = files.apply_patch_batch(
+                workspace_root, writes=writes, revision_id="staged", tool_call_id=call.id
+            )
+            if call.name == "write_file" and result.ok:
+                result.data.update(result.data["files"][0])
+            return result.model_copy(update={"name": call.name, "arguments": args})
         handlers: dict[str, Callable[..., ToolExecutionResult]] = {
             "list_files": files.list_files,
             "read_file": files.read_file,
             "search_code": files.search_code,
-            "write_file": files.apply_patch,
             "edit_file_by_replace": files.edit_file_by_replace,
             "generate_image": images.generate_project_image,
             "install_project_dependency": project_deps.install_project_dependency,

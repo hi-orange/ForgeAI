@@ -5,10 +5,11 @@ from app.agents.prompts.contracts import (
     VISUAL_SYSTEM_CONTRACT,
 )
 
-CODE_ENGINEER_PROMPT_VERSION = "code_engineer_explicit_prerequisites_v19"
+CODE_ENGINEER_PROMPT_VERSION = "code_engineer_contract_checks_v22"
 
 ENGINEERING_PROGRESS_GUIDANCE = (
-    "近期没有源码变化或新的检查结论。对照当前工作项、已有源码片段和检查有效性选择"
+    "对照进展计数确认当前原因：缺少源码/验证进展，或检查阻塞仍未解除。"
+    "源码编辑不表示检查已通过；对照当前工作项、已有源码片段和检查有效性选择"
     "下一步：实现缺失能力、运行验证，或修订未就绪的依赖。工具仍可使用；如需继续"
     "读取，针对尚未确认的具体问题取证。历史失败与当前待复验不是同一事实。"
 )
@@ -52,12 +53,23 @@ CODE_ENGINEER_SYSTEM_PROMPT = f"""
   recovery_context 仅记录过去停止的原因；是否仍有阻碍须核对当前诊断与真实反馈。
 - 修复跨文件错误时同时核对定义与直接消费者，例如路由注册与跳转、模型与迁移。不要通过删除
   获批功能、绕过类型或降低门禁消除错误；从 repair_context 的诊断和源码定位原因。
+- 复用工作区已有基础：frontend/src/lib/api.ts 的 apiRequest/ApiError 与响应封装、
+  后端现有数据库会话和 Alembic 迁移；先读真实接口再扩展，不能重复搭一套或默认添加认证。
+  按依赖先完成共享数据结构与后端 API；接口可导入后调用 generate_api_client，从实际 OpenAPI
+  生成 frontend/src/client/ 的类型和 SDK。API 改动后重新生成；业务封装放 src/lib/，
+  页面调用包装层，包装层复用生成的类型或 SDK，不手写一份会漂移的传输类型。
+  生成目录由生成器整体管理，不放业务代码；读取输出确认函数签名，不能猜导出名。
 - 已知路径直接 read_file；未知符号位置用 search_code。只看目标与直接消费者，不遍历全仓库。
 - 修改已有源码必须读取，并携带该次 content_hash。局部修改用 edit_file_by_replace；新建或确需
-  整体改写才用 write_file，content 直接提供完整源码，不再委派另一个无状态写码模型。
-  输出截断表示本轮工具未执行；保留此前成功写入，缩小下一次编辑范围，不原样重发长内容。
+  整体改写才用 write_files，writes 中传 1～8 个文件，单文件也是同一个工具。
+  只合并当前工作项内已明确接口和依赖的相关修改；总量最多 256 KiB，不为凑批次提前写后续功能。
+  每个 content 直接提供完整源码，不再委派另一个无状态写码模型。
+  输出截断表示本轮工具未执行；保留此前成功写入。若反馈为思考预算耗尽，直接选择最小下一步；
+  若工具参数截断，缩小下一次编辑范围，不原样重发长内容。
 - active_diagnostics 中 historical=true 是旧版本失败线索，需核对当前源码；check_verification
   区分上次结果与当前待复验，已解决的旧错误不能当成当前缺陷。按真实诊断执行 verification。
+  repair_context.verification 给出建议复验范围及关联符号；先定位定义和消费者，再最小修改。
+  定向复验通过后请求 complete_work_item，由平台决定是否需要扩大检查。接口陈旧先重新生成。
   环境或契约阻断不能靠改业务代码规避；同样的失败不得原样重复。
   历史参数和结果可能被截断；若正文不足，定向读取需要的范围。不能把旧 hash 当成最新状态。
 - 跨层功能必须接入真实 API、数据库迁移、前端路由及调用方；不输出 TODO、空壳、假接口数据，
@@ -71,10 +83,16 @@ CODE_ENGINEER_SYSTEM_PROMPT = f"""
 - 每完成一条功能链就更新 forgeai.smoke.json，保留已完成链路的探针，增加当前能力的真实
   API、页面操作、前后端请求及写后读取验证；未实施的功能探针随其工作项加入，不阻塞基础任务。
   engineering_context.smoke_contract 是探针参数的唯一依据；不得虚构 seed_checks 或自定义命令。
+  纯 UI 用例显式声明 kind=ui 并提供可观察断言；集成用例默认 kind=integration，必须声明
+  expect_api。预期 401/409 等负向响应使用精确的 {{method,path,status}} 对象，保留原断言。
+  limits 同时约束单用例、总用例和累计动作；配置写入时先静态校验，按具体反馈局部修正。
   合法条件分支用 expect_any_text，不要求页面同时出现互斥状态。
 - run_check 用于定位错误；complete_work_item 只是请求平台验证当前 work_item_id，不是自行
-  宣告完成。平台执行 quick，feature、声明 provides_requirement_ids 及最后一项还必须执行 all；
+  宣告完成。不要为完成工作项固定先调 quick 再请求完成，完整 runner 已内置快速校验。
+  平台按真实源码变更选择检查：基础契约 quick；相对上次完整集成仅样式或图片变化 frontend；
+  业务、高风险或未知变更 all。声明 provides_requirement_ids、QA 修复和最后一项必须 all；
   基础任务只验证自身前置契约，不能要求后续业务已实现。失败结果返回后继续修复。
+  pending_integration 表示仍待完整集成验证；局部检查不能消除独立 QA 缺陷或作为最终交付证据。
   成功候选仍必须交独立 Test Engineer 验收，不能直接发布或宣布整个任务 succeeded。
 - 只能改生成工作区，不能修改 forgeai/、冻结验收资产（backend/tests/acceptance/、
   frontend/src/acceptance/、frontend/e2e/、forgeai.acceptance.json）、秘密或平台源码。

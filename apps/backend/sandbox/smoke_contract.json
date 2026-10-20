@@ -1,7 +1,23 @@
 {
   "version": 1,
+  "limits": {
+    "manifest_bytes": 262144,
+    "api_checks": 50,
+    "browser_checks": 50,
+    "actions_per_check": 80,
+    "total_browser_actions": 400,
+    "browser_timeout_seconds": 120
+  },
   "top_level_fields": ["version", "visual_contract", "api_checks", "browser_checks"],
   "browser": {
+    "kinds": ["integration", "ui"],
+    "default_kind": "integration",
+    "expect_api": "Integration cases require expect_api. Strings require a successful path-prefix response; objects match exact method, path (including query), and status. UI cases may omit expect_api but require a visible assertion.",
+    "response_fields": {
+      "method": { "type": "string", "pattern": "^(GET|POST|PUT|PATCH|DELETE)$" },
+      "path": { "type": "local_path" },
+      "status": { "type": "integer", "minimum": 100, "maximum": 599 }
+    },
     "default_viewport": {
       "width": 1440,
       "height": 900

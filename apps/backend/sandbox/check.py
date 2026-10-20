@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import importlib.util
 import json
 import os
 import re
@@ -12,7 +13,16 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
+
+_smoke_spec = importlib.util.spec_from_file_location(
+    "forgeai_smoke_manifest", Path(__file__).with_name("smoke_manifest.py")
+)
+_smoke = importlib.util.module_from_spec(_smoke_spec)
+_smoke_spec.loader.exec_module(_smoke)
+_validate_local_path = _smoke._validate_local_path
+parse_smoke_manifest = _smoke.parse_smoke_manifest
 
 ROOT = Path("/tmp/app")
 DATABASE = Path("/tmp/check.db")
@@ -21,11 +31,6 @@ TEMPLATE_FRONTEND_MODULES = Path("/opt/frontend/node_modules")
 TEMPLATE_THEME_FILE = Path("/opt/frontend/index.css")
 TEMPLATE_BACKEND_PYPROJECT = Path("/opt/backend/pyproject.toml")
 SMOKE_MANIFEST = ROOT / "forgeai.smoke.json"
-SMOKE_CONTRACT_PATH = Path(__file__).with_name("smoke_contract.json")
-SMOKE_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
-SMOKE_CONTRACT = json.loads(SMOKE_CONTRACT_PATH.read_text(encoding="utf-8"))
-BROWSER_CONTRACT = SMOKE_CONTRACT["browser"]
-SMOKE_ACTIONS = BROWSER_CONTRACT["actions"]
 VARIABLE_PATTERN = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_]*)\}")
 CSS_VARIABLE_PATTERN = re.compile(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;]+);")
 REQUIRED_THEME_TOKENS = {"--color-primary", "--color-accent", "--color-muted"}
@@ -34,6 +39,23 @@ MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 SECURITY_SCANNER_VERSION = "forgeai-security-v1"
 SECURITY_REPORT_PREFIX = "FORGEAI_SECURITY_REPORT="
 APPLICATION_UID = None
+
+
+@contextmanager
+def phase(name):
+    started = time.monotonic()
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        print(
+            "FORGEAI_CHECK_PHASE="
+            + json.dumps(
+                {"phase": name, "ok": ok, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+            ),
+            flush=True,
+        )
 
 
 def application_process_options():
@@ -384,9 +406,16 @@ def quick():
     """Cheap per-work-item gate: syntax and TypeScript contracts, no build or runtime smoke."""
 
     backend_root = ROOT / "backend"
-    command(["python", "-m", "compileall", "-q", "app", "alembic"], backend_root)
+    with phase("python_compile"):
+        command(["python", "-m", "compileall", "-q", "app", "alembic"], backend_root)
+    with phase("frontend_dependencies"):
+        ensure_frontend_dependencies()
+    with phase("typescript"):
+        typescript()
+
+
+def typescript():
     frontend_root = ROOT / "frontend"
-    ensure_frontend_dependencies()
     package = json.loads((frontend_root / "package.json").read_text(encoding="utf-8"))
     dependencies = {
         **(package.get("dependencies") or {}),
@@ -401,9 +430,10 @@ def quick():
         frontend_command("tsc", "--noEmit")
 
 
-def database():
+def database(*, skip_compile=False):
     backend = ROOT / "backend"
-    command(["python", "-m", "compileall", "-q", "app", "alembic"], backend)
+    if not skip_compile:
+        command(["python", "-m", "compileall", "-q", "app", "alembic"], backend)
     ensure_backend_dependencies(backend)
     command(["alembic", "upgrade", "head"], backend)
     command(["alembic", "check"], backend)
@@ -440,14 +470,6 @@ def stop_process(process):
         process.wait()
 
 
-def _validate_local_path(value, *, api=False):
-    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
-        raise ValueError(f"联调路径必须是站内绝对路径：{value!r}")
-    if api and not value.startswith("/api/v1/"):
-        raise ValueError(f"API 联调路径必须位于 /api/v1：{value}")
-    return value
-
-
 def _source_path(value):
     if not isinstance(value, str) or not value or "\\" in value:
         raise ValueError(f"源码路径无效：{value!r}")
@@ -455,48 +477,6 @@ def _source_path(value):
     if not candidate.is_relative_to(ROOT) or candidate == ROOT:
         raise ValueError(f"源码路径越界：{value!r}")
     return candidate
-
-
-def _validate_contract_object(value, fields, label, *, extra_fields=()):
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} 必须是对象")
-    allowed = {*fields, *extra_fields}
-    unknown = sorted(set(value) - allowed)
-    if unknown:
-        raise ValueError(f"{label} 包含契约外字段：{', '.join(unknown)}")
-    for name, rule in fields.items():
-        if name not in value:
-            raise ValueError(f"{label} 缺少字段：{name}")
-        item = value[name]
-        kind = rule.get("type")
-        if kind == "string":
-            if not isinstance(item, str) or len(item) < int(rule.get("min_length", 0)):
-                raise ValueError(f"{label}.{name} 必须是有效字符串")
-            pattern = rule.get("pattern")
-            if pattern and re.fullmatch(pattern, item) is None:
-                raise ValueError(f"{label}.{name} 格式无效")
-        elif kind == "string_array":
-            minimum = int(rule.get("min_items", 0))
-            maximum = int(rule.get("max_items", len(item) if isinstance(item, list) else 0))
-            item_minimum = int(rule.get("item_min_length", 0))
-            if (
-                not isinstance(item, list)
-                or not minimum <= len(item) <= maximum
-                or not all(
-                    isinstance(candidate, str) and len(candidate) >= item_minimum
-                    for candidate in item
-                )
-            ):
-                raise ValueError(f"{label}.{name} 必须是有效字符串数组")
-        elif kind == "local_path":
-            _validate_local_path(item)
-        elif kind == "integer":
-            if isinstance(item, bool) or not isinstance(item, int):
-                raise ValueError(f"{label}.{name} 必须是整数")
-            if item < int(rule.get("minimum", item)) or item > int(rule.get("maximum", item)):
-                raise ValueError(f"{label}.{name} 超出允许范围")
-        else:
-            raise ValueError(f"平台检查契约字段类型无效：{kind}")
 
 
 def _css_variables(content):
@@ -509,120 +489,11 @@ def _css_variables(content):
 def load_smoke_manifest():
     if not SMOKE_MANIFEST.is_file():
         raise ValueError("缺少 forgeai.smoke.json，无法验证真实前后端联调")
-    if SMOKE_MANIFEST.stat().st_size > 256 * 1024:
-        raise ValueError("forgeai.smoke.json 超过 256KB")
-    manifest = json.loads(SMOKE_MANIFEST.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or manifest.get("version") != 1:
-        raise ValueError("forgeai.smoke.json 必须是 version=1 的对象")
-    unknown_top_level = sorted(set(manifest) - set(SMOKE_CONTRACT["top_level_fields"]))
-    if unknown_top_level:
-        raise ValueError("forgeai.smoke.json 包含未授权顶层字段：" + ", ".join(unknown_top_level))
-    api_checks = manifest.get("api_checks")
-    browser_checks = manifest.get("browser_checks")
-    if not isinstance(api_checks, list) or not 1 <= len(api_checks) <= 50:
-        raise ValueError("forgeai.smoke.json 必须包含 1～50 个 api_checks")
-    if not isinstance(browser_checks, list) or not 1 <= len(browser_checks) <= 20:
-        raise ValueError("forgeai.smoke.json 必须包含 1～20 个 browser_checks")
-    visual_contract = manifest.get("visual_contract")
-    template_metadata = json.loads((ROOT / "template.json").read_text(encoding="utf-8"))
-    if template_metadata.get("template_version") == "fullstack-react-v1":
-        if not isinstance(visual_contract, dict):
-            raise ValueError("React 项目必须在 forgeai.smoke.json 声明 visual_contract")
-        theme_file = visual_contract.get("theme_file")
-        if not isinstance(theme_file, str) or not theme_file.startswith("frontend/"):
-            raise ValueError("visual_contract.theme_file 必须指向 frontend 内的主题文件")
-        _source_path(theme_file)
-        required_tokens = visual_contract.get("required_tokens")
-        if not isinstance(required_tokens, list) or not all(
-            isinstance(token, str) and token.startswith("--") for token in required_tokens
-        ):
-            raise ValueError("visual_contract.required_tokens 必须是 CSS 变量名数组")
-        if not REQUIRED_THEME_TOKENS.issubset(required_tokens):
-            raise ValueError("视觉合同必须包含主色、强调色和中性色语义 token")
-        theme_mode = visual_contract.get("theme_mode")
-        if theme_mode not in {"template", "custom", "preserve"}:
-            raise ValueError("visual_contract.theme_mode 必须是 template、custom 或 preserve")
-        theme_reason = visual_contract.get("theme_reason")
-        if not isinstance(theme_reason, str) or len(theme_reason.strip()) < 8:
-            raise ValueError("visual_contract.theme_reason 必须说明当前配色意图")
-        local_assets = visual_contract.get("local_assets", [])
-        if not isinstance(local_assets, list) or len(local_assets) > 30:
-            raise ValueError("visual_contract.local_assets 必须是最多 30 项的数组")
-        for asset in local_assets:
-            _source_path(asset)
-    seen = set()
-    for check in api_checks:
-        if (
-            not isinstance(check, dict)
-            or not isinstance(check.get("id"), str)
-            or not check["id"].strip()
-        ):
-            raise ValueError("每个 API 联调项都必须有字符串 id")
-        if check["id"] in seen:
-            raise ValueError(f"联调项 id 重复：{check['id']}")
-        seen.add(check["id"])
-        method = str(check.get("method") or "GET").upper()
-        if method not in SMOKE_METHODS:
-            raise ValueError(f"不支持的 API 联调方法：{method}")
-        _validate_local_path(check.get("path"), api=True)
-        status = check.get("expect_status", 200)
-        if not isinstance(status, int) or not 100 <= status <= 599:
-            raise ValueError(f"API 联调状态码无效：{status!r}")
-        for field in ("expect_json_paths",):
-            value = check.get(field, [])
-            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                raise ValueError(f"{field} 必须是字符串数组")
-        capture = check.get("capture", {})
-        if not isinstance(capture, dict) or not all(
-            isinstance(key, str)
-            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", key)
-            and isinstance(value, str)
-            for key, value in capture.items()
-        ):
-            raise ValueError("capture 必须把变量名映射到 JSON 路径")
-        headers = check.get("headers", {})
-        if not isinstance(headers, dict) or not all(
-            isinstance(key, str) and isinstance(value, str) for key, value in headers.items()
-        ):
-            raise ValueError("headers 必须是字符串到字符串的对象")
-    for check in browser_checks:
-        if (
-            not isinstance(check, dict)
-            or not isinstance(check.get("id"), str)
-            or not check["id"].strip()
-        ):
-            raise ValueError("每个浏览器联调项都必须有字符串 id")
-        if check["id"] in seen:
-            raise ValueError(f"联调项 id 重复：{check['id']}")
-        seen.add(check["id"])
-        _validate_local_path(check.get("route"))
-        viewport = check.get("viewport")
-        if viewport is not None:
-            _validate_contract_object(viewport, BROWSER_CONTRACT["viewport"], "browser viewport")
-        expect_api = check.get("expect_api", [])
-        if not isinstance(expect_api, list) or not expect_api:
-            raise ValueError(f"浏览器联调项 {check['id']} 必须声明 expect_api")
-        for path in expect_api:
-            _validate_local_path(path, api=True)
-        expect_text = check.get("expect_text", [])
-        if not isinstance(expect_text, list) or not all(
-            isinstance(item, str) and item for item in expect_text
-        ):
-            raise ValueError("expect_text 必须是非空字符串数组")
-        actions = check.get("actions", [])
-        if not isinstance(actions, list) or len(actions) > 20:
-            raise ValueError("browser actions 必须是最多 20 项的数组")
-        for action in actions:
-            if not isinstance(action, dict) or action.get("type") not in SMOKE_ACTIONS:
-                raise ValueError(f"浏览器动作无效：{action!r}")
-            action_type = action["type"]
-            _validate_contract_object(
-                action,
-                SMOKE_ACTIONS[action_type]["fields"],
-                f"浏览器动作 {action_type}",
-                extra_fields=("type",),
-            )
-    return manifest
+    return parse_smoke_manifest(
+        SMOKE_MANIFEST.read_text(encoding="utf-8"),
+        root=ROOT,
+        template_metadata=json.loads((ROOT / "template.json").read_text(encoding="utf-8")),
+    )
 
 
 def validate_visual_contract(manifest):
@@ -758,7 +629,7 @@ def run_browser_smoke(manifest, variables, base_url):
     command(
         ["node", "/opt/forgeai/probe.mjs", base_url, str(rendered_path)],
         ROOT / "frontend",
-        timeout=120,
+        timeout=_smoke.SMOKE_CONTRACT["limits"]["browser_timeout_seconds"],
     )
 
 
@@ -784,23 +655,12 @@ def backend():
         stop_process(process)
 
 
-def frontend(*, skip_dependencies=False):
+def frontend(*, skip_dependencies=False, skip_types=False):
     frontend_root = ROOT / "frontend"
     if not skip_dependencies:
         ensure_frontend_dependencies()
-    package = json.loads((frontend_root / "package.json").read_text(encoding="utf-8"))
-    dependencies = {
-        **(package.get("dependencies") or {}),
-        **(package.get("devDependencies") or {}),
-    }
-    if "typescript" in dependencies:
-        build_config = frontend_root / "tsconfig.build.json"
-        if build_config.is_file():
-            frontend_command("tsc", "-p", build_config.name)
-        else:
-            frontend_command("tsc", "--noEmit")
-    else:
-        raise ValueError("frontend/package.json 必须配置 TypeScript 检查器")
+    if not skip_types:
+        typescript()
     # Vite writes node_modules/.vite-temp while loading its config.
     frontend_command("vite", "build")
     if not (frontend_root / "dist/index.html").is_file():
@@ -810,14 +670,18 @@ def frontend(*, skip_dependencies=False):
 def runtime_smoke():
     """Prove real browser journeys call the generated backend with valid contracts."""
 
-    database()
     manifest = load_smoke_manifest()
     validate_visual_contract(manifest)
+    quick()
+    with phase("frontend_build"):
+        frontend(skip_dependencies=True, skip_types=True)
+    with phase("database"):
+        database(skip_compile=True)
     backend_process = start_backend(port=8000)
     frontend_process = None
     try:
-        frontend()
-        variables = run_api_smoke(manifest, "http://127.0.0.1:8000")
+        with phase("api_smoke"):
+            variables = run_api_smoke(manifest, "http://127.0.0.1:8000")
         frontend_process = subprocess.Popen(
             [
                 "node",
@@ -833,7 +697,8 @@ def runtime_smoke():
         html = wait_http("http://127.0.0.1:5173/", frontend_process, "前端联调页面")
         if b"<html" not in html.lower() and b"<!doctype html" not in html.lower():
             raise RuntimeError("前端联调页面没有返回 HTML")
-        run_browser_smoke(manifest, variables, "http://127.0.0.1:5173")
+        with phase("browser_smoke"):
+            run_browser_smoke(manifest, variables, "http://127.0.0.1:5173")
         print("真实前后端联调通过：API 契约、页面请求和关键交互均有运行证据。", flush=True)
     finally:
         if frontend_process is not None:

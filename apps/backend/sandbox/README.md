@@ -16,11 +16,32 @@
 docker build -f sandbox/Dockerfile -t forgeai-checks:fullstack-react-v1 .
 ```
 
+若本机配置的 Docker Hub 镜像代理返回 403/限流，可先从官方仓库拉取并标记同版本基础镜像，
+再运行上面的构建命令，无需更改全局代理配置：
+
+```sh
+docker pull registry-1.docker.io/library/node:22.18.0-bookworm-slim
+docker tag registry-1.docker.io/library/node:22.18.0-bookworm-slim node:22.18.0-bookworm-slim
+docker pull registry-1.docker.io/library/python:3.13-slim-bookworm
+docker tag registry-1.docker.io/library/python:3.13-slim-bookworm python:3.13-slim-bookworm
+```
+
+完整重建可添加 `--no-cache`。Dockerfile 使用 Debian 官方 HTTPS 软件源安装系统依赖。
+
 镜像构建阶段预装模板依赖，作为与模板清单一致时的快速路径。
 运行检查时：若生成应用的 `package.json` / `pyproject.toml` 与模板一致，复用预装模块；
 若清单已演进（例如增加新的 UI 组件包），检查控制器会按生成清单联网安装依赖后再构建。
 生产环境应在可信构建机器预构建镜像并将 `ENGINEERING_CHECK_IMAGE` 指向审核过的镜像摘要。
 更新 `sandbox/check.py` 或模板基线依赖后需重新构建镜像。
+
+`smoke_contract.json` 是模型、写入校验和隔离执行的共同契约。配置在源码暂存阶段和检查
+启动前校验；`all` 先验证配置并编译前端，再迁移临时数据库。当前上限为 50 个 API 用例、
+50 个浏览器用例、每例 80 个动作、累计 400 个动作；浏览器总时限仍为 120 秒。
+纯 UI 用例使用 `kind: "ui"` 并提供可观察断言；默认集成用例仍要求 `expect_api`。
+负向 HTTP 场景可声明 `{"method":"POST","path":"/api/v1/apply","status":409}`，
+方法、含查询串的路径和状态必须精确匹配。意外 HTTP 错误、业务 console.error 和脚本异常
+仍判失败。API 请求成功或工程检查通过都不证明完整业务覆盖，最终仍需独立 QA。
+依赖工具按 npm 注册表规格和 Python PEP 508 分别解析；不接受本地路径、URL 或 VCS。
 
 配置：`ENGINEERING_CHECK_IMAGE`（默认上述标签）与
 `ENGINEERING_CHECK_TIMEOUT_SECONDS`（默认 300 秒，平台硬限制 300 秒）。
@@ -62,7 +83,16 @@ QA 容器禁用网络，不挂载宿主目录/socket，不传平台密钥。应�
 
 QA 执行不联网安装依赖。当前要求依赖与所选镜像预装清单相符；否则明确 environment/blocked，
 需准备匹配依赖的检查镜像。本轮没有实现按项目自动构建离线依赖镜像。
-更新三个运行器文件后重新构建镜像（运行时版本 18）。
+更新运行器或共享契约后重新构建镜像（检查运行时版本 20，依赖运行时版本 3）。
+
+版本 20 的 `all` 在同一个容器里依次运行 Python 语法、TypeScript、前端构建、迁移、
+API 和浏览器 smoke；类型检查与依赖准备不再因 `quick → all` 重复执行。
+运行器输出分阶段耗时，平台另记录总耗时及缓存命中；这些字段不作为验收依据。
+
+`generate_client.py` 从当前 FastAPI `app.main:app` 导出 OpenAPI，使用镜像内固定的
+`openapi-ts.config.ts` 和生成器生成 `frontend/openapi.json`、`frontend/src/client/`。
+业务封装应置于 `frontend/src/lib/`；生成目录会整体更新并清理过时文件。
+本次修改未执行测试；镜像构建成功仅说明脚本已打包，不代表业务验收通过。
 每次执行记录 code/source/suite/runner/execution 身份和逐步观察。诊断副本位于
 `forgeai/qa/<source_hash>/<execution_id>/`，持久恢复以受租约保护的任务检查点为准。
 测试资产修订最多 32 版、有效执行最多 6 次、模型轮次最多 64，恢复不重置预算。

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import PurePosixPath
 from typing import Any
 
 from app.core.exceptions import ConflictException
@@ -17,6 +20,81 @@ from app.tools.check_diagnostics import analyze_check_failure
 
 MAX_IDENTICAL_CHECK_FAILURES = 3
 MAX_UNCHANGED_SOURCE_FAILURES = 3
+
+
+def source_file_hashes(payload: bytes) -> dict[str, str]:
+    """Fingerprint the actual exported files, including removed files in later comparisons."""
+    return {
+        path: hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+        for path, content in json.loads(payload).items()
+    }
+
+
+def select_completion_check(
+    checkpoint: dict[str, Any],
+    work_item: WorkItem,
+    files: dict[str, str],
+    *,
+    final: bool,
+    quality_repair: bool,
+    runtime_version: str,
+) -> tuple[str, str]:
+    if final or quality_repair or work_item.provides_requirement_ids:
+        return "all", "最终交付、独立 QA 修复和前置能力必须完整集成验证"
+    watch = checkpoint.get("verification_watch", {}).get(work_item.id, {})
+    if any(key != "quick" for key in watch):
+        return "all", "存在尚未解除的构建或运行检查失败"
+    baseline = checkpoint.get("integration_baseline") or {}
+    previous = baseline.get("files")
+    if isinstance(previous, dict) and baseline.get("runtime_version") == runtime_version:
+        changed = {p for p in files.keys() | previous.keys() if files.get(p) != previous.get(p)}
+        if changed and all(
+            (p.startswith("frontend/src/") and PurePosixPath(p).suffix in {".css", ".scss"})
+            or (
+                p.startswith("frontend/public/")
+                and PurePosixPath(p).suffix in {".png", ".jpg", ".jpeg", ".webp"}
+            )
+            for p in changed
+        ):
+            return "frontend", "相对上次完整集成仅改变样式或本地图片，验证类型及构建"
+    if work_item.kind in {"foundation", "visual_foundation"}:
+        previous = checkpoint.get("initial_source_files")
+        if not isinstance(previous, dict):
+            return "all", "缺少变更基线，保守执行完整检查"
+        changed = {p for p in files.keys() | previous.keys() if files.get(p) != previous.get(p)}
+        if any(
+            any(
+                token in p.lower()
+                for token in ("auth", "security", "permission", "session", "token")
+            )
+            for p in changed
+        ):
+            return "all", "身份或权限相关源码变化需要完整集成验证"
+        # Only known source foundations qualify. Configuration, persistence and
+        # identity changes are deliberately conservative, including deletions.
+        if all(
+            p.startswith("frontend/src/")
+            or p.startswith("frontend/public/")
+            or (
+                p.startswith("backend/app/")
+                and PurePosixPath(p).suffix == ".py"
+                and not any(
+                    token in p.lower()
+                    for token in (
+                        "auth",
+                        "security",
+                        "permission",
+                        "model",
+                        "database",
+                        "/db",
+                        "settings",
+                    )
+                )
+            )
+            for p in changed
+        ):
+            return "quick", "基础工作项验证当前可用的语法与类型契约"
+    return "all", "业务、数据库、权限、配置或未识别变更需要完整集成验证"
 
 
 def apply_check_outcome(
@@ -35,12 +113,21 @@ def apply_check_outcome(
         source_hash = result.data.get("source_hash")
         if not isinstance(source_hash, str) or not source_hash:
             raise ConflictException("检查没有返回源码 hash")
-        streaks = current.get("failure_streaks")
-        if isinstance(streaks, dict):
-            streaks.pop(work_item.id, None)
         current_raw = current_item(current["work_items"])
         if current_raw is None or current_raw.get("id") != work_item.id:
             raise ConflictException("当前工作单元已变化")
+        final = all(
+            item.get("status") == "completed" or item.get("id") == work_item.id
+            for item in current["work_items"]
+        )
+        if (final or work_item.provides_requirement_ids) and (
+            result.data.get("check_id") != "all"
+            or result.data.get("runtime_version") != check_runtime_version
+        ):
+            raise ConflictException("最终交付及前置能力需要当前执行器的完整集成证据")
+        streaks = current.get("failure_streaks")
+        if isinstance(streaks, dict):
+            streaks.pop(work_item.id, None)
         current_raw["status"] = "completed"
         current_raw["summary"] = (summary or work_item.title)[:500]
         current["active_file_plan"] = None
@@ -55,6 +142,7 @@ def apply_check_outcome(
             label="Work item complete",
             detail=work_item.title,
             ok=True,
+            work_item=work_item,
         )
         if next_item is None:
             if any(item.get("status") != "completed" for item in current["work_items"]):

@@ -26,7 +26,7 @@ from app.services.task_execution import EXECUTION_LEASE, utc_now
 from app.services.workflow_events import append_event, sync_checkpoint_activity_events
 
 ACTIVE_JOB_STATUSES = ("queued", "running", "retry_wait")
-PAUSED_JOB_ERROR = "用户离开项目页面，构建已暂停。"
+PAUSED_JOB_ERROR = "构建已按用户操作暂停，可显式继续。"
 ROLE_JOB_TYPES = {
     TaskRecipient.PRODUCT_MANAGER.value: "product_manager",
     TaskRecipient.ARCHITECT.value: "architect",

@@ -220,6 +220,23 @@ def record_progress(
     information = False
     verification = False
     data = result.data
+    # Source edits and new failure output are evidence, but do not demonstrate
+    # that an outstanding check blocker has been repaired. Keep this clock across
+    # edits, rereads and recovery; only its own passing check clears it.
+    watch = checkpoint.setdefault("verification_watch", {}).setdefault(
+        str(checkpoint.get("current_work_item_id") or ""), {}
+    )
+    for check_id in watch:
+        watch[check_id] += 1
+    if result.name in {"run_check", "complete_work_item"} and data.get("source_hash"):
+        check_id = str(data.get("check_id") or "")
+        if check_id:
+            if result.ok:
+                watch.pop(check_id, None)
+                for covered in data.get("covered_checks", []):
+                    watch.pop(covered, None)
+            else:
+                watch.setdefault(check_id, 0)
     if result.ok and result.name == "read_file" and isinstance(data.get("content"), str):
         path, digest = data.get("path"), data.get("content_hash")
         if isinstance(path, str) and isinstance(digest, str):
@@ -283,26 +300,34 @@ def record_progress(
     checkpoint["steps_without_delivery"] = (
         0 if delivery_progress else int(checkpoint.get("steps_without_delivery", 0)) + 1
     )
-    if delivery_progress:
+    if delivery_progress and not watch:
         checkpoint.pop("progress_guidance_turn", None)
 
 
 def progress_guidance(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
     """One replaceable current-state note; no accumulating correction transcript."""
+    watch = checkpoint.get("verification_watch", {}).get(
+        str(checkpoint.get("current_work_item_id") or ""), {}
+    )
     if (
         checkpoint.get("needs_delivery_plan")
-        or int(checkpoint.get("steps_without_delivery", 0)) < GUIDANCE_AFTER_STEPS
+        or max(int(checkpoint.get("steps_without_delivery", 0)), max(watch.values(), default=0))
+        < GUIDANCE_AFTER_STEPS
     ):
         return None
     return {
         "work_item_id": checkpoint.get("current_work_item_id"),
         "steps_without_source_or_new_check": checkpoint["steps_without_delivery"],
         "steps_without_new_evidence": checkpoint.get("no_progress_steps", 0),
+        "unresolved_check_steps": dict(watch),
     }
 
 
 def implementation_stalled(checkpoint: dict[str, Any]) -> bool:
     issued = checkpoint.get("progress_guidance_turn")
+    watch = checkpoint.get("verification_watch", {}).get(
+        str(checkpoint.get("current_work_item_id") or ""), {}
+    )
     return (
         not checkpoint.get("needs_delivery_plan")
         and isinstance(issued, int)
@@ -310,5 +335,6 @@ def implementation_stalled(checkpoint: dict[str, Any]) -> bool:
         and (
             int(checkpoint.get("no_progress_steps", 0)) >= MAX_DUPLICATE_STEPS
             or int(checkpoint.get("steps_without_delivery", 0)) >= MAX_INSPECTION_STEPS
+            or max(watch.values(), default=0) >= MAX_INSPECTION_STEPS
         )
     )

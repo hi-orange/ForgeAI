@@ -10,6 +10,7 @@ import shutil
 import struct
 import subprocess
 import threading
+import time
 from collections import deque
 from functools import lru_cache
 from pathlib import Path
@@ -21,10 +22,11 @@ from app.core.settings import settings
 from app.runtime.docker import get_docker_sandbox_runtime
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.paths import MAX_FILE_BYTES, SKIP_DIRS, is_text_file, safe_path_under_root
+from sandbox.smoke_manifest import parse_smoke_manifest
 
 CHECK_IDS = {"quick", "database", "backend", "frontend", "all", "security"}
 CHECK_RUNTIME_LABEL = "org.forgeai.check-runtime-version"
-CHECK_RUNTIME_VERSION = "18"
+CHECK_RUNTIME_VERSION = "20"
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 MAX_BINARY_ASSETS_BYTES = 32 * 1024 * 1024
@@ -164,9 +166,11 @@ def visual_docker_command(binary: str, image: str, name: str, route: str) -> lis
     return [*docker_command(binary, image, name, "visual"), route]
 
 
-def _execute(command: list[str], payload: bytes, timeout: int) -> tuple[int, str, bool]:
+def _execute(
+    command: list[str], payload: bytes, timeout: int, *, max_output_bytes: int = MAX_LOG_BYTES
+) -> tuple[int, str, bool]:
     """Drain output continuously but retain only a bounded tail, even for noisy code."""
-    chunks: deque[bytes] = deque(maxlen=MAX_LOG_BYTES // 1024)
+    chunks: deque[bytes] = deque(maxlen=max_output_bytes // 1024)
     count = 0
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     process = subprocess.Popen(
@@ -212,7 +216,7 @@ def _execute(command: list[str], payload: bytes, timeout: int) -> tuple[int, str
     finally:
         reader.join(timeout=5)
         writer.join(timeout=5)
-    return code, b"".join(chunks).decode("utf-8", errors="replace"), count > MAX_LOG_BYTES
+    return code, b"".join(chunks).decode("utf-8", errors="replace"), count > max_output_bytes
 
 
 def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> ToolExecutionResult:
@@ -232,7 +236,29 @@ def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> Tool
     except (BusinessException, OSError, UnicodeError) as exc:
         return result.model_copy(update={"error_code": "INVALID_SOURCE", "summary": str(exc)})
     name = f"forgeai-check-{uuid4().hex}"
-    result.data = {"check_id": check_id, "source_hash": digest}
+    result.data = {
+        "check_id": check_id,
+        "source_hash": digest,
+        "runtime_version": CHECK_RUNTIME_VERSION,
+        "cache_hit": False,
+    }
+    if check_id in {"quick", "all"}:
+        try:
+            snapshot = json.loads(payload)
+            content = snapshot.get("forgeai.smoke.json")
+            if not isinstance(content, str):
+                raise ValueError("缺少 forgeai.smoke.json")
+            parse_smoke_manifest(
+                content,
+                root=root.resolve(),
+                template_metadata=json.loads(snapshot.get("template.json", "{}")),
+            )
+        except (ValueError, TypeError, OSError) as exc:
+            result.error_code = "CHECK_FAILED"
+            result.summary = "smoke 配置静态校验失败"
+            result.data.update(output=f"ValueError: {exc}", phase="smoke_manifest")
+            return result
+    started = time.monotonic()
     try:
         code, output, truncated = _execute(
             docker_command(binary, settings.engineering_check_image, name, check_id),
@@ -255,6 +281,23 @@ def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> Tool
             else f"{check_id} 检查失败"
         )
         result.data.update(exit_code=code, output=output)
+        if result.ok:
+            result.data["covered_checks"] = (
+                ["quick", "frontend", "database", "backend", "all"]
+                if check_id == "all"
+                else [check_id]
+            )
+        # Runner timings are diagnostic observations, never authority to bypass gates.
+        phases = []
+        for line in output.splitlines():
+            if line.startswith("FORGEAI_CHECK_PHASE="):
+                try:
+                    entry = json.loads(line.removeprefix("FORGEAI_CHECK_PHASE="))
+                    if isinstance(entry, dict):
+                        phases.append(entry)
+                except ValueError:
+                    pass
+        result.data["phase_observations"] = phases[-20:]
         result.truncated = truncated
         if source_snapshot(root)[1] != digest:
             result.ok, result.error_code, result.summary = (
@@ -267,6 +310,7 @@ def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> Tool
     except (OSError, BusinessException, UnicodeError) as exc:
         result.error_code, result.summary = "CHECK_ENVIRONMENT_UNAVAILABLE", str(exc)[:500]
     finally:
+        result.data["elapsed_ms"] = round((time.monotonic() - started) * 1000)
         # Killing the CLI alone does not stop its container. Never address another run's instance.
         try:
             subprocess.run(

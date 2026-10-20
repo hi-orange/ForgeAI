@@ -39,7 +39,11 @@ from app.generation.engineering.checkpoint import (
     remember_recovery,
     resume_blocked_checkpoint,
 )
-from app.generation.engineering.checks import apply_check_outcome
+from app.generation.engineering.checks import (
+    apply_check_outcome,
+    select_completion_check,
+    source_file_hashes,
+)
 from app.generation.engineering.context import (
     build_workspace_file_index,
     update_file_index,
@@ -224,6 +228,10 @@ class _EngineeringNodes:
                 return self._result(checkpoint)
 
             root = _workspace_root(state["project_id"], state["build_run_id"])
+            if "initial_source_files" not in checkpoint:
+                checkpoint["initial_source_files"] = source_file_hashes(
+                    check_tools.source_snapshot(root)[0]
+                )
             if not isinstance(checkpoint.get("workspace_file_index"), dict):
                 checkpoint["workspace_file_index"] = build_workspace_file_index(root)
             if checkpoint.get("check_environment_execution_id") != execution.execution_id:
@@ -367,6 +375,8 @@ class _EngineeringNodes:
                         if item.get("status") == "completed"
                     ],
                     "repair_context": checkpoint.get("repair_context"),
+                    "api_client_contract": checkpoint.get("api_client_contract"),
+                    "pending_integration": checkpoint.get("pending_integration", True),
                     "active_diagnostics": active_diagnostics(checkpoint),
                     "check_verification": check_verification(checkpoint),
                     "progress_guidance": progress_guidance(checkpoint),
@@ -393,7 +403,13 @@ class _EngineeringNodes:
             )
             result = rejected_tool(call, exc)
             result = result.model_copy(
-                update={"data": {**result.data, "available_tools": available}}
+                update={
+                    "data": {
+                        **result.data,
+                        "available_tools": available,
+                        **({"protocol_metadata": exc.data} if isinstance(exc.data, dict) else {}),
+                    }
+                }
             )
             return self._record_action(state, call, PreparedAction(result), root)
         except ProviderException:
@@ -435,7 +451,7 @@ class _EngineeringNodes:
             return self._record_action(state, call, PreparedAction(rejected_tool(call, exc)), root)
         with self._session_factory() as db:
             execution, current_snapshot, current = _locked_current(db, state)
-            needed = 3 if call.name == "complete_work_item" else 1
+            needed = 2 if call.name == "complete_work_item" else 1
             if int(current.get("tool_calls") or 0) + needed > call_budget(
                 snapshot, "max_tool_calls"
             ):
@@ -558,19 +574,41 @@ class _EngineeringNodes:
                 digest = result.data.get("content_hash")
                 if isinstance(path, str) and isinstance(digest, str):
                     hashes[path] = digest
-            changed = result.data.get("files") if result.ok and action.updates else []
+            changed = (
+                result.data.get("files")
+                if result.ok and (action.updates or action.deletions)
+                else []
+            )
             modified = list(current.get("modified_files") or [])
             for entry in changed or []:
                 path = entry["path"]
-                hashes[path] = entry["content_hash"]
+                if entry.get("deleted"):
+                    hashes.pop(path, None)
+                    index = current.get("workspace_file_index", {})
+                    index["paths"] = [p for p in index.get("paths", []) if p != path]
+                    current.setdefault("source_evidence", {}).pop(path, None)
+                    current.setdefault("work_memory", {}).get(
+                        str(current.get("current_work_item_id") or ""), {}
+                    ).get("changed_files", {}).pop(path, None)
+                else:
+                    hashes[path] = entry["content_hash"]
+                    update_file_index(current, path)
                 if path not in modified:
                     modified.append(path)
-                update_file_index(current, path)
             current["modified_files"] = modified
             current["observed_hashes"] = hashes
             if changed:
                 current["revision_id"] = execution.execution_id
                 invalidate_source_evidence(current)
+            if result.ok and call.name == "generate_api_client":
+                current["api_client_contract"] = {
+                    "backend_files": result.data["backend_files"],
+                    "generated_files": result.data["generated_files"],
+                    "runtime_version": result.data["runtime_version"],
+                }
+                # Backend-only changes can leave generated bytes identical. The
+                # refreshed contract still invalidates a cached API_CLIENT_STALE.
+                current["check_cache"] = {}
             record_progress(current, result, changed=bool(changed), plan_changed=progressed)
             record_work_result(current, result, updates=action.updates)
             log_tool_result("Code Engineer", int(current["model_turns"]), call, result)
@@ -603,7 +641,7 @@ class _EngineeringNodes:
             if current.get("outcome") == "running" and implementation_stalled(current):
                 block_checkpoint(
                     current,
-                    "已提供当前事实指导，仍持续没有源码或验证进展；保留现场等待显式继续",
+                    "已提供当前事实指导，仍未解除检查阻塞或取得有效进展；保留现场等待显式继续",
                     reason_code="NO_SOURCE_PROGRESS",
                 )
             snapshot["checkpoint"] = current
@@ -625,13 +663,28 @@ class _EngineeringNodes:
         if not isinstance(result.data.get("source_hash"), str):
             return result
         cache = dict(checkpoint.get("check_cache") or {})
+        if result.ok:
+            for covered in result.data.get("covered_checks", []):
+                cache.pop(covered, None)
         cache[check_id] = result.model_dump(mode="json")
         checkpoint["check_cache"] = cache
         if not result.ok:
             record_check_failure(checkpoint, result, check_id=check_id)
         else:
+            for covered in result.data.get("covered_checks", []):
+                diagnostic = checkpoint.get("diagnostic_state", {}).get(f"check:{covered}")
+                if isinstance(diagnostic, dict):
+                    diagnostic.update(
+                        status="resolved",
+                        verification_status="current",
+                        verified_by=check_id,
+                        verification_source_hash=result.data["source_hash"],
+                    )
             repair = checkpoint.get("repair_context")
-            if isinstance(repair, dict) and repair.get("check_id") == check_id:
+            if isinstance(repair, dict) and repair.get("check_id") in {
+                check_id,
+                *result.data.get("covered_checks", []),
+            }:
                 checkpoint["repair_context"] = None
         return result
 
@@ -639,13 +692,49 @@ class _EngineeringNodes:
     def _run_check(
         root: Path, checkpoint: dict[str, Any], *, check_id: str, tool_call_id: str
     ) -> ToolExecutionResult:
-        source_hash = check_tools.source_snapshot(root)[1]
+        payload, source_hash = check_tools.source_snapshot(root)
+        contract = checkpoint.get("api_client_contract")
+        if isinstance(contract, dict):
+            current_files = source_file_hashes(payload)
+            backend_files = {p: h for p, h in current_files.items() if p.startswith("backend/")}
+            generated_files = {
+                p: h
+                for p, h in current_files.items()
+                if p == "frontend/openapi.json" or p.startswith("frontend/src/client/")
+            }
+            if (
+                contract.get("backend_files") != backend_files
+                or contract.get("generated_files") != generated_files
+                or contract.get("runtime_version") != check_tools.CHECK_RUNTIME_VERSION
+            ):
+                return ToolExecutionResult(
+                    tool_call_id=tool_call_id,
+                    name="run_check",
+                    ok=False,
+                    error_code="API_CLIENT_STALE",
+                    summary="接口契约已过期，请先 generate_api_client 更新后再检查",
+                    data={
+                        "source_hash": source_hash,
+                        "check_id": check_id,
+                        "runtime_version": check_tools.CHECK_RUNTIME_VERSION,
+                    },
+                )
         cached = (checkpoint.get("check_cache") or {}).get(check_id)
-        if isinstance(cached, dict) and cached.get("data", {}).get("source_hash") == source_hash:
+        if (
+            isinstance(cached, dict)
+            and cached.get("data", {}).get("source_hash") == source_hash
+            and cached.get("data", {}).get("runtime_version") == check_tools.CHECK_RUNTIME_VERSION
+        ):
             return ToolExecutionResult.model_validate(cached).model_copy(
                 update={
                     "tool_call_id": tool_call_id,
                     "summary": f"复用同版本检查证据：{cached['summary']}",
+                    "data": {
+                        **cached["data"],
+                        "cache_hit": True,
+                        "elapsed_ms": 0,
+                        "cached_elapsed_ms": cached["data"].get("elapsed_ms"),
+                    },
                 }
             )
         return check_tools.run_check(root, check_id=check_id, tool_call_id=tool_call_id)
@@ -762,80 +851,65 @@ class _EngineeringNodes:
         work_item: WorkItem,
         root: Path,
     ) -> _WorkflowUpdate:
-        del snapshot
         pending_ids = [
             str(item.get("id"))
             for item in checkpoint.get("work_items") or []
             if isinstance(item, dict) and item.get("status") == "pending"
         ]
         is_final_work_item = pending_ids == [work_item.id]
+        source_payload, source_hash = check_tools.source_snapshot(root)
+        file_hashes = source_file_hashes(source_payload)
+        check_id, reason = select_completion_check(
+            checkpoint,
+            work_item,
+            file_hashes,
+            final=is_final_work_item,
+            quality_repair=isinstance(snapshot.get("quality_report"), dict),
+            runtime_version=check_tools.CHECK_RUNTIME_VERSION,
+        )
         self._persist_waiting(
             state,
-            name="run_quick_check",
-            label="Run quick checks",
-            detail=f"快速验证“{work_item.title}”的语法和类型契约",
+            name=f"run_{check_id}_check",
+            label=f"Run {check_id} checks",
+            detail=f"验证“{work_item.title}”：{reason}",
         )
-        quick_result = self._run_check(
+        result = self._run_check(
             root,
             checkpoint,
-            check_id="quick",
-            tool_call_id=f"quick_{work_item.id}",
+            check_id=check_id,
+            tool_call_id=f"{check_id}_{work_item.id}",
         )
         preview_snapshot: bytes | None = None
         preview_source_hash: str | None = None
-        if quick_result.ok:
+        if result.ok:
             preview_snapshot, preview_source_hash = check_tools.source_snapshot(root)
-            checked_hash = quick_result.data.get("source_hash")
-            if checked_hash != preview_source_hash:
-                quick_result = quick_result.model_copy(
+            if (
+                result.data.get("source_hash") != preview_source_hash
+                or preview_source_hash != source_hash
+            ):
+                result = result.model_copy(
                     update={
                         "ok": False,
                         "error_code": "SOURCE_CHANGED",
-                        "summary": "快速检查后源码发生变化，需要重新检查",
+                        "summary": "检查与调度时的源码身份不一致，需要重新检查",
                     }
                 )
                 preview_snapshot = None
                 preview_source_hash = None
 
-        final_result: ToolExecutionResult | None = None
-        result = quick_result
-        if quick_result.ok and (
-            is_final_work_item or work_item.kind == "feature" or work_item.provides_requirement_ids
-        ):
-            self._persist_waiting(
-                state,
-                name="run_final_check" if is_final_work_item else "run_integration_check",
-                label="Run final checks" if is_final_work_item else "Run integration checks",
-                detail=f"验证工作项“{work_item.title}”的构建、迁移和真实前后端冒烟",
-            )
-            final_result = self._run_check(
-                root,
-                checkpoint,
-                check_id="all",
-                tool_call_id=f"final_{work_item.id}",
-            )
-            if final_result.ok and (
-                final_result.data.get("source_hash") != preview_source_hash
-                or check_tools.source_snapshot(root)[1] != preview_source_hash
-            ):
-                final_result = final_result.model_copy(
-                    update={
-                        "ok": False,
-                        "error_code": "SOURCE_CHANGED",
-                        "summary": "完整检查与当前源码身份不一致，需要重新验证",
-                    }
-                )
-            result = final_result
-
         with self._session_factory() as db:
             execution, current_snapshot, current = _locked_current(db, state)
-            quick_result = self._remember_check(current, "quick", quick_result)
-            if final_result is not None:
-                final_result = self._remember_check(current, "all", final_result)
-            result = final_result if final_result is not None else quick_result
-            current["tool_calls"] = int(current.get("tool_calls") or 0) + (
-                2 if final_result is not None else 1
-            )
+            result = self._remember_check(current, check_id, result)
+            current["tool_calls"] = int(current.get("tool_calls") or 0) + 1
+            if result.ok and check_id == "all":
+                current["integration_baseline"] = {
+                    "source_hash": source_hash,
+                    "files": file_hashes,
+                    "runtime_version": check_tools.CHECK_RUNTIME_VERSION,
+                }
+                current["pending_integration"] = False
+            elif result.ok:
+                current["pending_integration"] = True
             pending = current.pop("pending_tool", {})
             completion_summary = pending.get("arguments", {}).get("summary", work_item.title)
             history = list(current.get("plan_history") or [])
@@ -843,29 +917,25 @@ class _EngineeringNodes:
                 {
                     "kind": current.get("active_plan_kind") or "implementation",
                     "plan": {"work_item_id": work_item.id, "summary": completion_summary},
-                    "quick_check": quick_result.model_dump(mode="json"),
-                    "final_check": (
-                        final_result.model_dump(mode="json") if final_result is not None else None
-                    ),
+                    "quick_check": result.model_dump(mode="json") if check_id == "quick" else None,
+                    "final_check": result.model_dump(mode="json") if check_id == "all" else None,
+                    "check_reason": reason,
                     "check": result.model_dump(mode="json"),
                 }
             )
             current["plan_history"] = history[-MAX_PLAN_HISTORY:]
-            quick_failure = None if quick_result.ok else analyze_check_failure(quick_result)
-            quick_excerpt = "" if quick_failure is None else quick_failure.excerpt
+            failure = None if result.ok else analyze_check_failure(result)
             append_activity(
                 current,
-                name="quick_check_result",
-                label="Quick checks passed" if quick_result.ok else "Quick checks failed",
-                detail=(
-                    quick_result.summary
-                    if quick_result.ok
-                    else f"{quick_result.summary}：{quick_excerpt}"
-                ),
-                ok=quick_result.ok,
+                name=f"{check_id}_check_result",
+                label=f"{check_id} checks {'passed' if result.ok else 'failed'}",
+                detail=result.summary
+                if failure is None
+                else f"{result.summary}：{failure.excerpt}",
+                ok=result.ok,
             )
 
-            if quick_result.ok and preview_snapshot is not None and preview_source_hash is not None:
+            if result.ok and preview_snapshot is not None and preview_source_hash is not None:
                 artifact = persist_source_artifact(
                     db,
                     project_id=state["project_id"],
@@ -889,7 +959,7 @@ class _EngineeringNodes:
                         "source_artifact_id": artifact.artifact_id,
                         "work_item_id": work_item.id,
                         "work_item_title": work_item.title,
-                        "check_id": "quick",
+                        "check_id": check_id,
                         "check_runtime_version": check_tools.CHECK_RUNTIME_VERSION,
                     },
                 )
@@ -905,23 +975,6 @@ class _EngineeringNodes:
                     label="Preview revision ready",
                     detail=f"Revision {event.sequence} · {work_item.title}",
                     ok=True,
-                )
-
-            if final_result is not None:
-                final_failure = None if final_result.ok else analyze_check_failure(final_result)
-                final_excerpt = "" if final_failure is None else final_failure.excerpt
-                append_activity(
-                    current,
-                    name="final_check_result" if is_final_work_item else "integration_check_result",
-                    label="Integration checks passed"
-                    if final_result.ok
-                    else "Integration checks failed",
-                    detail=(
-                        final_result.summary
-                        if final_result.ok
-                        else f"{final_result.summary}：{final_excerpt}"
-                    ),
-                    ok=final_result.ok,
                 )
 
             # Attribute verification evidence to the item being checked before advancing.

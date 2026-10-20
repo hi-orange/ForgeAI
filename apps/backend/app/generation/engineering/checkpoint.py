@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.core.exceptions import ConflictException
+from app.generation.delivery import WorkItem
 from app.generation.engineering.budget import DEFAULT_CALL_BUDGET
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.check_diagnostics import CheckFailureAnalysis, analyze_check_failure
@@ -214,6 +215,8 @@ def record_check_failure(
 ) -> None:
     """Keep actionable diagnostics even when the observation window rolls over."""
     failure = analyze_check_failure(result)
+    from app.tools.check_diagnostics import repair_verification
+
     checkpoint["repair_context"] = {
         "round": round_number,
         "check_id": check_id or result.data.get("check_id"),
@@ -221,6 +224,7 @@ def record_check_failure(
         "excerpt": failure.excerpt,
         "diagnostics": repair_diagnostics(failure),
         "modified_files": list(checkpoint.get("modified_files") or []),
+        "verification": repair_verification(result),
     }
 
 
@@ -327,6 +331,7 @@ def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
     checkpoint["manual_repair_attempts"] = retry_number
     checkpoint["no_progress_steps"] = 0
     checkpoint["steps_without_delivery"] = 0
+    checkpoint["verification_watch"] = {}
     checkpoint.pop("progress_guidance_turn", None)
     checkpoint["outcome"] = "running"
     checkpoint["blocked_reason"] = None
@@ -363,9 +368,12 @@ def append_activity(
     label: str,
     detail: str,
     ok: bool,
+    work_item: WorkItem | None = None,
 ) -> None:
     activity = list(checkpoint.get("activity") or [])
-    current = current_item(checkpoint.get("work_items") or [])
+    current = (
+        work_item.model_dump() if work_item else current_item(checkpoint.get("work_items") or [])
+    )
     activity.append(
         {
             "id": f"{name}_{len(activity) + 1}",

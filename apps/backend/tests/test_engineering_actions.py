@@ -60,6 +60,72 @@ class EngineeringActionTests(unittest.TestCase):
         self.assertFalse(action.result.ok)
         self.assertEqual(action.updates, {})
 
+    def test_unified_write_supports_single_and_multiple_files(self):
+        for count in (1, 2, 8):
+            with self.subTest(count=count):
+                writes = [
+                    {"path": f"batch_{count}/{i}.py", "content": f"VALUE = {i}\n"}
+                    for i in range(count)
+                ]
+                action = prepare_action(
+                    ToolCall(id="write", name="write_files", arguments={"writes": writes}),
+                    self.root,
+                    {},
+                )
+                self.assertTrue(action.result.ok, action.result.summary)
+                for row in writes:
+                    self.assertFalse((self.root / row["path"]).exists())
+                result = commit_action(action, self.root, revision_id=f"write-{count}")
+                self.assertTrue(result.ok, result.summary)
+                self.assertEqual(len(result.data["files"]), count)
+                for row in writes:
+                    self.assertEqual(
+                        (self.root / row["path"]).read_text(encoding="utf-8"), row["content"]
+                    )
+
+    def test_unified_write_conflict_prevents_every_file_commit(self):
+        digest = self.source("existing.py")
+        action = prepare_action(
+            ToolCall(
+                id="write",
+                name="write_files",
+                arguments={
+                    "writes": [
+                        {"path": "new.py", "content": "NEW = True"},
+                        {"path": "existing.py", "content": "VALUE = 2", "expected_hash": digest},
+                    ]
+                },
+            ),
+            self.root,
+            {"existing.py": digest},
+        )
+        self.assertTrue(action.result.ok, action.result.summary)
+        self.source("existing.py", b"CONCURRENT = True")
+        result = commit_action(action, self.root, revision_id="write-conflict")
+        self.assertFalse(result.ok)
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual((self.root / "existing.py").read_bytes(), b"CONCURRENT = True")
+
+    def test_unified_write_rejects_protected_path_in_entire_batch(self):
+        with patch("app.generation.engineering.actions.execute_tool_call") as tool:
+            action = prepare_action(
+                ToolCall(
+                    id="write",
+                    name="write_files",
+                    arguments={
+                        "writes": [
+                            {"path": "new.py", "content": "NEW = True"},
+                            {"path": "frontend/e2e/test.ts", "content": "tamper"},
+                        ]
+                    },
+                ),
+                self.root,
+                {},
+            )
+        tool.assert_not_called()
+        self.assertFalse(action.result.ok)
+        self.assertFalse((self.root / "new.py").exists())
+
     def test_concurrent_change_after_tool_execution_prevents_commit(self):
         action = prepare_action(
             ToolCall(
