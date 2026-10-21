@@ -34,6 +34,166 @@ def turn(name, **arguments):
 
 
 class EngineeringLoopTests(EngineeringClaimTests):
+    def test_startup_context_and_hash_adoption_allow_implementation_without_read_turns(self):
+        self._start()
+        frozen = read_frozen_input_snapshot(self.execution)
+        source_body = "@import 'tailwindcss';\n/* existing customized theme */\n"
+        (self.root / "frontend/src/index.css").write_text(source_body, encoding="utf-8")
+
+        def decide(*, work_item, observations, engineering_context, tools, **kwargs):
+            if work_item.id == "engineering_plan":
+                self.assertEqual(engineering_context["optional_capabilities"], [])
+                self.assertNotIn("install_capability", {tool.name for tool in tools})
+                sources = engineering_context["initial_source_context"]["files"]
+                source = next(row for row in sources if row["path"] == "frontend/src/index.css")
+                self.assertEqual(source["content"], source_body.rstrip())
+                self.assertEqual(
+                    engineering_context["observed_files"][source["path"]], source["content_hash"]
+                )
+                proposal = engineering_context["suggested_delivery_plan"]
+                self.assertTrue(proposal["items"])
+                return turn(
+                    "update_delivery_plan",
+                    suggested_plan_hash=proposal["content_hash"],
+                    reason="The frozen dependencies and existing theme support this plan",
+                )
+            self.assertIsNone(engineering_context["suggested_delivery_plan"])
+            if work_item.kind == "visual_foundation":
+                if not any(o.ok and o.name == "edit_file_by_replace" for o in observations):
+                    source = next(
+                        row
+                        for row in engineering_context["initial_source_context"]["files"]
+                        if row["path"] == "frontend/src/index.css"
+                    )
+                    return turn(
+                        "edit_file_by_replace",
+                        path=source["path"],
+                        old_text="/* existing customized theme */",
+                        new_text="/* verified shared theme */",
+                        expected_hash=source["content_hash"],
+                    )
+                self.assertIn(
+                    "frontend/src/index.css",
+                    engineering_context["initial_source_context"]["stale_paths"],
+                )
+                return turn(
+                    "complete_work_item", work_item_id=work_item.id, summary="Verified theme"
+                )
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        state = self._checkpoint()
+        self.assertEqual(state["model_turns"], 7)
+        self.assertFalse(any(row["name"] == "read_file" for row in state["observations"]))
+        self.assertEqual(len(state["delivery_plan_history"]), 1)
+        self.assertEqual(
+            len([row for row in state["activity"] if row["name"] == "prepare_context"]), 1
+        )
+        self.assertIn("verified shared theme", (self.root / "frontend/src/index.css").read_text())
+        with self.session_factory() as db:
+            saved = read_frozen_input_snapshot(db.get(TaskExecution, self.execution.execution_id))
+            for key in ("approved_item_id", "approved_spec_digest", "system_design", "call_budget"):
+                self.assertEqual(saved[key], frozen[key])
+
+    def test_stale_suggestion_is_rejected_then_current_hash_repairs_without_new_reading(self):
+        self._start()
+        attempts = 0
+
+        def decide(*, work_item, observations, engineering_context, **kwargs):
+            nonlocal attempts
+            if work_item.id == "engineering_plan":
+                attempts += 1
+                if attempts > 1:
+                    self.assertTrue(
+                        any(not row.ok and "版本已变化" in row.summary for row in observations)
+                    )
+                return turn(
+                    "update_delivery_plan",
+                    suggested_plan_hash="0" * 64
+                    if attempts == 1
+                    else engineering_context["suggested_delivery_plan"]["content_hash"],
+                    reason="Adopt the current proposal",
+                )
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(self._checkpoint()["delivery_plan_history"]), 1)
+
+    def test_selected_auth_installs_through_fenced_workflow_with_frozen_digest(self):
+        from test_delivery_dependencies import dependency_design, dependency_spec
+
+        design = dependency_design().model_dump()
+        design["optional_capabilities"] = [
+            {
+                "capability_id": "auth-session-v1",
+                "requirement_ids": ["login"],
+                "rationale": "Approved login requires authenticated identity",
+            }
+        ]
+        with (
+            patch("test_engineering_claim.valid_spec", return_value=dependency_spec().model_dump()),
+            patch("test_engineering_claim.valid_design", return_value=design),
+        ):
+            self._start()
+        frozen = read_frozen_input_snapshot(self.execution)["optional_capabilities"]
+
+        def decide(*, work_item, observations, engineering_context, tools, **kwargs):
+            if work_item.id == "engineering_plan":
+                return turn(
+                    "update_delivery_plan",
+                    suggested_plan_hash=engineering_context["suggested_delivery_plan"][
+                        "content_hash"
+                    ],
+                    reason="Implement identity before private records",
+                )
+            if work_item.id == "login" and not any(
+                row.ok and row.name == "install_capability" for row in observations
+            ):
+                self.assertIn("install_capability", {tool.name for tool in tools})
+                self.assertEqual(engineering_context["optional_capabilities"], frozen)
+                return turn("install_capability", capability_id="auth-session-v1")
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        installed = [
+            row for row in self._checkpoint()["observations"] if row["name"] == "install_capability"
+        ]
+        self.assertEqual(len(installed), 1)
+        self.assertTrue(installed[0]["ok"])
+        self.assertEqual(installed[0]["data"]["source_digest"], frozen[0]["source_digest"])
+        self.assertEqual(len(installed[0]["data"]["files"]), 8)
+        self.assertTrue((self.root / "backend/app/core/auth.py").is_file())
+        self.assertIn("backend/app/core/auth.py", self._checkpoint()["modified_files"])
+
+    def test_suggestion_shortcut_cannot_reset_an_existing_plan(self):
+        self._start()
+        proposal_hash = None
+        tried_again = False
+
+        def decide(*, work_item, observations, engineering_context, **kwargs):
+            nonlocal proposal_hash, tried_again
+            if work_item.id == "engineering_plan":
+                proposal_hash = engineering_context["suggested_delivery_plan"]["content_hash"]
+                return self._implement(work_item=work_item, observations=observations)
+            if not tried_again:
+                tried_again = True
+                return turn(
+                    "update_delivery_plan", suggested_plan_hash=proposal_hash, reason="Reset"
+                )
+            self.assertTrue(
+                any(not row.ok and "初始建议仅可用于空计划" in row.summary for row in observations)
+            )
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(len(self._checkpoint()["delivery_plan_history"]), 1)
+        self.assertEqual(self._checkpoint()["work_items"][0]["id"], "visual")
+
     def test_thinking_response_survives_provider_interruption_in_checkpoint(self):
         self._start()
         calls = 0
@@ -117,7 +277,14 @@ class EngineeringLoopTests(EngineeringClaimTests):
                     return result
                 self.assertEqual(names, {"update_delivery_plan", "report_blocked"})
                 self.assertEqual(engineering_context["planning_turns_remaining"], 0)
-                self.assertEqual(len(engineering_context["observed_files"]), reads)
+                self.assertEqual(
+                    {
+                        path
+                        for path in engineering_context["observed_files"]
+                        if path.startswith("context_")
+                    },
+                    {f"context_{index}.txt" for index in range(reads)},
+                )
                 constrained = True
             return self._implement(work_item=work_item, observations=observations)
 
@@ -243,7 +410,9 @@ class EngineeringLoopTests(EngineeringClaimTests):
         batch = ChatWithToolsResult(
             tool_calls=[
                 ToolCall(
-                    id=str(i), name="write_file", arguments={"path": f"{i}.py", "content": "x"}
+                    id=str(i),
+                    name="write_files",
+                    arguments={"writes": [{"path": f"{i}.py", "content": "x"}]},
                 )
                 for i in range(2)
             ]
@@ -320,7 +489,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
                 )
             self.assertEqual(
                 engineering_context["working_memory"]["inspection_steps"],
-                32 if not any(o.name == "write_file" for o in observations) else 0,
+                32 if not any(o.name == "write_files" and o.ok for o in observations) else 0,
             )
             return self._implement(work_item=work_item, observations=observations)
 
@@ -516,13 +685,21 @@ class EngineeringLoopTests(EngineeringClaimTests):
             "frontend/src/visual.ts" if work_item.id == "visual" else f"generated/{work_item.id}.py"
         )
         if not any(
-            o.ok and o.name == "write_file" and o.arguments.get("path") == path
+            o.ok
+            and o.name == "write_files"
+            and any(write["path"] == path for write in o.arguments["writes"])
             for o in observations
         ):
             return turn(
-                "write_file",
-                path=path,
-                content="export const VALUE = 1\n" if work_item.id == "visual" else "VALUE = 1\n",
+                "write_files",
+                writes=[
+                    {
+                        "path": path,
+                        "content": "export const VALUE = 1\n"
+                        if work_item.id == "visual"
+                        else "VALUE = 1\n",
+                    }
+                ],
             )
         return turn("complete_work_item", work_item_id=work_item.id, summary="Implemented feature")
 
@@ -619,7 +796,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self._start()
         self.model.side_effect = None
         self.model.return_value = turn(
-            "write_file", path="generated/premature.py", content="BAD = True"
+            "write_files", writes=[{"path": "generated/premature.py", "content": "BAD = True"}]
         )
         self.assertEqual(self._run()["outcome"], "blocked")
         self.assertFalse((self.root / "generated/premature.py").exists())
@@ -745,15 +922,16 @@ class EngineeringLoopTests(EngineeringClaimTests):
                     any(not o.ok and "invalid feature" in o.summary for o in observations)
                 )
                 evidence = next(
-                    o for o in reversed(observations) if o.name == "write_file" and o.ok
+                    o for o in reversed(observations) if o.name == "write_files" and o.ok
                 )
+                written = evidence.data["files"][0]
                 repaired = True
                 return turn(
                     "edit_file_by_replace",
-                    path=evidence.arguments["path"],
+                    path=written["path"],
                     old_text="VALUE = 1",
                     new_text="VALUE = 2",
-                    expected_hash=evidence.data["content_hash"],
+                    expected_hash=written["content_hash"],
                 )
             return self._implement(work_item=work_item, observations=observations)
 
@@ -815,16 +993,23 @@ class EngineeringLoopTests(EngineeringClaimTests):
     def test_pause_during_model_call_discards_late_write(self):
         self._start()
 
-        def paused(**kwargs):
+        def paused(*, work_item, observations, tools, **kwargs):
+            if work_item.id == "engineering_plan":
+                return self._implement(work_item=work_item, observations=observations)
+            self.assertIn("write_files", {tool.name for tool in tools})
             with self.session_factory() as db:
                 row = db.get(TaskExecution, self.execution.execution_id)
                 row.status = "failed"
                 row.active_slot = None
                 db.commit()
-            return turn("write_file", path="generated/late.py", content="LATE = True\n")
+            return turn(
+                "write_files", writes=[{"path": "generated/late.py", "content": "LATE = True\n"}]
+            )
 
         self.model.side_effect = paused
         self.assertEqual(self._run()["outcome"], "paused")
+        self.assertEqual(self.model.call_count, 2)
+        self.assertFalse(self._checkpoint()["needs_delivery_plan"])
         self.assertFalse((self.root / "generated/late.py").exists())
 
     def test_pause_after_tool_staging_discards_prepared_output(self):
@@ -864,13 +1049,22 @@ class EngineeringLoopTests(EngineeringClaimTests):
         def decide(*, work_item, observations, **kwargs):
             if work_item.id == "engineering_plan":
                 return self._implement(work_item=work_item, observations=observations)
-            return turn("write_file", path="frontend/e2e/escape.ts", content="skip()")
+            return turn(
+                "write_files", writes=[{"path": "frontend/e2e/escape.ts", "content": "skip()"}]
+            )
 
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "blocked")
         self.assertFalse(self._checkpoint()["needs_delivery_plan"])
         self.assertFalse((self.root / "frontend/e2e/escape.ts").exists())
         self.assertEqual(self._checkpoint()["blocked_reason_code"], "REPEATED_TOOL_FAILURE")
+        rejected_writes = [
+            row for row in self._checkpoint()["observations"] if row["name"] == "write_files"
+        ]
+        self.assertTrue(rejected_writes)
+        for row in rejected_writes:
+            self.assertFalse(row["ok"])
+            self.assertIn("不能修改冻结验收资产", row["summary"])
 
     def test_completion_cannot_select_another_work_item(self):
         self._start()
@@ -919,9 +1113,8 @@ class EngineeringLoopTests(EngineeringClaimTests):
         with patch(
             "app.agents.code_engineer.chat_with_tools",
             return_value=turn(
-                "write_file",
-                path="bad.py",
-                content="bad",
+                "write_files",
+                writes=[{"path": "bad.py", "content": "bad"}],
             ),
         ):
             with self.assertRaisesRegex(BusinessException, "无权"):
@@ -1059,3 +1252,81 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.model.reset_mock()
         self.assertEqual(self._run()["outcome"], "blocked")
         self.model.assert_not_called()
+
+    def test_alternating_plan_failures_reach_model_as_history_then_allow_implementation(self):
+        self._start()
+        frozen = read_frozen_input_snapshot(self.execution)
+        planning_turns = 0
+        remaining_budgets = []
+        diagnosed = False
+
+        def decide(*, work_item, observations, engineering_context, **kwargs):
+            nonlocal planning_turns, diagnosed
+            if work_item.id != "engineering_plan":
+                self.assertIsNone(engineering_context["planning_repair"])
+                return self._implement(work_item=work_item, observations=observations)
+            call = self._implement(work_item=work_item, observations=observations)
+            planning_turns += 1
+            remaining_budgets.append(engineering_context["remaining_model_turns"])
+            self.assertEqual(engineering_context["modified_files"], [])
+            items = call.tool_calls[0].arguments["items"]
+            if planning_turns in {1, 3}:
+                # The shared visual node still links this requirement, but a foundation
+                # cannot replace the user-visible feature that must cover it.
+                items[1]["kind"] = "foundation"
+                items[1]["rationale"] = f"Foundation proposal {planning_turns}"
+                return call
+            if planning_turns == 2:
+                self.assertEqual(engineering_context["planning_repair"]["mode"], "repair")
+                items[0]["kind"] = "foundation"
+                return call
+
+            repair = engineering_context["planning_repair"]
+            self.assertEqual(repair["mode"], "review_constraints")
+            self.assertEqual(len(repair["recent_attempts"]), 3)
+            self.assertEqual(repair["omitted_attempts"], 0)
+            self.assertEqual(
+                [attempt["model_turn"] for attempt in repair["recent_attempts"]], [1, 2, 3]
+            )
+            missing = {
+                "code": "MISSING_FEATURE_COVERAGE",
+                "requirement_id": items[1]["requirement_ids"][0],
+                "occurrences": 2,
+            }
+            self.assertIn(missing, repair["repeated_issues"])
+            self.assertIn(missing, repair["regressed_issues"])
+            self.assertIn(
+                "MISSING_VISUAL_FOUNDATION",
+                {problem["code"] for problem in repair["recent_attempts"][1]["problems"]},
+            )
+            self.assertEqual(engineering_context["no_progress_steps"], 3)
+            diagnosed = True
+            return call
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertTrue(diagnosed)
+        self.assertEqual(planning_turns, 4)
+        self.assertEqual(
+            remaining_budgets,
+            [frozen["call_budget"]["max_model_turns"] - turn for turn in range(1, 5)],
+        )
+        state = self._checkpoint()
+        self.assertEqual(state["model_turns"], 10)
+        self.assertEqual(state["diagnostic_state"]["plan"]["status"], "resolved")
+        self.assertEqual(len(state["modified_files"]), 3)
+        self.assertTrue(all(item["status"] == "completed" for item in state["work_items"]))
+        self.assertEqual(
+            [call.kwargs["check_id"] for call in self.checks.call_args_list],
+            ["quick", "all", "all"],
+        )
+        with self.session_factory() as db:
+            saved = read_frozen_input_snapshot(db.get(TaskExecution, self.execution.execution_id))
+            for key in (
+                "approved_item_id",
+                "approved_spec_digest",
+                "template_version",
+                "system_design",
+                "call_budget",
+            ):
+                self.assertEqual(saved[key], frozen[key], key)

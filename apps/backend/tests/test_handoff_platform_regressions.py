@@ -178,20 +178,48 @@ def expected_conflict():
     def test_manifest_and_compile_fail_before_database_setup(self):
         with (
             patch.object(sandbox_check, "load_smoke_manifest", side_effect=ValueError("bad")),
+            patch.object(sandbox_check, "quick") as quick,
             patch.object(sandbox_check, "database") as database,
         ):
             with self.assertRaisesRegex(ValueError, "bad"):
                 sandbox_check.runtime_smoke()
+            quick.assert_not_called()
             database.assert_not_called()
-        with (
-            patch.object(sandbox_check, "load_smoke_manifest", return_value={}),
-            patch.object(sandbox_check, "validate_visual_contract"),
-            patch.object(sandbox_check, "frontend", side_effect=ValueError("missing export")),
-            patch.object(sandbox_check, "database") as database,
-        ):
-            with self.assertRaisesRegex(ValueError, "missing export"):
-                sandbox_check.runtime_smoke()
-            database.assert_not_called()
+        for failing_stage in ("python_compile", "typescript", "frontend_build"):
+            with (
+                self.subTest(stage=failing_stage),
+                patch.object(sandbox_check, "load_smoke_manifest", return_value={}),
+                patch.object(sandbox_check, "validate_visual_contract"),
+                patch.object(sandbox_check, "command") as compile_command,
+                patch.object(sandbox_check, "ensure_frontend_dependencies") as dependencies,
+                patch.object(sandbox_check, "typescript") as typescript,
+                patch.object(sandbox_check, "frontend") as frontend,
+                patch.object(sandbox_check, "database") as database,
+            ):
+                stages = {
+                    "python_compile": compile_command,
+                    "typescript": typescript,
+                    "frontend_build": frontend,
+                }
+                stages[failing_stage].side_effect = ValueError(f"failed {failing_stage}")
+                # Exercise the real quick gate without spawning container commands on the host.
+                with self.assertRaisesRegex(ValueError, f"failed {failing_stage}"):
+                    sandbox_check.runtime_smoke()
+                compile_command.assert_called_once_with(
+                    ["python", "-m", "compileall", "-q", "app", "alembic"],
+                    sandbox_check.ROOT / "backend",
+                )
+                if failing_stage == "python_compile":
+                    dependencies.assert_not_called()
+                    typescript.assert_not_called()
+                else:
+                    dependencies.assert_called_once_with()
+                    typescript.assert_called_once_with()
+                if failing_stage == "frontend_build":
+                    frontend.assert_called_once_with(skip_dependencies=True, skip_types=True)
+                else:
+                    frontend.assert_not_called()
+                database.assert_not_called()
 
     def test_edits_and_unrelated_checks_cannot_reset_unresolved_check_clock(self):
         checkpoint = new_checkpoint()

@@ -56,6 +56,8 @@ def prepare_action(call: ToolCall, root: Path, observed_hashes: dict[str, str]) 
         call = validate_tool_call(call)
         if call.name not in MUTATING_TOOLS:
             return PreparedAction(execute_tool_call(call, workspace_root=root))
+        if call.name == "install_capability":
+            raise ConflictException("能力安装必须通过冻结输入授权的专用暂存入口")
         if call.name == "generate_api_client":
             from app.tools.api_client import prepare_client
 

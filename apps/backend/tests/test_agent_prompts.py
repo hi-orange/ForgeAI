@@ -1,7 +1,9 @@
 """Prompt contracts keep imported reference ideas inside ForgeAI boundaries."""
 
+import re
 import unittest
 
+from app.agents.code_engineer import CODE_ENGINEER_TOOLS
 from app.agents.prompts.architect import (
     ARCHITECT_PROMPT_VERSION,
     ARCHITECT_SYSTEM_PROMPT,
@@ -28,14 +30,33 @@ from app.agents.prompts.product_manager import (
 
 class AgentPromptContractTests(unittest.TestCase):
     def test_engineer_prompt_matches_the_active_tool_loop(self):
+        prompt_identifiers = set(re.findall(r"[A-Za-z][A-Za-z0-9_]*", CODE_ENGINEER_SYSTEM_PROMPT))
+        exposed_tools = {tool.name for tool in CODE_ENGINEER_TOOLS}
+        for tool_name in (
+            "read_file",
+            "write_files",
+            "edit_file_by_replace",
+            "update_delivery_plan",
+            "run_check",
+            "complete_work_item",
+        ):
+            with self.subTest(tool=tool_name):
+                self.assertIn(tool_name, exposed_tools)
+                self.assertIn(tool_name, prompt_identifiers)
+        for retired_tool in ("write_file", "retrieve_code_context", "write_new_code"):
+            with self.subTest(retired_tool=retired_tool):
+                self.assertNotIn(retired_tool, exposed_tools)
+                self.assertNotIn(retired_tool, prompt_identifiers)
         self.assertIn("观察已有状态", CODE_ENGINEER_SYSTEM_PROMPT)
-        self.assertIn("write_file", CODE_ENGINEER_SYSTEM_PROMPT)
-        self.assertIn("edit_file_by_replace", CODE_ENGINEER_SYSTEM_PROMPT)
-        self.assertIn("complete_work_item", CODE_ENGINEER_SYSTEM_PROMPT)
-        self.assertIn("平台执行 quick", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("平台按真实源码变更选择检查", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("基础契约 quick", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("仅样式或图片变化 frontend", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn("业务、高风险或未知变更 all", CODE_ENGINEER_SYSTEM_PROMPT)
+        self.assertIn(
+            "声明 provides_requirement_ids、QA 修复和最后一项必须 all", CODE_ENGINEER_SYSTEM_PROMPT
+        )
+        self.assertIn("局部检查不能消除独立 QA 缺陷或作为最终交付证据", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("冻结验收资产", CODE_ENGINEER_SYSTEM_PROMPT)
-        self.assertNotIn("retrieve_code_context", CODE_ENGINEER_SYSTEM_PROMPT)
-        self.assertNotIn("write_new_code", CODE_ENGINEER_SYSTEM_PROMPT)
 
     def test_product_manager_research_is_optional_and_approval_safe(self):
         self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v16"))
@@ -61,7 +82,7 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertNotIn("模式 2", APP_SPEC_SYSTEM_PROMPT)
 
     def test_architect_produces_implementation_ready_cross_layer_contracts(self):
-        self.assertTrue(ARCHITECT_PROMPT_VERSION.endswith("_v8"))
+        self.assertTrue(ARCHITECT_PROMPT_VERSION.endswith("_v9"))
         self.assertIn("implementation_dependencies", ARCHITECT_SYSTEM_PROMPT)
         self.assertIn("update_delivery_plan", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("批准功能 → 模块 → 接口 → 数据结构", ARCHITECT_SYSTEM_PROMPT)

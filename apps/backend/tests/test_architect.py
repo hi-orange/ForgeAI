@@ -76,6 +76,7 @@ def valid_design() -> dict:
         ],
         "constraints": ["所有查询按当前用户过滤。"],
         "implementation_dependencies": [],
+        "optional_capabilities": [],
     }
 
 

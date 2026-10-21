@@ -63,6 +63,16 @@ class ImplementationDependency(BaseModel):
     reason: DesignText
 
 
+class OptionalCapability(BaseModel):
+    """An explicit implementation choice linked to approved product behavior."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    capability_id: Literal["auth-session-v1"]
+    requirement_ids: list[RequirementId] = Field(min_length=1, max_length=50)
+    rationale: DesignText
+
+
 class SystemDesign(BaseModel):
     """A concise but implementation-ready design derived from one approved app_spec."""
 
@@ -78,9 +88,18 @@ class SystemDesign(BaseModel):
     implementation_dependencies: list[ImplementationDependency] = Field(
         default_factory=list, max_length=100
     )
+    optional_capabilities: list[OptionalCapability] = Field(default_factory=list, max_length=10)
 
     def validate_requirement_dependencies(self, spec: AppSpec) -> None:
         ids = {item.id for item in spec.features}
+        selected: set[str] = set()
+        for capability in self.optional_capabilities:
+            if capability.capability_id in selected:
+                raise ValueError("可选能力不能重复选择")
+            selected.add(capability.capability_id)
+            linked = capability.requirement_ids
+            if len(linked) != len(set(linked)) or not set(linked) <= ids:
+                raise ValueError("可选能力必须关联不同且存在的获批功能 id")
         edges: dict[str, set[str]] = {key: set() for key in ids}
         for dependency in self.implementation_dependencies:
             before = dependency.prerequisite_requirement_id

@@ -90,6 +90,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
                 "search_code",
                 "write_files",
                 "generate_api_client",
+                "install_capability",
                 "edit_file_by_replace",
                 "generate_image",
                 "install_project_dependency",

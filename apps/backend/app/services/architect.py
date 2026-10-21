@@ -180,6 +180,8 @@ def complete_architect_task(
     # Keep canonical identities stable for designs predating dependency contracts.
     if not design.implementation_dependencies:
         payload.pop("implementation_dependencies", None)
+    if not design.optional_capabilities:
+        payload.pop("optional_capabilities", None)
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     result_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     try:

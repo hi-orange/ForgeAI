@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -119,6 +121,22 @@ def restore_workspace_revision(root: Path, *, revision_id: str) -> list[str]:
     return restored
 
 
+def _listed_candidates(start: Path, root: Path) -> Iterator[Path]:
+    for directory, folders, names in os.walk(start, followlinks=False):
+        # Prune before descending; installed dependencies can contain millions of files.
+        folders[:] = sorted(
+            folder
+            for folder in folders
+            if folder not in SKIP_DIRS
+            and not (Path(directory) == root and folder == "forgeai")
+            and not (Path(directory) / folder).is_symlink()
+        )
+        for name in sorted(names):
+            candidate = Path(directory) / name
+            if not candidate.is_symlink():
+                yield candidate
+
+
 def list_files(
     root: Path, *, path: str = ".", tool_call_id: str = "call_list"
 ) -> ToolExecutionResult:
@@ -136,7 +154,7 @@ def list_files(
         )
     files: list[dict[str, object]] = []
     truncated = False
-    for candidate in sorted(start.rglob("*")):
+    for candidate in _listed_candidates(start, base):
         try:
             is_file = candidate.is_file()
         except OSError:
@@ -165,7 +183,7 @@ def list_files(
         name="list_files",
         ok=True,
         summary=f"列出 {len(files)} 个文件",
-        data={"files": files, "truncated": truncated},
+        data={"files": sorted(files, key=lambda entry: str(entry["path"])), "truncated": truncated},
         truncated=truncated,
     )
 

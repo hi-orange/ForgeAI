@@ -152,6 +152,15 @@ private business operations). Code Engineer submits an `update_delivery_plan` gr
 source and those contracts before source mutation. Requirements and tasks have a many-to-many mapping:
 shared foundations and multiple implementation slices must not introduce new product scope.
 
+For an empty initial plan, the platform offers a complete, validated proposal derived from frozen
+feature ids, linked acceptance and explicit architecture dependencies. It contains a reusable visual
+foundation and one feature node per approved capability; it does not infer authentication from words
+or invent product scope. Cross-feature acceptance is assigned only when its linked prerequisites are
+available. The engineer explicitly adopts the displayed proposal by its content hash or submits a
+custom graph. Adoption uses the same validation, fencing, history and budgets; it is not automatic
+completion or product approval. An existing plan and independent QA repair cannot be replaced through
+this shortcut. Changed proposals require a fresh matching hash.
+
 The runtime validates exact approved feature coverage, unique task ids, existing dependency targets,
 acyclicity and frozen architecture dependencies. A visual foundation establishes or verifies reuse of
 shared design tokens before feature work; it does not force a redesign of existing applications.
@@ -288,6 +297,14 @@ gates.
   co-located prerequisite/dependent requirements still require explicit task separation under the
   current graph contract. The checkpoint retains distinct raw failures and source-bound correction
   attempts, while model context carries the latest plan/check exchanges and unresolved diagnostics.
+  Plan correction also carries a bounded structural summary of recent failed submissions since the
+  last accepted plan. Repeated conflicts are matched by rule and affected requirement or dependency,
+  independently of cosmetic plan changes; returning conflicts flag possible regressions, not proof
+  that an earlier plan had satisfied a check omitted by a prior validation failure. This evidence
+  prompts comparison of the combined constraints before another submission. The latest full graph
+  remains available, historical summaries are explicitly partial, and a valid plan clears the current
+  repair context without deleting audit evidence. This guidance grants neither extra attempts nor
+  permission to relax coverage, frozen dependencies or completed-node protection.
   Work-item memory retains actual changed paths, bounded source excerpts and recent actions beyond
   the rolling tool history. Source evidence is keyed by path, source hash and read range: complementary
   ranges coexist, identical range reads are deduplicated, and a new source version replaces all old
@@ -309,6 +326,42 @@ gates.
 - An open BuildRun can await explicit recovery. User-facing status exposes the current job and retry
   schedule so queued recovery keeps polling while a stopped execution shows its cause and controls.
   Received model usage is metered before tool parsing, including malformed responses and Leader routing.
+
+## Startup context, optional capabilities and progress presentation
+
+Engineering receives a bounded startup pack read from the current isolated workspace's known entry
+points, configuration and contracts. Every excerpt carries its actual file hash and line range;
+oversize, absent and changed files remain explicit. The pack is reused only while the bytes match,
+and a later partial read cannot erase complementary startup evidence. It consumes no model/tool
+turns, proves no implementation progress and grants no new write permission. Existing source edits
+still require the supplied observed hash and the fenced original-byte check. Dependency and runtime
+directories are pruned before indexing; startup does not traverse installed packages.
+
+Platform capability availability is distinct from product scope and installation. Architect may
+select a versioned capability only for explicitly linked approved features; the semantic fit remains
+an architecture responsibility. Empty or legacy selections enable nothing. Engineering freezes the
+selected bundle's source digest with the design. Installation is offered only for selected bundles
+and stages source through the existing execution fence, optimistic checks and recoverable revisions.
+A changed bundle, existing target, customized entry point or migration chain cannot be overwritten.
+The first bundle, `auth-session-v1`, supplies local password verification, expiring/revocable bearer
+sessions, current identity, migration and in-memory React auth state. It supplies no default account,
+public registration or business ownership policy. Approved provisioning, UI and record-level access
+must still be implemented and checked; capability installation never completes a work item.
+
+The conversation groups routine reads/writes into compact descriptions with expandable evidence.
+Failure, actual repair and verification remain distinct so later success cannot hide the reason for
+a retry. Internal decision calls do not become extra user-visible steps. The source browser exposes
+read-only REQUIREMENTS, ARCHITECTURE and PROGRESS documents from the current run's persisted artifacts
+and exact execution lineage, including before generated source is available. PROGRESS reflects only
+accepted work and recorded checks, distinguishing engineering completion from independent acceptance.
+Key execution changes refresh these documents without replacing the user's selected file. Document
+projections do not modify generated source, source hashes or approved intent.
+
+Plan correction summaries live in their own bounded, ordered checkpoint history, independent of
+rolling tool observations. Extra reads cannot erase unresolved plan attempts. A successful plan
+starts a new summary epoch while audit history remains durable. Legacy missing history is labelled
+partial rather than reconstructed from deduplicated diagnostics. This mechanism changes no budgets,
+completion state or stop-loss boundaries.
 
 ## Evaluation and release evidence
 

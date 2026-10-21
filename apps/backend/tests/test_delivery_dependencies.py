@@ -13,6 +13,7 @@ from app.generation.delivery import (
     PlannedWorkItem,
     WorkItem,
     replace_delivery_plan,
+    suggested_delivery_plan,
     validate_delivery_plan,
 )
 from app.generation.engineering.checkpoint import current_item
@@ -79,7 +80,99 @@ def dependency_design():
     return SystemDesign.model_validate(payload)
 
 
+def visual_prerequisite_plan():
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/visual_prerequisite_plan.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return (
+        AppSpec.model_validate(fixture["spec"]),
+        SystemDesign.model_validate(
+            {**valid_design(), "implementation_dependencies": fixture["dependencies"]}
+        ),
+        [PlannedWorkItem.model_validate(i) for i in fixture["original"]],
+    )
+
+
 class DeliveryDependencyTests(unittest.TestCase):
+    def test_suggested_plan_uses_explicit_edges_and_keeps_cross_feature_acceptance_late(self):
+        spec, design = dependency_spec(), dependency_design()
+        proposal = suggested_delivery_plan(spec, design)
+        rows = replace_delivery_plan(
+            spec, [PlannedWorkItem.model_validate(row) for row in proposal["items"]], [], design
+        )
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual(by_id["login"]["acceptance"], ["Sign in"])
+        self.assertEqual(by_id["dashboard"]["acceptance"], ["Only see own projects"])
+        order = []
+        while item := current_item(rows):
+            order.append(item["id"])
+            item["status"] = "completed"
+        self.assertEqual(order, ["visual_foundation", "login", "dashboard"])
+        self.assertEqual(suggested_delivery_plan(spec, design), proposal)
+        self.assertNotEqual(suggested_delivery_plan(spec)["content_hash"], proposal["content_hash"])
+
+    def test_suggested_plan_does_not_infer_auth_and_avoids_reserved_id_collisions(self):
+        spec = dependency_spec().model_copy(
+            update={
+                "features": [
+                    dependency_spec()
+                    .features[0]
+                    .model_copy(
+                        update={"id": "visual_foundation", "text": "A public login guide page"}
+                    )
+                ],
+                "acceptance_criteria": [],
+            }
+        )
+        items = suggested_delivery_plan(spec)["items"]
+        self.assertEqual(len(items), 2)
+        self.assertEqual({row["id"] for row in items}, {"visual_foundation", "visual_foundation_1"})
+        self.assertTrue(all(row["requirement_ids"] == ["visual_foundation"] for row in items))
+
+    def test_plan_tool_accepts_exactly_one_plan_source(self):
+        digest = suggested_delivery_plan(dependency_spec())["content_hash"]
+        valid = validate_tool_call(
+            ToolCall(
+                id="adopt",
+                name="update_delivery_plan",
+                arguments={"suggested_plan_hash": digest, "reason": "Matches approved scope"},
+            )
+        )
+        self.assertIsNone(valid.arguments["items"])
+        for arguments in (
+            {"reason": "missing plan"},
+            {"reason": "bad hash", "suggested_plan_hash": "made up"},
+            {
+                "reason": "ambiguous",
+                "suggested_plan_hash": digest,
+                "items": [row.model_dump() for row in dependency_items()],
+            },
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                validate_tool_call(
+                    ToolCall(id="bad", name="update_delivery_plan", arguments=arguments)
+                )
+
+    def test_suggestion_handles_maximum_features_and_long_requirement_ids(self):
+        payload = dependency_spec().model_dump()
+        payload["features"] = [
+            {"id": f"f{index:02d}" + "x" * 61, "text": f"Approved feature {index}"}
+            for index in range(50)
+        ]
+        payload["acceptance_criteria"] = [
+            {"id": f"ac_{index}", "text": f"Feature {index} works", "source_ids": [feature["id"]]}
+            for index, feature in enumerate(payload["features"])
+        ]
+        spec = AppSpec.model_validate(payload)
+        proposed = suggested_delivery_plan(spec)
+        self.assertEqual(len(proposed["items"]), 51)
+        self.assertEqual(
+            {row["id"] for row in proposed["items"] if row["kind"] == "feature"},
+            {feature.id for feature in spec.features},
+        )
+
     def test_prd_and_plan_order_do_not_override_dependencies(self):
         rows = replace_delivery_plan(dependency_spec(), dependency_items(), [], dependency_design())
         order = []
@@ -133,16 +226,7 @@ class DeliveryDependencyTests(unittest.TestCase):
             replace_delivery_plan(dependency_spec(), items, [], dependency_design())
 
     def test_real_visual_prerequisite_plan_has_an_explicit_repair_path(self):
-        fixture = json.loads(
-            (Path(__file__).parent / "fixtures/visual_prerequisite_plan.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        spec = AppSpec.model_validate(fixture["spec"])
-        design = SystemDesign.model_validate(
-            {**valid_design(), "implementation_dependencies": fixture["dependencies"]}
-        )
-        items = [PlannedWorkItem.model_validate(i) for i in fixture["original"]]
+        spec, design, items = visual_prerequisite_plan()
         with self.assertRaises(DeliveryPlanError) as raised:
             replace_delivery_plan(spec, items, [], design)
         issues = raised.exception.diagnostic.issues
@@ -163,6 +247,83 @@ class DeliveryDependencyTests(unittest.TestCase):
         next(i for i in items if i.id == "jobs_public_api").depends_on = [visual.id]
         with self.assertRaises(DeliveryPlanError):
             replace_delivery_plan(spec, items, [], design)
+
+    def test_visual_coverage_repair_preserves_both_foundation_and_feature_constraints(self):
+        spec, design, items = visual_prerequisite_plan()
+        visual = next(item for item in items if item.kind == "visual_foundation")
+        visual.provides_requirement_ids = ["feat_visual"]
+        for item in items:
+            if item.kind == "feature":
+                item.requirement_ids = [r for r in item.requirement_ids if r != "feat_visual"]
+
+        # Declaring a real prerequisite still leaves the user-visible feature uncovered.
+        with self.assertRaises(DeliveryPlanError) as raised:
+            replace_delivery_plan(spec, items, [], design)
+        issue = next(
+            i for i in raised.exception.diagnostic.issues if i["code"] == "MISSING_FEATURE_COVERAGE"
+        )
+        self.assertEqual(issue["missing_requirement_ids"], ["feat_visual"])
+        self.assertEqual(
+            issue["linked_non_feature_items"],
+            [
+                {
+                    "work_item_id": visual.id,
+                    "kind": "visual_foundation",
+                    "requirement_ids": ["feat_visual"],
+                    "provides_requirement_ids": ["feat_visual"],
+                }
+            ],
+        )
+        self.assertIn("不计入功能覆盖", issue["expected"])
+        self.assertIn("保留", issue["suggested_action"])
+
+        # Retagging the same node repairs coverage but breaks the visual prerequisite gate.
+        visual.kind = "feature"
+        with self.assertRaises(DeliveryPlanError) as raised:
+            replace_delivery_plan(spec, items, [], design)
+        issue = next(
+            i
+            for i in raised.exception.diagnostic.issues
+            if i["code"] == "MISSING_VISUAL_FOUNDATION"
+        )
+        self.assertIn(visual.id, issue["feature_work_item_ids"])
+        self.assertIn("同时保留 feature", issue["suggested_action"])
+
+        # A distinct runnable UI slice can cover the requirement while reusing the foundation.
+        visual.kind = "visual_foundation"
+        items.append(
+            PlannedWorkItem(
+                id="visual_experience",
+                title="职位列表的视觉体验与移动端验证",
+                requirement_ids=["feat_visual"],
+                depends_on=["web_shell_jobs"],
+                acceptance=["职位卡片采用统一主题与字号层级，移动端能够正常浏览"],
+                deliverables=["职位列表样式接入与浏览器验证"],
+            )
+        )
+        rows = replace_delivery_plan(spec, items, [], design)
+        self.assertEqual(current_item(rows)["id"], visual.id)
+        self.assertTrue(all(row["status"] == "pending" for row in rows))
+        self.assertEqual(rows[-1]["requirement_ids"], ["feat_visual"])
+
+    def test_coverage_diagnostic_identifies_nonvisual_foundations_without_granting_coverage(self):
+        items = dependency_items()
+        auth = items[1]
+        auth.kind = "foundation"
+        auth.provides_requirement_ids = ["login"]
+        auth.acceptance = ["Identity and session contract is callable"]
+        auth.deliverables = ["User model and session API"]
+        with self.assertRaises(DeliveryPlanError) as raised:
+            replace_delivery_plan(dependency_spec(), items, [], dependency_design())
+        issue = next(
+            i for i in raised.exception.diagnostic.issues if i["code"] == "MISSING_FEATURE_COVERAGE"
+        )
+        linked = {item["work_item_id"]: item for item in issue["linked_non_feature_items"]}
+        self.assertEqual(issue["missing_requirement_ids"], ["login"])
+        self.assertEqual(linked["auth"]["kind"], "foundation")
+        self.assertEqual(linked["auth"]["provides_requirement_ids"], ["login"])
+        self.assertEqual(linked["theme"]["kind"], "visual_foundation")
+        self.assertEqual(linked["theme"]["provides_requirement_ids"], [])
 
     def test_provisions_require_linked_scope_and_verifiable_deliverables(self):
         for mutation in ("unlinked", "unknown", "no_acceptance", "no_deliverables"):

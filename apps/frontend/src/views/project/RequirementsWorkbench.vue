@@ -73,6 +73,7 @@
             v-if="status?.activities?.length"
             :activities="status.activities"
             :running="timelineRunning"
+            :paused="status.state === 'stopped'"
             :failed="
               (status.state === 'retry_available' || status.state === 'quality_failed') &&
               !automaticRecovery &&
@@ -308,7 +309,8 @@
       <WorkspaceEditorPane
         v-if="workspaceView === 'editor'"
         :project-id="projectId"
-        :ready="sourceReady"
+        :ready="Boolean(status?.run_id)"
+        :download-ready="sourceReady"
         :run-id="status?.run_id"
         :generation="workspaceGeneration"
         :written-path="latestWrittenPath"
@@ -396,7 +398,12 @@ import ForgeLogo from '@/components/ForgeLogo.vue'
 import * as deploymentApi from '@/api/modules/deployments'
 import type { Deployment } from '@/api/modules/deployments'
 import type { WorkspaceView } from './projectView'
-import { isNearThreadBottom, isWriteActivity } from './buildTimeline'
+import {
+  isNearThreadBottom,
+  isWriteActivity,
+  timelineSteps,
+  workspaceActivityVersion,
+} from './buildTimeline'
 import AppPreviewPane from './components/AppPreviewPane.vue'
 import BuildTimeline from './components/BuildTimeline.vue'
 import QualityEvidence from './components/QualityEvidence.vue'
@@ -534,8 +541,23 @@ const timelineRunning = computed(
 const successfulWrites = computed(
   () => status.value?.activities?.filter((step) => isWriteActivity(step.name) && step.ok) ?? [],
 )
-const workspaceGeneration = computed(() => successfulWrites.value.length)
-const latestWrittenPath = computed(() => successfulWrites.value.at(-1)?.detail || null)
+const workspaceGeneration = computed(() =>
+  [
+    successfulWrites.value.length,
+    status.value?.state,
+    status.value?.task_id,
+    status.value?.result?.configuration_item_id,
+    status.value?.preview_revision,
+    workspaceActivityVersion(status.value?.activities ?? []),
+    status.value?.error,
+  ].join(':'),
+)
+const latestWrittenPath = computed(
+  () =>
+    timelineSteps(successfulWrites.value)
+      .reverse()
+      .find((step) => step.path)?.path || null,
+)
 const sourceReady = computed(() =>
   Boolean(status.value?.preview_revision || status.value?.code_item_id),
 )

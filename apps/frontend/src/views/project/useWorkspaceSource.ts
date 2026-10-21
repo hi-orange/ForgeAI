@@ -6,7 +6,7 @@ export type WorkspaceSourceInput = {
   projectId: number
   ready: boolean
   runId?: string | null
-  generation?: number
+  generation?: number | string
   writtenPath?: string | null
   requestedPath?: string | null
   requestSequence?: number
@@ -19,6 +19,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
   const fileContent = ref<string | null>(null)
   const fileKind = ref<workspaceApi.WorkspaceFileKind>('text')
   const fileMediaType = ref<string | null>(null)
+  const fileTruncated = ref(false)
   const loading = ref(false)
   const error = ref('')
   const fileLoading = ref(false)
@@ -36,16 +37,21 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
       fileContent.value = null
       fileKind.value = 'text'
       fileMediaType.value = null
+      fileTruncated.value = false
     }
     selectedPath.value = path
     fileLoading.value = fileContent.value === null
     fileError.value = ''
     try {
-      const file = await workspaceApi.getWorkspaceFile(input.projectId, path)
+      const file = await workspaceApi.getWorkspaceFile(input.projectId, path, runId)
       if (request !== fileRequest || runId !== input.runId) return
+      if (runId && file.run_id !== undefined && file.run_id !== runId) {
+        throw new Error('构建已切换，请刷新文件列表')
+      }
       fileContent.value = file.content
-      fileKind.value = file.kind === 'image' ? 'image' : 'text'
+      fileKind.value = file.kind === 'image' || file.kind === 'document' ? file.kind : 'text'
       fileMediaType.value = file.media_type ?? null
+      fileTruncated.value = Boolean(file.truncated)
     } catch (err) {
       if (request === fileRequest)
         fileError.value = err instanceof Error ? err.message : '读取文件失败'
@@ -63,6 +69,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
       fileContent.value = null
       fileKind.value = 'text'
       fileMediaType.value = null
+      fileTruncated.value = false
       following.value = true
       fileError.value = ''
       fileLoading.value = false
@@ -74,7 +81,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
     loading.value = files.value.length === 0
     error.value = ''
     try {
-      const listing = await workspaceApi.getWorkspace(input.projectId)
+      const listing = await workspaceApi.getWorkspace(input.projectId, input.runId)
       if (request !== listingRequest || (input.runId && listing.run_id !== input.runId)) return
       files.value = listing.files
       const preferred = following.value ? input.writtenPath : selectedPath.value
@@ -92,6 +99,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
         fileContent.value = null
         fileKind.value = 'text'
         fileMediaType.value = null
+        fileTruncated.value = false
         fileLoading.value = false
       }
     } catch (err) {
@@ -136,6 +144,7 @@ export function useWorkspaceSource(input: WorkspaceSourceInput) {
     fileContent,
     fileKind,
     fileMediaType,
+    fileTruncated,
     loading,
     error,
     fileLoading,

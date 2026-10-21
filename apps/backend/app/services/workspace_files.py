@@ -16,6 +16,7 @@ from app.models.workflow_event import WorkflowEvent
 from app.services import project as project_service
 from app.services.requirements import get_requirements_status
 from app.services.source_artifact import ensure_code_workspace, read_source_artifact_snapshot
+from app.services.workspace_documents import run_documents
 from app.tools.checks import source_snapshot
 
 _SKIP_DIRS = {
@@ -66,7 +67,7 @@ _MAX_TEXT_BYTES = 512 * 1024
 _MAX_IMAGE_BYTES = 2 * 1024 * 1024
 _MAX_LISTED_FILES = 400
 
-WorkspaceFileKind = Literal["text", "image"]
+WorkspaceFileKind = Literal["text", "image", "document"]
 
 
 class WorkspaceFileEntry(BaseModel):
@@ -90,6 +91,7 @@ class WorkspaceFileContent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
+    run_id: str | None = None
     kind: WorkspaceFileKind = "text"
     content: str
     media_type: str | None = None
@@ -213,37 +215,67 @@ def _visible_source_snapshot(
     return run_id, _decode_visible_snapshot(snapshot)
 
 
-def list_project_workspace(db: Session, user: User, project_id: int) -> WorkspaceListing:
+def list_project_workspace(
+    db: Session,
+    user: User,
+    project_id: int,
+    run_id: str | None = None,
+) -> WorkspaceListing:
     project_service.get_user_project(db, user, project_id)
     status = get_requirements_status(db, user, project_id)
+    if run_id is not None and status.run_id != run_id:
+        raise ConflictException("构建已切换，请刷新文件列表")
+    documents = run_documents(db, project_id, status)
     visible = _visible_source_snapshot(db, project_id=project_id, status=status)
-    if visible is None:
+    if visible is None and not documents:
         return WorkspaceListing(ready=False, run_id=status.run_id)
-    run_id, snapshot = visible
+    snapshot = visible[1] if visible else {}
     files = [
+        WorkspaceFileEntry(path=path, size_bytes=len(data), kind="document")
+        for path, data in sorted(documents.items())
+    ] + [
         WorkspaceFileEntry(path=path, size_bytes=len(data), kind=kind)
         for path, (kind, data) in sorted(snapshot.items())
     ]
     return WorkspaceListing(
         ready=True,
-        run_id=run_id,
+        run_id=status.run_id,
         files=files,
     )
 
 
 def read_project_workspace_file(
-    db: Session, user: User, project_id: int, relative_path: str
+    db: Session,
+    user: User,
+    project_id: int,
+    relative_path: str,
+    run_id: str | None = None,
 ) -> WorkspaceFileContent:
     project_service.get_user_project(db, user, project_id)
     status = get_requirements_status(db, user, project_id)
-    visible = _visible_source_snapshot(db, project_id=project_id, status=status)
-    if visible is None:
-        raise ConflictException("源码 revision 尚未生成")
-    _, snapshot = visible
+    if run_id is not None and status.run_id != run_id:
+        raise ConflictException("构建已切换，请刷新文件列表")
     normalized = relative_path.replace("\\", "/").strip()
     path = PurePosixPath(normalized)
     if path.is_absolute() or not path.parts or ".." in path.parts:
         raise ConflictException("非法文件路径")
+    if path.parts[0] == "forgeai":
+        document = run_documents(db, project_id, status).get(normalized)
+        if document is None:
+            raise NotFoundException("文档尚未生成或不存在")
+        return WorkspaceFileContent(
+            path=normalized,
+            run_id=status.run_id,
+            kind="document",
+            content=document[:_MAX_TEXT_BYTES].decode("utf-8", errors="ignore"),
+            media_type="text/markdown",
+            size_bytes=len(document),
+            truncated=len(document) > _MAX_TEXT_BYTES,
+        )
+    visible = _visible_source_snapshot(db, project_id=project_id, status=status)
+    if visible is None:
+        raise ConflictException("源码 revision 尚未生成")
+    _, snapshot = visible
     source = snapshot.get(normalized)
     if source is None:
         raise NotFoundException("文件不存在")
@@ -253,6 +285,7 @@ def read_project_workspace_file(
         payload = raw[:_MAX_IMAGE_BYTES]
         return WorkspaceFileContent(
             path=normalized,
+            run_id=status.run_id,
             kind="image",
             content=base64.b64encode(payload).decode("ascii"),
             media_type=_IMAGE_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream"),
@@ -267,6 +300,7 @@ def read_project_workspace_file(
         raise ConflictException(f"{normalized} 不是可预览的文本文件") from exc
     return WorkspaceFileContent(
         path=normalized,
+        run_id=status.run_id,
         kind="text",
         content=text,
         truncated=truncated,

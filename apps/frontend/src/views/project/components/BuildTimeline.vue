@@ -2,23 +2,43 @@
   <section class="build-timeline" aria-label="应用构建过程">
     <article v-for="(phase, phaseIndex) in phases" :key="phase.id" class="timeline-phase">
       <p class="phase-label">{{ phase.role }} · {{ phase.title }}</p>
+      <p
+        v-if="
+          !openPhases.has(phase.id) ||
+          isFailedPhase(phaseIndex) ||
+          (paused && phaseIndex === phases.length - 1)
+        "
+        class="timeline-current"
+        :class="{ failed: isFailedPhase(phaseIndex) }"
+        role="status"
+      >
+        <span aria-hidden="true">{{ phaseMark(phaseIndex) }}</span>
+        {{
+          isFailedPhase(phaseIndex)
+            ? '构建已暂停，需要处理'
+            : paused && phaseIndex === phases.length - 1
+              ? '构建已暂停，进度已保存'
+              : phase.summary
+        }}
+      </p>
       <button
         class="timeline-toggle"
         type="button"
         :aria-expanded="openPhases.has(phase.id)"
         @click="togglePhase(phase.id)"
       >
-        <span>{{ phaseMark(phaseIndex) }}</span>
-        {{ phaseState(phaseIndex) }} {{ phase.groups.length }} 步
+        <span aria-hidden="true">{{ phaseMark(phaseIndex) }}</span>
+        {{ isRunningPhase(phaseIndex) ? '正在处理' : '处理记录' }}
         <span>{{ openPhases.has(phase.id) ? '⌃' : '⌄' }}</span>
       </button>
-      <p v-if="!openPhases.has(phase.id)" class="timeline-current" role="status">
-        {{ phase.groups.at(-1)?.title || '正在准备工作区…' }}
-      </p>
-      <div v-else class="timeline-groups">
+      <div v-if="openPhases.has(phase.id)" class="timeline-groups">
         <article v-for="group in phase.groups" :key="group.id" class="build-group">
           <p class="group-summary">{{ group.title }}</p>
-          <div v-if="group.steps.length" class="tool-card">
+          <div
+            v-if="group.steps.length"
+            class="tool-card"
+            :class="{ expanded: openGroups.has(groupKey(phase.id, group.id)) }"
+          >
             <div
               v-for="step in visibleSteps(phase.id, group)"
               :key="step.operation_id || step.id"
@@ -38,7 +58,12 @@
               >
                 {{ step.path.split('/').at(-1) }}
               </button>
-              <span v-else class="tool-detail" :title="step.detail">{{ step.detail }}</span>
+              <span
+                v-else-if="openGroups.has(groupKey(phase.id, group.id))"
+                class="tool-detail"
+                :title="step.detail"
+                >{{ step.detail }}</span
+              >
               <details v-if="step.output || !step.ok" class="step-output">
                 <summary>查看原因</summary>
                 <pre>{{ step.output || step.detail }}</pre>
@@ -53,18 +78,10 @@
             >
               {{
                 openGroups.has(groupKey(phase.id, group.id))
-                  ? '隐藏'
+                  ? '收起'
                   : '显示 ' + (group.steps.length - 1) + ' 个更多'
               }}
             </button>
-            <span
-              v-if="
-                group.steps.some((step) => !step.ok) &&
-                !openGroups.has(groupKey(phase.id, group.id))
-              "
-              class="failure-note"
-              >有操作未通过</span
-            >
           </div>
         </article>
         <p v-if="!phase.groups.length" class="group-summary">正在准备工作区…</p>
@@ -76,12 +93,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { EngineeringActivity } from '@/api/modules/requirements'
-import { buildPhases, isWriteActivity, type BuildGroup } from '../buildTimeline'
+import { buildPhases, isWriteActivity, representativeStep, type BuildGroup } from '../buildTimeline'
 
 const props = defineProps<{
   activities: EngineeringActivity[]
   running: boolean
   failed?: boolean
+  paused?: boolean
 }>()
 defineEmits<{ 'open-file': [path: string] }>()
 const openPhases = ref(new Set<string>())
@@ -94,7 +112,7 @@ watch(
     const fresh = items.filter((phase) => !knownPhaseIds.has(phase.id))
     items.forEach((phase) => knownPhaseIds.add(phase.id))
     const latest = fresh.at(-1)
-    if (latest) openPhases.value = new Set([...openPhases.value, latest.id])
+    if (latest) openPhases.value = new Set([latest.id])
   },
   { immediate: true },
 )
@@ -107,12 +125,7 @@ function isFailedPhase(index: number) {
 function phaseMark(index: number) {
   if (isRunningPhase(index)) return '◌'
   if (isFailedPhase(index)) return '!'
-  return '✓'
-}
-function phaseState(index: number) {
-  if (isRunningPhase(index)) return '正在处理'
-  if (isFailedPhase(index)) return '处理暂停'
-  return '已处理'
+  return '·'
 }
 function togglePhase(id: string) {
   const next = new Set(openPhases.value)
@@ -124,7 +137,12 @@ function groupKey(phaseId: string, groupId: string) {
   return `${phaseId}:${groupId}`
 }
 function visibleSteps(phaseId: string, group: BuildGroup) {
-  return openGroups.value.has(groupKey(phaseId, group.id)) ? group.steps : group.steps.slice(0, 1)
+  const representative = representativeStep(group)
+  return openGroups.value.has(groupKey(phaseId, group.id))
+    ? group.steps
+    : representative
+      ? [representative]
+      : []
 }
 function toggleGroup(phaseId: string, groupId: string) {
   const id = groupKey(phaseId, groupId)
@@ -164,15 +182,13 @@ button {
 .timeline-groups {
   margin: 12px 0 0 5px;
   padding-left: 16px;
-  border-left: 1px solid #e4e4e8;
+  border-left: 1px dashed #e4e4e8;
 }
 .timeline-current {
-  margin: 8px 0 0 22px;
+  margin: 8px 0;
   color: #5d6478;
   line-height: 1.7;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 .build-group {
   position: relative;
@@ -195,20 +211,29 @@ button {
   overflow-wrap: anywhere;
 }
 .tool-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 8px;
   position: relative;
   padding: 8px 10px;
   border: 1px solid #e7e7eb;
   border-radius: 8px;
 }
 .tool-row {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: baseline;
   flex-wrap: wrap;
   gap: 6px;
   padding: 5px 0;
 }
+.tool-card.expanded .tool-row {
+  flex-basis: 100%;
+}
 .tool-row.failed,
-.failure-note {
+.timeline-current.failed {
   color: #b44f4a;
 }
 .tool-icon {
@@ -234,8 +259,8 @@ button {
 }
 .more-tools {
   display: block;
-  margin: 4px 0 0 auto;
-  border: 1px solid #e7e7eb;
+  margin-left: auto;
+  border: 0;
   border-radius: 5px;
   padding: 2px 6px;
   background: transparent;

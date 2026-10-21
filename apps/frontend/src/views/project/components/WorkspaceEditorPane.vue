@@ -5,10 +5,13 @@
         <input v-model="query" type="search" placeholder="搜索文件" aria-label="搜索文件" />
       </div>
       <div class="file-tree" role="tree">
-        <p v-if="!ready" class="tree-empty">首个代码 revision 通过快速检查后，这里会显示源码。</p>
+        <p v-if="!ready" class="tree-empty">开始构建后，这里会显示项目文档与源码。</p>
         <p v-else-if="loading" class="tree-empty">正在读取工作区…</p>
         <p v-else-if="error" class="tree-error">{{ error }}</p>
         <template v-else>
+          <p v-if="!files.length" class="tree-empty">
+            需求与设计保存后会显示在这里，源码将在检查通过后出现。
+          </p>
           <div
             v-for="node in visibleTree"
             :key="node.key"
@@ -42,7 +45,12 @@
           </div>
         </template>
       </div>
-      <button type="button" class="download-btn" :disabled="!ready" @click="$emit('download')">
+      <button
+        type="button"
+        class="download-btn"
+        :disabled="!(downloadReady ?? ready)"
+        @click="$emit('download')"
+      >
         <WorkbenchIcon name="download" size="sm" />
         下载项目
       </button>
@@ -54,18 +62,32 @@
           <span class="file-badge">{{ badgeFor(selectedName) }}</span>
           <span>{{ selectedName }}</span>
         </div>
-        <span v-else class="code-tab-placeholder">选择左侧文件查看源码</span>
+        <span v-else class="code-tab-placeholder">选择左侧文件查看内容</span>
+        <span v-if="fileKind === 'document'" class="document-label">只读文档</span>
         <button v-if="!following" type="button" class="follow-btn" @click="followWrites">
           跟随写入
         </button>
       </header>
-      <div class="code-scroll" :class="{ 'image-scroll': fileKind === 'image' }">
+      <p v-if="fileTruncated && !fileLoading && !fileError" class="tree-error">
+        内容较长，当前仅展示前半部分。
+      </p>
+      <div
+        class="code-scroll"
+        :class="{
+          'image-scroll': fileKind === 'image',
+          'document-scroll': fileKind === 'document',
+        }"
+      >
         <p v-if="fileLoading" class="tree-empty">加载文件中…</p>
         <p v-else-if="fileError" class="tree-error">{{ fileError }}</p>
         <figure v-else-if="selectedPath && fileKind === 'image' && imageSrc" class="image-preview">
           <img :src="imageSrc" :alt="selectedName" />
           <figcaption>{{ selectedPath }}</figcaption>
         </figure>
+        <WorkspaceDocument
+          v-else-if="selectedPath && fileKind === 'document' && fileContent !== null"
+          :content="fileContent"
+        />
         <template v-else-if="selectedPath && fileContent !== null">
           <div class="code-lines" aria-hidden="true">
             <span v-for="line in lineCount" :key="line">{{ line }}</span>
@@ -74,7 +96,7 @@
         </template>
         <p v-else class="tree-empty">选择文件后可在此查看源码。</p>
       </div>
-      <div v-if="fileKind !== 'image'" class="upgrade-banner" role="note">
+      <div v-if="fileKind === 'text'" class="upgrade-banner" role="note">
         要进行编辑，请升级到付费计划
       </div>
     </div>
@@ -85,6 +107,7 @@
 import { computed, ref, watch } from 'vue'
 import { useWorkspaceSource } from '../useWorkspaceSource'
 import WorkbenchIcon from './WorkbenchIcon.vue'
+import WorkspaceDocument from './WorkspaceDocument.vue'
 
 type TreeNode =
   | { kind: 'dir'; key: string; path: string; name: string; depth: number }
@@ -93,8 +116,9 @@ type TreeNode =
 const props = defineProps<{
   projectId: number
   ready: boolean
+  downloadReady?: boolean
   runId?: string | null
-  generation?: number
+  generation?: number | string
   writtenPath?: string | null
   requestedPath?: string | null
   requestSequence?: number
@@ -105,6 +129,7 @@ defineEmits<{ download: [] }>()
 const query = ref('')
 const expanded = ref(
   new Set<string>([
+    'forgeai',
     'frontend',
     'backend',
     'frontend/src',
@@ -130,6 +155,7 @@ const {
   fileContent,
   fileKind,
   fileMediaType,
+  fileTruncated,
   loading,
   error,
   fileLoading,
@@ -252,6 +278,15 @@ function toggleDir(path: string) {
 .code-scroll {
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
+}
+
+.code-scroll.document-scroll {
+  display: block;
+}
+.document-label {
+  margin-left: 12px;
+  color: #71717a;
+  font-size: 12px;
 }
 
 .file-tree:hover,

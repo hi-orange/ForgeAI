@@ -34,6 +34,139 @@ test('presentation groups repeated model calls into one tool card and keeps stag
   assert.equal(groups[1].steps[0].path, 'frontend/src/App.vue')
 })
 
+test('real engineering batches stay compact and keep a blocking failure visible', async () => {
+  const { buildGroups, representativeStep } = await loadModule(
+    '../src/views/project/buildTimeline.ts',
+    {},
+  )
+  const event = (id, name, detail, ok = true) => ({
+    id,
+    name,
+    detail,
+    ok,
+    phase_id: 'engineering',
+    phase_role: 'Code Engineer',
+  })
+  const activities = [
+    event('environment', 'check_environment', '环境已就绪'),
+    event('start', 'start', '内部执行器说明'),
+  ]
+  for (let i = 0; i < 12; i++)
+    activities.push(event('read' + i, 'read_file', `读取 backend/file${i}.py 第 1-17 行`))
+  for (let i = 0; i < 12; i++) {
+    activities.push(event('decide' + i, 'decide_action', 'Choose engineering action'))
+    activities.push(event('plan' + i, 'update_delivery_plan', '缺少 feat_visual', false))
+  }
+  activities.push(event('blocked', 'error', '连续 12 个工具动作没有进展', false))
+  const groups = buildGroups(activities)
+  assert.equal(groups.length, 3)
+  assert.equal(groups[0].steps.length, 13)
+  assert.equal(representativeStep(groups[0]).path, 'backend/file0.py')
+  assert.equal(groups[1].steps.length, 12)
+  assert.equal(representativeStep(groups[1]).ok, false)
+  assert.equal(groups[2].steps[0].detail, '连续 12 个工具动作没有进展')
+  assert.ok(groups.every((group) => !group.title.includes('Choose engineering action')))
+})
+
+test('collapsed tool cards expose failures and keep full check output for diagnosis', async () => {
+  const { buildGroups, representativeStep, phaseSummary } = await loadModule(
+    '../src/views/project/buildTimeline.ts',
+    {},
+  )
+  const events = [
+    { id: 'read1', name: 'read_file', detail: 'backend/main.py', ok: true },
+    { id: 'read2', name: 'read_file', detail: '文件不存在', ok: false },
+    { id: 'check', name: 'run_check', detail: '检查未通过', output: 'missing id', ok: false },
+  ]
+  const groups = buildGroups(events)
+  assert.equal(representativeStep(groups[0]).id, 'read2')
+  assert.equal(groups[1].steps[0].output, 'missing id')
+  assert.equal(phaseSummary(events), '工程检查发现问题')
+  assert.equal(
+    phaseSummary([{ id: 'qa', name: 'quality_result', detail: '失败', ok: false }]),
+    '独立验证发现问题',
+  )
+})
+
+test('a failed check and its actual repair remain separate compact groups', async () => {
+  const { buildGroups, representativeStep, isWriteActivity, timelineSteps } = await loadModule(
+    '../src/views/project/buildTimeline.ts',
+    {},
+  )
+  const events = [
+    { id: 'check', name: 'run_check', detail: 'missing id', ok: false },
+    { id: 'read', name: 'read_file', detail: '读取 backend/models.py（完整 20 行）', ok: true },
+    { id: 'write', name: 'write_files', detail: '已写入 2 个文件', ok: true },
+    { id: 'patch', name: 'edit_file_by_replace', detail: '已局部修改 backend/models.py', ok: true },
+    { id: 'recheck', name: 'check_result', detail: '检查通过', ok: true },
+  ]
+  const groups = buildGroups(events)
+  assert.equal(groups.length, 3)
+  assert.match(groups[0].title, /发现问题/)
+  assert.equal(representativeStep(groups[0]).id, 'check')
+  assert.match(groups[1].title, /根据反馈修改/)
+  assert.deepEqual(
+    Array.from(groups[1].steps, (step) => step.id),
+    ['write', 'patch'],
+  )
+  assert.equal(isWriteActivity('write_files'), true)
+  assert.equal(groups[2].title, '本轮工程检查已通过。')
+  assert.equal(timelineSteps(events)[1].path, 'backend/models.py')
+  assert.equal(timelineSteps(events)[3].path, 'backend/models.py')
+  assert.equal(timelineSteps(events)[2].path, null)
+})
+
+test('document refresh tracks persisted plan and check changes without every inspection call', async () => {
+  const { workspaceActivityVersion } = await loadModule('../src/views/project/buildTimeline.ts', {})
+  const events = [{ id: 'plan', name: 'update_delivery_plan', ok: true }]
+  assert.equal(workspaceActivityVersion(events), 'plan')
+  events.push({ id: 'read', name: 'read_file', ok: true })
+  assert.equal(workspaceActivityVersion(events), 'plan')
+  events.push({ id: 'write', name: 'write_files', ok: true })
+  assert.equal(workspaceActivityVersion(events), 'write')
+  events.push({ id: 'done', name: 'work_item_complete', ok: true })
+  assert.equal(workspaceActivityVersion(events), 'done')
+})
+
+test('batched context is preparation and optional capability installation is a visible source mutation', async () => {
+  const { buildGroups, timelineSteps, phaseSummary, isWriteActivity, workspaceActivityVersion } =
+    await loadModule('../src/views/project/buildTimeline.ts', {})
+  const events = [
+    { id: 'environment', name: 'check_environment', detail: '环境已就绪', ok: true },
+    {
+      id: 'context',
+      name: 'prepare_context',
+      label: 'prepare_context',
+      detail: '已批量载入 10 个入口与契约文件',
+      ok: true,
+    },
+    {
+      id: 'capability',
+      name: 'install_capability',
+      label: 'install_capability',
+      detail: '已集成登录能力，写入 8 个文件',
+      ok: true,
+    },
+  ]
+  const groups = buildGroups(events)
+  assert.equal(groups.length, 2)
+  assert.equal(groups[0].kind, 'prepare')
+  assert.equal(groups[0].steps.length, 2)
+  assert.match(groups[0].title, /准备项目上下文/)
+  assert.match(groups[1].title, /集成设计中选用的通用能力/)
+  const rows = timelineSteps(events)
+  assert.equal(rows[1].label, '准备项目上下文')
+  assert.equal(rows[2].label, '集成通用能力')
+  assert.equal(rows[2].path, null)
+  assert.equal(isWriteActivity('prepare_context'), false)
+  assert.equal(isWriteActivity('install_capability'), true)
+  assert.equal(workspaceActivityVersion(events.slice(0, 2)), '')
+  assert.equal(workspaceActivityVersion(events), 'capability')
+  assert.equal(phaseSummary(events), '已集成选用的通用能力，等待工程检查')
+  events[2].ok = false
+  assert.equal(phaseSummary(events), '操作遇到问题，正在处理反馈')
+})
+
 async function sourceFixture() {
   const input = reactive({
     projectId: 7,
@@ -93,6 +226,67 @@ test('source viewer opens template and refreshes same file on every successful w
   f.input.generation++
   await f.settle()
   assert.equal(f.view.fileContent.value, 'second write')
+  f.stop()
+})
+
+test('source viewer displays saved documents before code and preserves manual document selection', async () => {
+  const f = await sourceFixture()
+  const documentPath = 'forgeai/ARCHITECTURE.md'
+  let listed = [{ path: documentPath, kind: 'document', size_bytes: 40 }]
+  f.api.getWorkspace.mock.mockImplementation(async () => ({
+    ready: true,
+    run_id: 'run-1',
+    files: listed,
+  }))
+  f.api.getWorkspaceFile.mock.mockImplementation(async (_id, path, runId) => ({
+    run_id: runId,
+    path,
+    kind: path === documentPath ? 'document' : 'text',
+    content: path === documentPath ? '# 架构设计\n\n## 模块划分\n\n职位服务' : 'code',
+    media_type: path === documentPath ? 'text/markdown' : null,
+  }))
+  f.input.generation++
+  await f.settle()
+  assert.equal(f.view.selectedPath.value, documentPath)
+  assert.equal(f.view.fileKind.value, 'document')
+  assert.match(f.view.fileContent.value, /模块划分/)
+  assert.equal(f.api.getWorkspace.mock.calls.at(-1).arguments[1], 'run-1')
+  await f.view.selectFile(documentPath)
+  listed = [...listed, { path: 'frontend/src/App.vue', kind: 'text', size_bytes: 4 }]
+  f.input.writtenPath = 'frontend/src/App.vue'
+  f.input.generation++
+  await f.settle()
+  assert.equal(f.view.selectedPath.value, documentPath)
+  assert.equal(f.view.fileKind.value, 'document')
+  f.stop()
+})
+
+test('source viewer rejects document content from another run', async () => {
+  const f = await sourceFixture()
+  f.api.getWorkspaceFile.mock.mockImplementation(async () => ({
+    run_id: 'run-other',
+    kind: 'document',
+    content: '其他构建的设计',
+  }))
+  await f.view.selectFile('forgeai/ARCHITECTURE.md')
+  assert.equal(f.view.fileContent.value, null)
+  assert.match(f.view.fileError.value, /构建已切换/)
+  f.stop()
+})
+
+test('a manually selected progress document refreshes without switching back to source', async () => {
+  const f = await sourceFixture()
+  const path = 'forgeai/PROGRESS.md'
+  f.contents[path] = '# 当前进度\n\n状态：待实施'
+  f.input.generation++
+  await f.settle()
+  await f.view.selectFile(path)
+  f.contents[path] = '# 当前进度\n\n状态：工程检查已通过'
+  f.input.writtenPath = 'frontend/src/App.vue'
+  f.input.generation++
+  await f.settle()
+  assert.equal(f.view.selectedPath.value, path)
+  assert.match(f.view.fileContent.value, /工程检查已通过/)
   f.stop()
 })
 

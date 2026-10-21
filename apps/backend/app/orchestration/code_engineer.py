@@ -26,6 +26,7 @@ from app.generation.delivery import (
     plan_quality_repair,
     planning_item,
     replace_delivery_plan,
+    suggested_delivery_plan,
     work_items_to_json,
 )
 from app.generation.engineering.actions import PreparedAction, commit_action, prepare_action
@@ -45,7 +46,9 @@ from app.generation.engineering.checks import (
     source_file_hashes,
 )
 from app.generation.engineering.context import (
+    build_initial_source_context,
     build_workspace_file_index,
+    initial_source_context,
     update_file_index,
 )
 from app.generation.engineering.diagnostics import (
@@ -54,6 +57,7 @@ from app.generation.engineering.diagnostics import (
     active_diagnostics,
     check_verification,
     invalidate_source_evidence,
+    planning_repair_context,
     reconcile_protocol_diagnostic,
     record_feedback,
     resolve_protocol_diagnostic,
@@ -77,6 +81,7 @@ from app.services.source_artifact import persist_source_artifact
 from app.services.task_execution import latest_execution, renew_execution_lease, utc_now
 from app.services.workflow_events import append_event
 from app.tools import checks as check_tools
+from app.tools.capabilities import prepare_capability
 from app.tools.check_diagnostics import analyze_check_failure
 from app.tools.code_engineer import MUTATING_TOOLS, rejected_tool, validate_tool_call
 
@@ -234,6 +239,20 @@ class _EngineeringNodes:
                 )
             if not isinstance(checkpoint.get("workspace_file_index"), dict):
                 checkpoint["workspace_file_index"] = build_workspace_file_index(root)
+            if "initial_source_context" not in checkpoint:
+                initial = build_initial_source_context(root)
+                checkpoint["initial_source_context"] = initial
+                for source in initial["files"]:
+                    checkpoint.setdefault("observed_hashes", {})[source["path"]] = source[
+                        "content_hash"
+                    ]
+                append_activity(
+                    checkpoint,
+                    name="prepare_context",
+                    label="准备项目上下文",
+                    detail=f"已批量载入 {len(initial['files'])} 个入口与契约文件，可直接规划和实施",
+                    ok=True,
+                )
             if checkpoint.get("check_environment_execution_id") != execution.execution_id:
                 environment = record_feedback(checkpoint, check_tools.check_environment())
                 append_activity(
@@ -312,6 +331,8 @@ class _EngineeringNodes:
             for tool in CODE_ENGINEER_TOOLS
             if tool.name != "generate_image" or settings.image_generation_enabled
         ]
+        if not snapshot.get("optional_capabilities"):
+            tools = [tool for tool in tools if tool.name != "install_capability"]
         if checkpoint.get("needs_delivery_plan"):
             tools = [
                 tool
@@ -335,6 +356,7 @@ class _EngineeringNodes:
             ]
         available = sorted(tool.name for tool in tools)
         reconcile_protocol_diagnostic(checkpoint, available)
+        memory = working_context(checkpoint, root)
         self._persist_waiting(
             state,
             name="decide_action",
@@ -361,12 +383,21 @@ class _EngineeringNodes:
                         call_budget(snapshot, "max_planning_turns")
                         - int(checkpoint.get("planning_turns") or 0),
                     ),
-                    "working_memory": working_context(checkpoint, root),
+                    "working_memory": memory,
+                    "initial_source_context": initial_source_context(
+                        checkpoint, root, source_evidence=memory["source_evidence"]
+                    ),
+                    "suggested_delivery_plan": suggested_delivery_plan(spec, system_design)
+                    if checkpoint.get("needs_delivery_plan")
+                    and not checkpoint["work_items"]
+                    and snapshot.get("quality_report") is None
+                    else None,
                     "observed_files": checkpoint.get("observed_hashes", {}),
                     "no_progress_steps": checkpoint.get("no_progress_steps", 0),
                     "recovery_context": checkpoint.get("recovery_context"),
                     "delivery_plan": checkpoint["work_items"],
                     "stack": snapshot.get("stack"),
+                    "optional_capabilities": snapshot.get("optional_capabilities", []),
                     "workspace_file_index": checkpoint.get("workspace_file_index"),
                     "modified_files": checkpoint.get("modified_files", []),
                     "completed_work_items": [
@@ -378,6 +409,7 @@ class _EngineeringNodes:
                     "api_client_contract": checkpoint.get("api_client_contract"),
                     "pending_integration": checkpoint.get("pending_integration", True),
                     "active_diagnostics": active_diagnostics(checkpoint),
+                    "planning_repair": planning_repair_context(checkpoint),
                     "check_verification": check_verification(checkpoint),
                     "progress_guidance": progress_guidance(checkpoint),
                     "quality_report": snapshot.get("quality_report"),
@@ -431,7 +463,7 @@ class _EngineeringNodes:
                 current_snapshot["checkpoint"] = current
                 _save_snapshot(db, execution.execution_id, current_snapshot)
         for call in decision.tool_calls:
-            update = self._execute_call(state, snapshot, checkpoint, work_item, root, call)
+            update = self._execute_call(state, snapshot, checkpoint, work_item, root, call, spec)
             if update.get("outcome") != "running":
                 return update
         return update
@@ -444,6 +476,7 @@ class _EngineeringNodes:
         work_item: WorkItem,
         root: Path,
         call: ToolCall,
+        spec: AppSpec,
     ) -> _WorkflowUpdate:
         try:
             call = validate_tool_call(call)
@@ -498,6 +531,17 @@ class _EngineeringNodes:
                     tool_call_id=call.id,
                 ).model_copy(update={"arguments": call.arguments})
             )
+        elif call.name == "install_capability":
+            action = prepare_capability(
+                call,
+                root,
+                checkpoint.get("observed_hashes", {}),
+                spec=spec,
+                system_design=SystemDesign.model_validate(snapshot["system_design"])
+                if isinstance(snapshot.get("system_design"), dict)
+                else None,
+                capability_snapshot=snapshot.get("optional_capabilities"),
+            )
         else:
             action = prepare_action(call, root, checkpoint.get("observed_hashes", {}))
         return self._record_action(state, call, action, root)
@@ -526,13 +570,29 @@ class _EngineeringNodes:
                         state["build_run_id"],
                         str(snapshot["approved_item_id"]),
                     )
-                    revised = replace_delivery_plan(
-                        spec,
-                        [PlannedWorkItem.model_validate(row) for row in call.arguments["items"]],
-                        current["work_items"],
+                    design = (
                         SystemDesign.model_validate(snapshot["system_design"])
                         if isinstance(snapshot.get("system_design"), dict)
-                        else None,
+                        else None
+                    )
+                    if call.arguments.get("suggested_plan_hash") is not None:
+                        if current["work_items"] or not current.get("needs_delivery_plan"):
+                            raise ConflictException(
+                                "初始建议仅可用于空计划；重规划请提交完整 items"
+                            )
+                        proposal = suggested_delivery_plan(spec, design)
+                        if call.arguments["suggested_plan_hash"] != proposal["content_hash"]:
+                            raise ConflictException(
+                                "建议计划版本已变化，请核对当前完整建议后重新提交"
+                            )
+                        proposed = proposal["items"]
+                    else:
+                        proposed = call.arguments["items"]
+                    revised = replace_delivery_plan(
+                        spec,
+                        [PlannedWorkItem.model_validate(row) for row in proposed],
+                        current["work_items"],
+                        design,
                     )
                     if revised == current["work_items"] and not current.get("needs_delivery_plan"):
                         raise ConflictException("计划没有变化，请执行已就绪任务")

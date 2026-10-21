@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException, ConflictException, NotFoundException
+from app.generation.capabilities import freeze_optional_capabilities
 from app.generation.engineering.budget import DEFAULT_CALL_BUDGET as DEFAULT_CALL_BUDGET
 from app.generation.template_registry import DEFAULT_TEMPLATE_VERSION, load_template_metadata
 from app.models.build_run import BuildRun, BuildRunStage
@@ -33,8 +34,8 @@ from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_engineer
 from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_now
 
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
-INPUT_SNAPSHOT_SCHEMA_VERSION = 4
-SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+INPUT_SNAPSHOT_SCHEMA_VERSION = 5
+SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
 TOOL_STRATEGY_VERSION = "evidence_tool_loop_v1"
 
 
@@ -87,6 +88,9 @@ def build_frozen_input_snapshot(
         "design_item_id": design_item_id,
         "system_design": (
             system_design.model_dump(mode="json") if system_design is not None else None
+        ),
+        "optional_capabilities": freeze_optional_capabilities(
+            spec, system_design, template_version
         ),
         "acceptance_test_plan_item_id": acceptance_test_plan_item_id,
         "acceptance_test_hash": acceptance_test_hash,

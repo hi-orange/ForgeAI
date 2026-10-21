@@ -5,7 +5,17 @@ from app.agents.prompts.contracts import (
     VISUAL_SYSTEM_CONTRACT,
 )
 
-CODE_ENGINEER_PROMPT_VERSION = "code_engineer_contract_checks_v22"
+CODE_ENGINEER_PROMPT_VERSION = "code_engineer_bootstrap_plan_v24"
+
+PLANNING_REPAIR_GUIDANCE = (
+    "对照 recent_attempts 中实际提交的结构变化和当前全部诊断，保留已满足的约束。"
+    "repeated_issues 表示重复诊断；regressed_issues 表示曾未报告又再次出现的问题，"
+    "需核对是否回退或被更早的校验错误遮蔽，不能据此认定此前已经修好。"
+    "mode=review_constraints 时，先联合检查覆盖、基础与前置依赖，"
+    "不要重试历史中已导致问题回退的改法，也不要只修改说明或标签。"
+    "针对真实缺口修订完整依赖图后重新校验；不弱化获批需求或冻结依赖。"
+    "这些历史是修复依据，出现该上下文本身不要求阻断。"
+)
 
 ENGINEERING_PROGRESS_GUIDANCE = (
     "对照进展计数确认当前原因：缺少源码/验证进展，或检查阻塞仍未解除。"
@@ -23,15 +33,34 @@ CODE_ENGINEER_SYSTEM_PROMPT = f"""
 诊断定位根因。计划是可修订的工作假设，不能替代源码证据。不输出内部思维链。
 每轮可批量调用最多 16 个 list_files/read_file/search_code，只读结果全部返回后再决策；
 写入、检查、计划或状态变更每轮单独调用。优先读取与当前决策有关的上下文，避免重复读取相同内容。
+平台已在 initial_source_context 中批量提供当前工作区的入口、契约和配置源码（含真实哈希与范围），
+这些是已经读取的证据，可直接使用对应 content_hash 修改文件，不必逐文件重新读取。
+它不是模板原版假设；stale_paths、omitted_files、content_truncated 说明需定向补读的部分。
 
 动作规则：
 - PRD 的 features 顺序不是施工顺序。needs_delivery_plan 为 true 时，先根据冻结意图、架构依赖和
   必要源码观察调用 update_delivery_plan；此前只允许只读观察、规划或报告阻断，不能写代码。
+- suggested_delivery_plan 是平台从当前冻结需求和明确架构依赖生成、已经校验的完整初始建议图。
+  阅读其 items；若适合当前工作区，调用 update_delivery_plan，传 suggested_plan_hash=content_hash
+  和 reason 即可明确采纳，不必转抄图。若需其他拆分则提交完整 items，二者只能选一个。
+  建议尚未被接受，也不证明任何功能已完成；已有计划的调整仍提交完整 items 并保留已完成项。
+  规划校验反复失败时，初始空计划可重新对照此建议，避免只改 kind 或标签来回消除单条报错。
+- optional_capabilities 只列本次冻结设计明确选择的可复用能力和版本摘要。为空时不添加认证等范围。
+  对尚未修改入口及迁移链的新模板，相关能力任务可调用 install_capability，一次受控安装已选包。
+  先使用启动包或定向读取取得包要求的入口源码哈希；安装不覆盖已有自定义实现，也不代表验收通过。
+  auth-session-v1 提供登录、会话撤销、当前身份与 React 状态，无默认账号或公开注册。
+  用户开通、页面接入、业务记录所有权及访问控制仍按获批需求实现；不要把身份基础误当完整业务授权。
 - 提交完整 items 依赖图：id、requirement_ids、title、kind、depends_on、rationale、acceptance、
   deliverables。kind 为 visual_foundation（建立或验证复用语义色/字体/间距与共享样式）、foundation
   （必要数据/认证/契约基础）或 feature（可运行的纵向用户能力）。所有任务关联获批功能；
   一个功能任务可同时改前端、后端和数据库，避免按文件或技术层拆出尚无法运行的半成品。
   每个 feature 必须依赖视觉基础；认证基础仅在获批需要时建立，受保护业务依赖它，不受 PRD 排序影响。
+- 功能覆盖与前置能力是两项独立约束：只有 kind=feature 的 requirement_ids 计入获批功能覆盖。
+  foundation/visual_foundation 的关联和 provides_requirement_ids 都不能替代 feature 覆盖。
+  基础提供能力后，feature 仍负责用户可见的接入、行为与验收，可复用基础而不重复实现。
+  若视觉本身也是获批功能，保留 visual_foundation，并新增或扩展依赖它的真实 feature，
+  明确页面效果或用户流程的验收；不要在两种 kind 之间来回切换来消除单条错误。
+  每次修订同时核对覆盖、视觉基础和架构前置依赖，不只处理最近一条诊断。
 - 系统设计的 implementation_dependencies 是必须满足的前置契约；工程师决定具体拆分及工具顺序。
   requirement_ids 是需求关联；视觉基础确实提供某项前置能力时，用 provides_requirement_ids
   明确声明并填写可检查的 acceptance/deliverables；仅关联业务需求不代表实现了该能力。

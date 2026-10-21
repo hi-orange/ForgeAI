@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -19,12 +21,17 @@ class PlannedWorkItem(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     id: RequirementId
-    requirement_ids: list[RequirementId] = Field(min_length=1, max_length=50)
+    requirement_ids: list[RequirementId] = Field(
+        min_length=1,
+        max_length=50,
+        description="关联获批需求以追踪来源；只有 kind=feature 的关联计入功能覆盖。",
+    )
     provides_requirement_ids: list[RequirementId] = Field(
         default_factory=list,
         max_length=50,
         description=(
             "明确提供的前置能力，必须是 requirement_ids 的子集并有 acceptance/deliverables；"
+            "只用于前置依赖，不替代 feature 功能覆盖。"
             "视觉基础的需求关联默认不提供业务能力。声明后完成该项必须通过集成检查。"
         ),
     )
@@ -54,6 +61,66 @@ def planning_item(spec: AppSpec) -> WorkItem:
         requirement_ids=[feature.id for feature in spec.features],
         title="根据冻结需求、设计与现有源码提交工程依赖计划",
     )
+
+
+def suggested_delivery_plan(spec: AppSpec, design: SystemDesign | None = None) -> dict[str, Any]:
+    """A validated initial proposal derived solely from frozen requirements and edges.
+
+    It is neither accepted work nor completion evidence. The engineer must explicitly
+    adopt this exact hash or submit its own graph through the normal validation gate.
+    """
+    ids = {feature.id for feature in spec.features}
+    visual_id = "visual_foundation"
+    suffix = 0
+    while visual_id in ids:
+        suffix += 1
+        visual_id = f"visual_foundation_{suffix}"
+    dependencies = {feature.id: set[str]() for feature in spec.features}
+    if design is not None:
+        design.validate_requirement_dependencies(spec)
+        for edge in design.implementation_dependencies:
+            dependencies[edge.dependent_requirement_id].add(edge.prerequisite_requirement_id)
+    available: dict[str, set[str]] = {}
+    remaining = dict(dependencies)
+    while remaining:
+        for key in [key for key, deps in remaining.items() if deps <= available.keys()]:
+            parents = remaining.pop(key)
+            available[key] = {key} | {req for parent in parents for req in available[parent]}
+    items = [
+        PlannedWorkItem(
+            id=visual_id,
+            title="建立或验证复用共享视觉基础",
+            kind="visual_foundation",
+            requirement_ids=[feature.id for feature in spec.features],
+            acceptance=["共享样式与获批界面要求一致，已有基础优先验证复用"],
+            deliverables=["当前工作区的主题、字体、间距及共享样式"],
+        ),
+        *[
+            PlannedWorkItem(
+                id=feature.id,
+                title=feature.text,
+                requirement_ids=[feature.id],
+                depends_on=[visual_id, *sorted(dependencies[feature.id])],
+                rationale="按冻结架构中的前置依赖实施获批功能",
+                acceptance=[
+                    criterion.text
+                    for criterion in spec.acceptance_criteria
+                    if feature.id in criterion.source_ids
+                    and set(criterion.source_ids) <= available[feature.id]
+                ]
+                or [feature.text],
+                deliverables=["实现该获批功能所需的源码及集成检查；复用已验证的前置能力"],
+            )
+            for feature in spec.features
+        ],
+    ]
+    # Use the same authority as model-authored graphs. No fallback may waive a rule.
+    validate_delivery_plan(spec, [WorkItem(**item.model_dump()) for item in items], design)
+    payload = [item.model_dump(mode="json") for item in items]
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return {"items": payload, "content_hash": digest}
 
 
 def plan_quality_repair(spec: AppSpec, report: TestReport) -> list[WorkItem]:
@@ -226,16 +293,53 @@ def validate_delivery_plan(
             ancestors[key] = deps | {parent for dep in deps for parent in ancestors[dep]}
     covered = {req for item in items if item.kind == "feature" for req in item.requirement_ids}
     if covered != feature_ids:
+        missing = feature_ids - covered
         issues.append(
             {
                 "code": "MISSING_FEATURE_COVERAGE",
-                "missing_requirement_ids": sorted(feature_ids - covered),
-                "expected": "工程计划必须以功能任务覆盖全部获批功能，不能只交付基础设施",
+                "missing_requirement_ids": sorted(missing),
+                "linked_non_feature_items": [
+                    {
+                        "work_item_id": item.id,
+                        "kind": item.kind,
+                        "requirement_ids": sorted(set(item.requirement_ids) & missing),
+                        "provides_requirement_ids": sorted(
+                            set(item.provides_requirement_ids) & missing
+                        ),
+                    }
+                    for item in items
+                    if item.kind != "feature" and set(item.requirement_ids) & missing
+                ],
+                "expected": (
+                    "全部获批功能必须由 kind=feature 的 requirement_ids 覆盖。"
+                    "foundation/visual_foundation 的关联仅用于追踪；"
+                    "provides_requirement_ids 只满足前置依赖，不计入功能覆盖。"
+                ),
+                "suggested_action": (
+                    "保留仍需复用的基础任务及其能力声明，新增或扩展真正实现这些需求的 feature，"
+                    "写明用户可见的实现与验收，并依赖相应基础任务。"
+                    "若基础已经提供所需能力，feature 负责页面接入或用户流程验证，无需重建基础。"
+                    "不要只追加需求标签或来回修改同一项的 kind；提交前同时检查功能覆盖、"
+                    "视觉基础及冻结的前置依赖。"
+                ),
             }
         )
     visual = {item.id for item in items if item.kind == "visual_foundation"}
     if not visual:
-        issues.append({"code": "MISSING_VISUAL_FOUNDATION", "expected": "先建立或验证复用视觉基础"})
+        issues.append(
+            {
+                "code": "MISSING_VISUAL_FOUNDATION",
+                "feature_work_item_ids": [item.id for item in items if item.kind == "feature"],
+                "expected": "先建立或验证复用视觉基础；未完成 feature 必须以它为祖先任务。",
+                "suggested_action": (
+                    "同时保留 feature 对获批功能的覆盖，并新增或恢复独立 visual_foundation。"
+                    "若刚把视觉基础改成 feature，分别表达共享基础与用户可见实现/验收，"
+                    "让 feature 依赖基础；仅改回 kind 会再次丢失功能覆盖。"
+                    "基础确实提供架构前置能力时保留 provides_requirement_ids，"
+                    "该声明仍不替代 feature 覆盖。"
+                ),
+            }
+        )
     for item in items:
         if (
             item.kind == "feature"

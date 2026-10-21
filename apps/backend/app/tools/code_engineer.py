@@ -70,6 +70,10 @@ class _GenerateClient(_Arguments):
     pass
 
 
+class _Capability(_Arguments):
+    capability_id: Literal["auth-session-v1"]
+
+
 class _Image(_Arguments):
     path: str = Field(min_length=1)
     prompt: str = Field(min_length=1, max_length=4000)
@@ -98,8 +102,19 @@ class _Blocked(_Arguments):
 
 
 class _Plan(_Arguments):
-    items: list[PlannedWorkItem] = Field(min_length=1, max_length=100)
+    items: list[PlannedWorkItem] | None = Field(default=None, min_length=1, max_length=100)
+    suggested_plan_hash: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+        description="仅初始空计划可用：明确采纳上下文中已展示的完整建议图，提交其 content_hash。",
+    )
     reason: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def one_plan_source(self) -> _Plan:
+        if (self.items is None) == (self.suggested_plan_hash is None):
+            raise ValueError("items 与 suggested_plan_hash 必须且只能提供一个")
+        return self
 
 
 _TOOL_ARGUMENTS: dict[str, type[_Arguments]] = {
@@ -110,6 +125,7 @@ _TOOL_ARGUMENTS: dict[str, type[_Arguments]] = {
     "write_file": _Write,
     "write_files": _BatchWrite,
     "generate_api_client": _GenerateClient,
+    "install_capability": _Capability,
     "edit_file_by_replace": _Edit,
     "generate_image": _Image,
     "install_project_dependency": _Dependency,
@@ -120,6 +136,8 @@ _TOOL_ARGUMENTS: dict[str, type[_Arguments]] = {
 _DESCRIPTIONS = {
     "update_delivery_plan": (
         "提交完整工程依赖图或调整剩余计划；先建立/验证视觉基础，再依赖它实现功能。"
+        "初始空计划可用 suggested_plan_hash 明确采纳上下文中的完整建议图，免于转抄 items；"
+        "二者只能选一个，已有计划的重规划必须提交完整 items。"
         "需求可拆分，基础可共用；保留已完成项的全部定义，不提交 status/summary。"
         "平台校验覆盖、依赖及完成记录后，只执行依赖已满足的任务。"
     ),
@@ -144,6 +162,11 @@ _DESCRIPTIONS = {
         "从当前 FastAPI app.main:app 在隔离容器导出 OpenAPI；使用固定模板生成"
         " frontend/openapi.json 和 frontend/src/client/ 类型及 SDK。该目录完全由生成器管理，"
         "会移除旧生成文件；业务封装放 src/lib/。后端接口就绪或变更后调用，生成本身不代表检查通过。"
+    ),
+    "install_capability": (
+        "安装冻结设计显式选择的版本化能力包；仅首次安装，不覆盖自定义业务或迁移。"
+        "auth-session-v1 提供登录/退出/身份会话、迁移和 React 状态，无默认账户或自动注册。"
+        "必须先读取包需修改的模板入口；安装后仍需实现获批业务授权并通过检查。"
     ),
     "install_project_dependency": (
         "在隔离容器解析 npm/uv 项目依赖，更新清单和锁文件；禁止系统安装。"
@@ -172,6 +195,7 @@ MUTATING_TOOLS = frozenset(
         "generate_image",
         "install_project_dependency",
         "generate_api_client",
+        "install_capability",
     }
 )
 

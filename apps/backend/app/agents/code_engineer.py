@@ -8,6 +8,7 @@ from typing import Any
 from app.agents.prompts.code_engineer import (
     CODE_ENGINEER_SYSTEM_PROMPT,
     ENGINEERING_PROGRESS_GUIDANCE,
+    PLANNING_REPAIR_GUIDANCE,
 )
 from app.agents.roles import get_role_profile
 from app.agents.tool_protocol import append_tool_batch_exchange
@@ -188,6 +189,12 @@ def build_code_engineer_messages(
     guidance = context.get("progress_guidance")
     if isinstance(guidance, dict):
         context["progress_guidance"] = {**guidance, "instruction": ENGINEERING_PROGRESS_GUIDANCE}
+    planning_repair = context.get("planning_repair")
+    if isinstance(planning_repair, dict):
+        context["planning_repair"] = {
+            **planning_repair,
+            "instruction": PLANNING_REPAIR_GUIDANCE,
+        }
     repair = context.get("repair_context")
     if isinstance(repair, dict):
         # Current structured evidence is sufficient; raw check output remains durable.

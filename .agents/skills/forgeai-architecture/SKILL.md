@@ -1,27 +1,53 @@
 ---
 name: forgeai-architecture
-description: Applies ForgeAI artifact ownership, approval, frozen-input, quality-gate, recovery, and prompt-contract invariants. Use when changing ForgeAI orchestration, role prompts, generated-code tooling, artifacts, or delivery state transitions.
+description: Guide changes to ForgeAI orchestration, role contracts, generated-code tools and artifact lifecycles while preserving ownership, frozen inputs, isolation and recovery.
 ---
 
 # ForgeAI Architecture
 
-## Workflow
+Implement the user's current change in the existing system. Separate durable product constraints
+from mechanisms that can evolve; use runtime schemas, validators and tests for current behavior.
 
-1. Read `docs/architecture.md` completely.
-2. Read `reference.md` when changing artifacts, approvals, engineering handoff, smoke checks, acceptance testing, or repair routing.
-3. Inspect current schemas, migrations, services and tests before relying on a field name.
-4. Preserve frozen inputs, exact artifact identities, ownership boundaries, generated-source isolation and recoverable revisions.
-5. Put hard gates in runtime validation. Keep prompts focused on role decisions and import shared policy from `app.agents.prompts.contracts` instead of copying it.
-6. Run targeted tests for direct consumers, then broader package checks when a public contract changes.
+## Find the relevant contract
 
-## Boundaries
+Start with the affected files and the behavior being changed. Trace their direct producers and
+consumers before widening the investigation. Read the relevant sections of
+[docs/architecture.md](../../../docs/architecture.md) before changing their contracts:
 
-- Do not turn an implementation mismatch into a product change when approved intent already covers it.
-- Do not use clarification as approval.
-- Do not modify frozen acceptance assets from Code Engineer paths.
-- Do not let smoke evidence substitute for independent acceptance evidence.
-- Preserve the distinction between approved-standard `test_hash`, QA asset `suite_hash` and each
-  source-bound execution id. QA adapter revisions never overwrite snapshots or weaken assertions.
-- Keep generated application processes unable to write trusted QA evidence; external effects are
-  disabled during independent acceptance. Check publication against persisted runner facts.
-- Do not add product behavior in architecture, engineering, or testing prompts.
+- Scope, approvals and ownership: core invariants and artifact lifecycle.
+- Scheduling, retries and recovery: the affected scheduling and state-transition sections.
+- Generated-code tools and verification: engineering execution and independent QA.
+- Role instructions: prompt layering and the corresponding runtime enforcement.
+
+Read [reference.md](reference.md) when changing artifact identity, handoffs, acceptance evidence or
+compatibility. Follow existing links and inspect runtime definitions as needed. Read the full
+architecture when the change spans its boundaries or the relevant constraints remain unclear.
+A local change does not require loading every architectural detail.
+
+## Preserve boundaries; improve mechanisms
+
+- Keep execution bound to its frozen inputs and exact artifact/source identities. New versions
+  preserve lineage; they do not silently replace inputs or rewrite terminal history.
+- Respect artifact ownership and the separation between generated source and trusted platform/QA
+  state. Code repair cannot edit frozen acceptance standards or manufacture passing evidence.
+- Preserve recoverable revisions, concurrency fences and recorded work across retries. Resume or
+  migration must not silently reset spent budgets or revive a terminal execution.
+- Treat smoke, independent acceptance and publication as distinct evidence and transitions.
+
+Task decomposition, stage layout, retry policy, context selection and prompt wording are mechanisms.
+Improve them within the requested scope when evidence shows a problem, and update the relevant
+contract and consumers together. Record new platform behavior in the relevant product documentation.
+For generated applications, new product scope needs approved intent; defects within approved intent
+remain repairs. The skill adds no approval step to work the user has already authorized.
+
+Keep enforceable boundaries in runtime validation. Put decision guidance in the existing role prompts
+and reuse shared policy from `app.agents.prompts.contracts`. Avoid turning one incident's workaround
+into a mandatory sequence for every application.
+
+## Verify the outcome
+
+Use relevant available evidence, such as tool results, saved state or execution records, to establish
+what happened; distinguish those facts from model explanations. Check the changed behavior and its direct consumers first,
+including the relevant failure or recovery path. Broaden verification when shared contracts, persistent
+state, security or concurrency are affected. Report the checks and any remaining uncertainty;
+deterministic regression tests alone do not establish better real-model success rates.
