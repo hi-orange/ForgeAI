@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from app.core.exceptions import ConflictException
 from app.generation.delivery import WorkItem
-from app.generation.engineering.budget import DEFAULT_CALL_BUDGET
+from app.generation.engineering.budget import DEFAULT_CALL_BUDGET, call_budget
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.check_diagnostics import CheckFailureAnalysis, analyze_check_failure
 
@@ -83,6 +83,53 @@ def is_terminal_engineering_failure(checkpoint: dict[str, Any]) -> bool:
         "MODEL_BUDGET_EXHAUSTED",
         "TOOL_BUDGET_EXHAUSTED",
     }
+
+
+def requires_manual_repair_retry(snapshot: dict[str, Any]) -> bool:
+    """Require an explicit bounded attempt for a stop-loss or budget-cited block.
+
+    A model may report that it cannot finish a work item with its last available
+    turn instead of consuming that turn. Only treat that report as a budget stop
+    when the persisted budget is actually at its limit; an unrelated blocker
+    retains the ordinary recovery semantics.
+    """
+
+    checkpoint = snapshot.get("checkpoint")
+    if not isinstance(checkpoint, dict) or checkpoint.get("outcome") != "blocked":
+        return False
+    if is_terminal_engineering_failure(checkpoint):
+        return True
+    reason = str(checkpoint.get("blocked_reason") or "").casefold()
+    model_budget_cited = any(
+        phrase in reason
+        for phrase in (
+            "剩余模型调用",
+            "剩余模型轮次",
+            "模型调用预算",
+            "模型轮次预算",
+            "remaining_model_turns",
+            "remaining model turn",
+            "model call budget",
+            "model budget",
+        )
+    )
+    tool_budget_cited = any(
+        phrase in reason
+        for phrase in (
+            "剩余工具调用",
+            "工具调用预算",
+            "remaining tool call",
+            "tool call budget",
+            "tool budget",
+        )
+    )
+    return (
+        model_budget_cited
+        and int(checkpoint.get("model_turns") or 0) >= call_budget(snapshot, "max_model_turns") - 1
+    ) or (
+        tool_budget_cited
+        and int(checkpoint.get("tool_calls") or 0) >= call_budget(snapshot, "max_tool_calls") - 1
+    )
 
 
 def load_checkpoint(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -294,7 +341,7 @@ def resume_blocked_checkpoint(checkpoint: dict[str, Any]) -> bool:
 
 
 def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Create one bounded, user-requested retry from terminal check evidence.
+    """Create one bounded, user-requested retry from persisted block evidence.
 
     Automatic recovery must preserve the stop-loss. This explicit path keeps the
     frozen inputs and prior activity, but gives the current work item a fresh repair
@@ -303,7 +350,7 @@ def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
 
     prepared = json.loads(json.dumps(snapshot))
     checkpoint = load_checkpoint(prepared)
-    if checkpoint.get("outcome") != "blocked" or not is_terminal_engineering_failure(checkpoint):
+    if not requires_manual_repair_retry(prepared):
         raise ConflictException("当前工程执行不需要人工重新修复")
 
     remember_recovery(checkpoint)
@@ -332,6 +379,10 @@ def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
     checkpoint["no_progress_steps"] = 0
     checkpoint["steps_without_delivery"] = 0
     checkpoint["verification_watch"] = {}
+    item_memory = checkpoint.setdefault("work_memory", {}).setdefault(current_item_id, {})
+    item_memory["redundant_read_steps"] = 0
+    item_memory["inspection_model_turns"] = 0
+    item_memory.pop("last_inspection_model_turn", None)
     checkpoint.pop("progress_guidance_turn", None)
     checkpoint["outcome"] = "running"
     checkpoint["blocked_reason"] = None
@@ -342,7 +393,7 @@ def prepare_manual_repair_retry(snapshot: dict[str, Any]) -> dict[str, Any]:
         checkpoint,
         name="manual_repair_retry",
         label="Retry repair",
-        detail=f"用户要求基于最后一次检查错误重新分析并修复（第 {retry_number} 次）",
+        detail=f"用户要求基于当前阻断证据重新分析并修复（第 {retry_number} 次）",
         ok=True,
     )
     prepared["checkpoint"] = checkpoint

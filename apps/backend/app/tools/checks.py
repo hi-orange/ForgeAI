@@ -22,11 +22,11 @@ from app.core.settings import settings
 from app.runtime.docker import get_docker_sandbox_runtime
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.paths import MAX_FILE_BYTES, SKIP_DIRS, is_text_file, safe_path_under_root
-from sandbox.smoke_manifest import parse_smoke_manifest
+from sandbox.smoke_manifest import all_check_timeout_seconds, parse_smoke_manifest
 
 CHECK_IDS = {"quick", "database", "backend", "frontend", "all", "security"}
 CHECK_RUNTIME_LABEL = "org.forgeai.check-runtime-version"
-CHECK_RUNTIME_VERSION = "20"
+CHECK_RUNTIME_VERSION = "22"
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 MAX_BINARY_ASSETS_BYTES = 32 * 1024 * 1024
@@ -242,13 +242,14 @@ def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> Tool
         "runtime_version": CHECK_RUNTIME_VERSION,
         "cache_hit": False,
     }
+    manifest = None
     if check_id in {"quick", "all"}:
         try:
             snapshot = json.loads(payload)
             content = snapshot.get("forgeai.smoke.json")
             if not isinstance(content, str):
                 raise ValueError("缺少 forgeai.smoke.json")
-            parse_smoke_manifest(
+            manifest = parse_smoke_manifest(
                 content,
                 root=root.resolve(),
                 template_metadata=json.loads(snapshot.get("template.json", "{}")),
@@ -260,10 +261,16 @@ def run_check(root: Path, *, check_id: str, tool_call_id: str = "check") -> Tool
             return result
     started = time.monotonic()
     try:
+        timeout = max(10, min(settings.engineering_check_timeout_seconds, 300))
+        if check_id == "all":
+            assert manifest is not None
+            timeout = all_check_timeout_seconds(
+                manifest, settings.engineering_check_timeout_seconds
+            )
         code, output, truncated = _execute(
             docker_command(binary, settings.engineering_check_image, name, check_id),
             payload,
-            max(10, min(settings.engineering_check_timeout_seconds, 300)),
+            timeout,
         )
         result.ok = code == 0
         result.error_code = (
@@ -453,7 +460,12 @@ def capture_screenshots(
         if route == "/"
         else f"visual_{hashlib.sha256(route.encode('utf-8')).hexdigest()[:12]}"
     )
-    result.data = {"check_id": visual_check_id, "source_hash": digest, "route": route}
+    result.data = {
+        "check_id": visual_check_id,
+        "source_hash": digest,
+        "runtime_version": CHECK_RUNTIME_VERSION,
+        "route": route,
+    }
     try:
         code, output, truncated = _execute(
             visual_docker_command(binary, settings.engineering_check_image, name, route),

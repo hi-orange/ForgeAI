@@ -10,6 +10,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from sandbox.smoke_manifest import (
+    all_check_timeout_seconds,
+    browser_smoke_timeout_seconds,
+    validate_smoke_manifest,
+)
+
 CHECK_SCRIPT = Path(__file__).resolve().parents[1] / "sandbox" / "check.py"
 SPEC = importlib.util.spec_from_file_location("forgeai_sandbox_check", CHECK_SCRIPT)
 assert SPEC and SPEC.loader
@@ -18,6 +24,42 @@ SPEC.loader.exec_module(sandbox_check)
 
 
 class SmokeManifestTests(unittest.TestCase):
+    def test_browser_timeout_scales_with_manifest_and_remains_bounded(self) -> None:
+        self.assertEqual(browser_smoke_timeout_seconds({"browser_checks": [{"id": "one"}]}), 120)
+        checks = [
+            {
+                "id": f"case-{index}",
+                "actions": [{"type": "expect_no_horizontal_scroll"}] * (12 if index < 9 else 11),
+            }
+            for index in range(19)
+        ]
+        manifest = {"browser_checks": checks}
+        self.assertEqual(sum(len(check["actions"]) for check in checks), 218)
+        self.assertEqual(browser_smoke_timeout_seconds(manifest), 826)
+        self.assertEqual(all_check_timeout_seconds(manifest, 1200), 1006)
+        self.assertEqual(all_check_timeout_seconds(manifest, 300), 300)
+        saturated = {
+            "browser_checks": [{"id": f"case-{index}", "actions": [{}] * 8} for index in range(50)]
+        }
+        self.assertEqual(browser_smoke_timeout_seconds(saturated), 900)
+        self.assertEqual(all_check_timeout_seconds(saturated, 1200), 1080)
+
+    def test_browser_runner_uses_manifest_budget_and_preserves_rendered_checks(self) -> None:
+        manifest = self.baseline()
+        manifest["browser_checks"] = [
+            {**manifest["browser_checks"][0], "id": f"case-{index}"} for index in range(20)
+        ]
+        with TemporaryDirectory() as tmp:
+            rendered_path = Path(tmp) / "rendered.json"
+            with (
+                patch.object(sandbox_check, "Path", return_value=rendered_path),
+                patch.object(sandbox_check, "command") as command,
+            ):
+                sandbox_check.run_browser_smoke(manifest, {"item_id": 42}, "http://127.0.0.1:5173")
+            self.assertEqual(command.call_args.kwargs["timeout"], 485)
+            rendered = json.loads(rendered_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(rendered["browser_checks"]), 20)
+
     def test_materialize_restores_public_binary_image(self):
         image = b"\xff\xd8\xffgenerated"
         with (
@@ -140,6 +182,65 @@ class SmokeManifestTests(unittest.TestCase):
         self.assertEqual(sandbox_check._json_path(document, "[0].details.price"), 32)
         self.assertEqual(sandbox_check._json_path({"data": document}, "$.data[0].name"), "手冲咖啡")
         self.assertEqual(sandbox_check._json_path({"data": {"id": 7}}, "data.id"), 7)
+
+    def test_captured_login_token_reaches_later_authorization_header(self) -> None:
+        manifest = self.baseline()
+        manifest.pop("visual_contract")
+        manifest["api_checks"] = [
+            {
+                "id": "login",
+                "method": "POST",
+                "path": "/api/v1/auth/login",
+                "json": {"username": "seeker", "password": "password"},
+                "capture": {"seeker_token": "data.access_token"},
+            },
+            {
+                "id": "profile",
+                "path": "/api/v1/profile",
+                "headers": {"Authorization": "Bearer ${seeker_token}"},
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            validate_smoke_manifest(manifest, root=Path(tmp), template_metadata={})
+
+        class Response:
+            def __init__(self, body):
+                self.status = 200
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return self.body
+
+        requests = []
+
+        def respond(request, *, timeout):
+            requests.append(request)
+            assert timeout == 10
+            body = b'{"data":{"access_token":"real-token"}}' if len(requests) == 1 else b"{}"
+            return Response(body)
+
+        with patch.object(sandbox_check.urllib.request, "urlopen", side_effect=respond):
+            variables = sandbox_check.run_api_smoke(manifest, "http://127.0.0.1:8000")
+
+        self.assertEqual(variables["seeker_token"], "real-token")
+        self.assertEqual(requests[1].get_header("Authorization"), "Bearer real-token")
+
+    def test_api_check_rejects_unknown_auth_field_with_supported_flow(self) -> None:
+        manifest = self.baseline()
+        manifest.pop("visual_contract")
+        manifest["api_checks"][1]["auth"] = "seeker"
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as error:
+                validate_smoke_manifest(manifest, root=Path(tmp), template_metadata={})
+        message = str(error.exception)
+        for fragment in ("api_checks[read]", "auth", "capture", "headers", "${seeker_token}"):
+            self.assertIn(fragment, message)
 
     def test_rejects_external_api_and_browser_routes(self) -> None:
         manifest = self.baseline()

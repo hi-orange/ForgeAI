@@ -19,6 +19,7 @@ from app.services.qa_verification import (
     export_test_engineer_progress,
     restore_test_engineer_progress,
 )
+from app.tools.checks import CHECK_RUNTIME_VERSION
 from app.tools.test_engineer import execute_test_engineer_tool
 
 SOURCE_HASH = "a" * 64
@@ -67,6 +68,7 @@ def visual_result(tool_call_id: str = "visual") -> ToolExecutionResult:
         data={
             "check_id": "visual",
             "source_hash": SOURCE_HASH,
+            "runtime_version": CHECK_RUNTIME_VERSION,
             "route": "/",
             "screenshots": [
                 {"path": "forgeai/evidence/hash/desktop.png"},
@@ -112,6 +114,220 @@ def unit_progress():
 
 
 class TestEngineerTests(unittest.TestCase):
+    def test_post_execution_read_loop_stops_and_preserves_failure_evidence(self):
+        with TemporaryDirectory(prefix="forgeai-qa-read-stop-") as directory:
+            root = Path(directory)
+            (root / "a.txt").write_text("alpha\n", encoding="utf-8")
+            state = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=root,
+            )
+            add_unit_evidence(state, status="failed")
+            original_execution = state.executions[0]
+            saved = []
+
+            def model(**_kwargs):
+                turn = len(calls) + 1
+                calls.append(turn)
+                return ChatWithToolsResult(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"read_{turn}_{index}",
+                            name="read_file",
+                            arguments={"path": "a.txt"},
+                        )
+                        for index in range(2)
+                    ]
+                )
+
+            calls = []
+            with (
+                patch.object(test_engineer_agent, "chat_with_tools", side_effect=model),
+                patch.object(
+                    test_engineer_agent,
+                    "MAX_QA_READ_ONLY_TURNS_AFTER_EXECUTION",
+                    3,
+                ),
+                self.assertRaisesRegex(BusinessException, "连续 3 轮只读"),
+            ):
+                test_engineer_agent.verify_code(
+                    spec=valid_spec(),
+                    system_design=None,
+                    code_item_id="ci_code",
+                    code_source_hash=SOURCE_HASH,
+                    workspace_root=root,
+                    saved_progress=export_test_engineer_progress(state),
+                    on_progress=saved.append,
+                )
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(saved[-1]["tool_turns"], 3)
+            self.assertEqual(saved[-1]["last_qa_progress_turn"], 0)
+            self.assertEqual(saved[-1]["executions"], [original_execution])
+            restored = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=root,
+            )
+            restore_test_engineer_progress(restored, saved[-1])
+            self.assertEqual(restored.executions, [original_execution])
+
+    def test_post_execution_finite_reads_reset_after_real_check(self):
+        with TemporaryDirectory(prefix="forgeai-qa-read-progress-") as directory:
+            root = Path(directory)
+            (root / "a.txt").write_text("alpha\n", encoding="utf-8")
+            state = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=root,
+            )
+            add_unit_evidence(state, status="failed")
+            saved = []
+            calls = [
+                ToolCall(id="r1", name="read_file", arguments={"path": "a.txt"}),
+                ToolCall(id="r2", name="read_file", arguments={"path": "a.txt"}),
+                ToolCall(id="check", name="run_check", arguments={"check_id": "all"}),
+                ToolCall(id="r4", name="read_file", arguments={"path": "a.txt"}),
+                ToolCall(id="r5", name="read_file", arguments={"path": "a.txt"}),
+            ]
+            responses = [ChatWithToolsResult(tool_calls=[call]) for call in calls]
+            responses.append(RuntimeError("stop after finite inspection"))
+            with (
+                patch.object(test_engineer_agent, "chat_with_tools", side_effect=responses),
+                patch.object(
+                    test_engineer_agent,
+                    "MAX_QA_READ_ONLY_TURNS_AFTER_EXECUTION",
+                    3,
+                ),
+                patch(
+                    "app.tools.test_engineer.check_tools.run_check",
+                    return_value=ToolExecutionResult(
+                        tool_call_id="check",
+                        name="run_check",
+                        ok=True,
+                        summary="all 检查通过",
+                        data={
+                            "check_id": "all",
+                            "source_hash": SOURCE_HASH,
+                            "runtime_version": CHECK_RUNTIME_VERSION,
+                        },
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "stop after finite inspection"),
+            ):
+                test_engineer_agent.verify_code(
+                    spec=valid_spec(),
+                    system_design=None,
+                    code_item_id="ci_code",
+                    code_source_hash=SOURCE_HASH,
+                    workspace_root=root,
+                    saved_progress=export_test_engineer_progress(state),
+                    on_progress=saved.append,
+                )
+            self.assertEqual(saved[-1]["last_qa_progress_turn"], 3)
+            self.assertEqual(saved[-1]["tool_turns"], 6)
+            self.assertEqual(len(saved[-1]["executions"]), 1)
+
+    def test_recovery_starts_read_counter_at_current_turn_for_old_checkpoint(self):
+        with TemporaryDirectory(prefix="forgeai-qa-legacy-read-") as directory:
+            root = Path(directory)
+            state = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=root,
+                tool_turns=43,
+            )
+            add_unit_evidence(state, status="failed")
+            legacy = export_test_engineer_progress(state)
+            legacy.pop("last_qa_progress_turn")
+            restored = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=root,
+            )
+            restore_test_engineer_progress(restored, legacy)
+            self.assertEqual(restored.last_qa_progress_turn, 43)
+
+    def test_agent_batches_independent_reads_in_one_model_turn(self):
+        with TemporaryDirectory(prefix="forgeai-qa-batch-") as directory:
+            root = Path(directory)
+            (root / "a.txt").write_text("alpha\n", encoding="utf-8")
+            (root / "b.txt").write_text("beta\n", encoding="utf-8")
+            calls = []
+            progress = []
+
+            def model(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return ChatWithToolsResult(
+                        tool_calls=[
+                            ToolCall(id="read_a", name="read_file", arguments={"path": "a.txt"}),
+                            ToolCall(id="read_b", name="read_file", arguments={"path": "b.txt"}),
+                        ]
+                    )
+                raise RuntimeError("stop after batch")
+
+            with (
+                patch.object(test_engineer_agent, "chat_with_tools", side_effect=model),
+                self.assertRaisesRegex(RuntimeError, "stop after batch"),
+            ):
+                test_engineer_agent.verify_code(
+                    spec=valid_spec(),
+                    system_design=None,
+                    code_item_id="ci_code",
+                    code_source_hash=SOURCE_HASH,
+                    workspace_root=root,
+                    on_progress=progress.append,
+                )
+        self.assertEqual(progress[-1]["tool_turns"], 2)
+        self.assertTrue(calls[0]["parallel_tool_calls"])
+        read_results = [row for row in calls[1]["messages"] if row["role"] == "tool"]
+        self.assertEqual([row["tool_call_id"] for row in read_results], ["read_a", "read_b"])
+
+    def test_pre_suite_reading_gets_design_guidance_without_blocking_read(self):
+        with TemporaryDirectory(prefix="forgeai-qa-guidance-") as directory:
+            root = Path(directory)
+            (root / "a.txt").write_text("alpha\n", encoding="utf-8")
+            state = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=root,
+                tool_turns=12,
+            )
+            calls = []
+
+            def model(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return ChatWithToolsResult(
+                        tool_calls=[
+                            ToolCall(id="read", name="read_file", arguments={"path": "a.txt"})
+                        ]
+                    )
+                raise RuntimeError("stop after guidance")
+
+            with (
+                patch.object(test_engineer_agent, "chat_with_tools", side_effect=model),
+                self.assertRaisesRegex(RuntimeError, "stop after guidance"),
+            ):
+                test_engineer_agent.verify_code(
+                    spec=valid_spec(),
+                    system_design=None,
+                    code_item_id="ci_code",
+                    code_source_hash=SOURCE_HASH,
+                    workspace_root=root,
+                    saved_progress=export_test_engineer_progress(state),
+                )
+        self.assertIn("design_test_cases", calls[0]["messages"][-1]["content"])
+        self.assertIn("design_test_cases", calls[1]["messages"][-1]["content"])
+
     def test_role_is_independent_and_has_no_code_write_tool(self):
         profile = get_role_profile(TaskRecipient.TEST_ENGINEER)
         self.assertIn("独立验证", profile.goal)
@@ -123,6 +339,7 @@ class TestEngineerTests(unittest.TestCase):
                 {
                     "design_test_cases",
                     "write_test_script",
+                    "adapt_test_script",
                     "run_acceptance_tests",
                     "read_artifact",
                     "list_files",
@@ -131,6 +348,7 @@ class TestEngineerTests(unittest.TestCase):
                     "run_check",
                     "capture_screenshots",
                     "record_defect",
+                    "resolve_defect",
                     "write_test_report",
                 }
             ),
@@ -424,7 +642,11 @@ class TestEngineerTests(unittest.TestCase):
                 name="run_check",
                 ok=True,
                 summary="all 检查通过",
-                data={"check_id": "all", "source_hash": SOURCE_HASH},
+                data={
+                    "check_id": "all",
+                    "source_hash": SOURCE_HASH,
+                    "runtime_version": CHECK_RUNTIME_VERSION,
+                },
             )
             previous.checks["visual"] = visual_result("old_visual")
             progress = export_test_engineer_progress(previous)
@@ -457,6 +679,37 @@ class TestEngineerTests(unittest.TestCase):
         self.assertIn("复用", captured.summary)
         run.assert_not_called()
         capture.assert_not_called()
+
+    def test_recovery_drops_checks_from_previous_runtime(self):
+        with TemporaryDirectory(prefix="forgeai-test-engineer-runtime-") as directory:
+            previous = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=Path(directory),
+            )
+            previous.checks["all"] = ToolExecutionResult(
+                tool_call_id="old_all",
+                name="run_check",
+                ok=True,
+                summary="旧运行器检查通过",
+                data={
+                    "check_id": "all",
+                    "source_hash": SOURCE_HASH,
+                    "runtime_version": "21",
+                },
+            )
+            previous.checks["visual"] = visual_result().model_copy(
+                update={"data": {**visual_result().data, "runtime_version": "21"}}
+            )
+            restored = EngineerToolState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash=SOURCE_HASH,
+                workspace_root=Path(directory),
+            )
+            restore_test_engineer_progress(restored, export_test_engineer_progress(previous))
+        self.assertEqual(restored.checks, {})
 
     def test_recovery_rejects_other_source_and_transient_check_results(self):
         with TemporaryDirectory(prefix="forgeai-test-engineer-stale-") as directory:

@@ -23,6 +23,7 @@ from app.core.settings import settings
 from app.generation.delivery import (
     PlannedWorkItem,
     WorkItem,
+    migrate_implementation_repair_plan,
     plan_quality_repair,
     planning_item,
     replace_delivery_plan,
@@ -62,10 +63,18 @@ from app.generation.engineering.diagnostics import (
     record_feedback,
     resolve_protocol_diagnostic,
 )
+from app.generation.engineering.smoke_guard import (
+    guard_passing_smoke_check,
+    hydrate_legacy_failed_api_probes,
+    record_failed_api_probes,
+)
 from app.generation.engineering.work_memory import (
+    READ_TOOLS,
     implementation_stalled,
+    inspection_action_required,
     progress_guidance,
     record_progress,
+    suppress_redundant_read,
     working_context,
 )
 from app.generation.engineering.work_memory import record_result as record_work_result
@@ -88,6 +97,57 @@ from app.tools.code_engineer import MUTATING_TOOLS, rejected_tool, validate_tool
 MAX_PLAN_HISTORY = 24
 
 SessionFactory = Callable[[], Session]
+
+
+def _pending_protocol_retry(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep a malformed action pending across intervening read-only decisions."""
+    for row in reversed(checkpoint.get("observations", [])[-16:]):
+        if row.get("name") in READ_TOOLS:
+            continue
+        if row.get("name") != "model_response" or row.get("error_code") != "TOOL_REJECTED":
+            return None
+        data = row.get("data") or {}
+        metadata = data.get("protocol_metadata") or {}
+        rejected = metadata.get("rejected_tool_call")
+        if isinstance(rejected, dict) and rejected.get("name") in READ_TOOLS:
+            # A call to a temporarily unavailable read tool did not repair
+            # the malformed action or produce new source evidence.
+            continue
+        if metadata.get("protocol_issue") == "invalid_tool_arguments":
+            tool_name = metadata.get("tool_name")
+            if tool_name in READ_TOOLS:
+                return None
+            return {"tool_name": tool_name, "model_turn": row.get("model_turn")}
+        # Existing checkpoints only retained the protocol message. They can
+        # still recover from this specific failure without rewriting history.
+        if row.get("summary") == "工具参数不是合法 JSON":
+            return {"tool_name": None, "model_turn": row.get("model_turn")}
+        return None
+    return None
+
+
+def _unchanged_failed_checks(checkpoint: dict[str, Any], root: Path) -> dict[str, Any] | None:
+    """Require a repair action before rerunning a failed check on identical source."""
+    cache = checkpoint.get("check_cache") or {}
+    failed = {
+        check_id: row
+        for check_id, row in cache.items()
+        if isinstance(row, dict)
+        and row.get("ok") is False
+        and row.get("error_code") in {"CHECK_FAILED", "SMOKE_PROBE_WEAKENED", "API_CLIENT_STALE"}
+        and row.get("data", {}).get("runtime_version") == check_tools.CHECK_RUNTIME_VERSION
+        and isinstance(row.get("data", {}).get("source_hash"), str)
+    }
+    if not failed:
+        return None
+    try:
+        _, source_hash = check_tools.source_snapshot(root)
+    except BusinessException:
+        return None
+    matching = sorted(
+        check_id for check_id, row in failed.items() if row["data"]["source_hash"] == source_hash
+    )
+    return {"check_ids": matching, "source_hash": source_hash} if matching else None
 
 
 class _WorkflowInputState(TypedDict):
@@ -280,6 +340,23 @@ class _EngineeringNodes:
                 if isinstance(report_payload, dict)
                 else None
             )
+            repair_payload = snapshot.get("implementation_repair_request")
+            repair_request = (
+                repair_payload.get("content") if isinstance(repair_payload, dict) else None
+            )
+            if repair_payload is not None and (
+                not isinstance(repair_request, str) or not repair_request.strip()
+            ):
+                raise ConflictException("冻结实现修复请求正文无效")
+            if quality_report is None and isinstance(repair_payload, dict):
+                if migrate_implementation_repair_plan(checkpoint, repair_payload):
+                    append_activity(
+                        checkpoint,
+                        name="scope_repair_plan",
+                        label="Scope repair plan",
+                        detail="保留已完成工作，将未实施的旧全功能计划改为本次冻结缺陷的限域计划",
+                        ok=True,
+                    )
             if quality_report is not None:
                 checkpoint["diagnostic_state"].setdefault(
                     "acceptance",
@@ -295,9 +372,10 @@ class _EngineeringNodes:
                 )
             # Old feature lists remain evidence, not a runnable fallback plan.
             # Never overwrite an accepted engineering graph when resuming.
-            checkpoint["needs_delivery_plan"] = (
-                quality_report is None and checkpoint.get("delivery_plan_version") != 1
-            )
+            if quality_report is not None:
+                checkpoint["needs_delivery_plan"] = False
+            elif repair_request is None:
+                checkpoint["needs_delivery_plan"] = checkpoint.get("delivery_plan_version") != 1
             current = current_item(checkpoint["work_items"])
             checkpoint["current_work_item_id"] = (
                 None if checkpoint["needs_delivery_plan"] else current["id"] if current else None
@@ -326,6 +404,8 @@ class _EngineeringNodes:
         if isinstance(loaded, dict):
             return cast(_WorkflowUpdate, loaded)
         snapshot, checkpoint, spec, system_design, work_item, root = loaded
+        protocol_retry = _pending_protocol_retry(checkpoint)
+        failed_check_repair = _unchanged_failed_checks(checkpoint, root)
         tools = [
             tool
             for tool in CODE_ENGINEER_TOOLS
@@ -354,6 +434,10 @@ class _EngineeringNodes:
             tools = [
                 tool for tool in tools if tool.name in {"update_delivery_plan", "report_blocked"}
             ]
+        if inspection_action_required(checkpoint) or protocol_retry:
+            tools = [tool for tool in tools if tool.name not in READ_TOOLS]
+        if failed_check_repair:
+            tools = [tool for tool in tools if tool.name not in {"run_check", "complete_work_item"}]
         available = sorted(tool.name for tool in tools)
         reconcile_protocol_diagnostic(checkpoint, available)
         memory = working_context(checkpoint, root)
@@ -387,9 +471,25 @@ class _EngineeringNodes:
                     "initial_source_context": initial_source_context(
                         checkpoint, root, source_evidence=memory["source_evidence"]
                     ),
-                    "suggested_delivery_plan": suggested_delivery_plan(spec, system_design)
+                    "suggested_delivery_plan": suggested_delivery_plan(
+                        spec,
+                        system_design,
+                        repair_request=(
+                            snapshot["implementation_repair_request"]["content"]
+                            if isinstance(snapshot.get("implementation_repair_request"), dict)
+                            else None
+                        ),
+                        completed=[
+                            item
+                            for item in checkpoint["work_items"]
+                            if item.get("status") == "completed"
+                        ],
+                    )
                     if checkpoint.get("needs_delivery_plan")
-                    and not checkpoint["work_items"]
+                    and (
+                        not checkpoint["work_items"]
+                        or isinstance(snapshot.get("implementation_repair_request"), dict)
+                    )
                     and snapshot.get("quality_report") is None
                     else None,
                     "observed_files": checkpoint.get("observed_hashes", {}),
@@ -400,11 +500,6 @@ class _EngineeringNodes:
                     "optional_capabilities": snapshot.get("optional_capabilities", []),
                     "workspace_file_index": checkpoint.get("workspace_file_index"),
                     "modified_files": checkpoint.get("modified_files", []),
-                    "completed_work_items": [
-                        item
-                        for item in checkpoint["work_items"]
-                        if item.get("status") == "completed"
-                    ],
                     "repair_context": checkpoint.get("repair_context"),
                     "api_client_contract": checkpoint.get("api_client_contract"),
                     "pending_integration": checkpoint.get("pending_integration", True),
@@ -412,7 +507,10 @@ class _EngineeringNodes:
                     "planning_repair": planning_repair_context(checkpoint),
                     "check_verification": check_verification(checkpoint),
                     "progress_guidance": progress_guidance(checkpoint),
+                    "protocol_retry": protocol_retry,
+                    "failed_check_repair": failed_check_repair,
                     "quality_report": snapshot.get("quality_report"),
+                    "implementation_repair_request": snapshot.get("implementation_repair_request"),
                     "acceptance_test_plan": snapshot.get("acceptance_test_plan"),
                     "acceptance_test_hash": snapshot.get("acceptance_test_hash"),
                     "smoke_contract": check_tools.load_smoke_contract(),
@@ -427,9 +525,33 @@ class _EngineeringNodes:
                 ],
             )
             allowed = {tool.name for tool in tools}
-            if any(call.name not in allowed for call in decision.tool_calls):
-                raise ModelProtocolException(f"当前阶段不开放该工具；当前可用：{sorted(allowed)}")
+            invalid = next((call for call in decision.tool_calls if call.name not in allowed), None)
+            if invalid is not None:
+                raise ModelProtocolException(
+                    f"当前阶段不开放 {invalid.name}；当前可用：{sorted(allowed)}",
+                    data={"rejected_tool_call": invalid.model_dump(mode="json")},
+                )
         except ModelProtocolException as exc:
+            attempted = exc.data.get("rejected_tool_call") if isinstance(exc.data, dict) else None
+            if inspection_action_required(checkpoint) and isinstance(attempted, dict):
+                try:
+                    rejected = ToolCall.model_validate(attempted)
+                except ValueError:
+                    rejected = None
+                if rejected is not None and rejected.name in READ_TOOLS:
+                    result = ToolExecutionResult(
+                        tool_call_id=rejected.id,
+                        name=rejected.name,
+                        ok=False,
+                        error_code="INSPECTION_ACTION_REQUIRED",
+                        summary=(
+                            f"{rejected.name} 本轮未执行：当前工作项的只读决策窗口已用完。"
+                            "请基于已有证据实现、验证、有效重规划，或说明缺失的具体源码后阻断。"
+                        ),
+                        arguments=rejected.arguments,
+                        data={"available_tools": available},
+                    )
+                    return self._record_action(state, rejected, PreparedAction(result), root)
             call = ToolCall(
                 id=f"protocol_{checkpoint.get('model_turns', 0)}", name="model_response"
             )
@@ -543,7 +665,9 @@ class _EngineeringNodes:
                 capability_snapshot=snapshot.get("optional_capabilities"),
             )
         else:
-            action = prepare_action(call, root, checkpoint.get("observed_hashes", {}))
+            action = prepare_action(
+                call, root, checkpoint.get("observed_hashes", {}), checkpoint=checkpoint
+            )
         return self._record_action(state, call, action, root)
 
     def _record_action(
@@ -556,6 +680,7 @@ class _EngineeringNodes:
         with self._session_factory() as db:
             execution, snapshot, current = _locked_current(db, state)
             result = commit_action(action, root, revision_id=execution.execution_id)
+            result = suppress_redundant_read(current, root, result)
             result = result.model_copy(update={"model_turn": current["model_turns"]})
             progressed = False
             if call.name == "update_delivery_plan" and result.ok:
@@ -576,11 +701,27 @@ class _EngineeringNodes:
                         else None
                     )
                     if call.arguments.get("suggested_plan_hash") is not None:
-                        if current["work_items"] or not current.get("needs_delivery_plan"):
+                        if not current.get("needs_delivery_plan") or any(
+                            item.get("status") != "completed" for item in current["work_items"]
+                        ):
                             raise ConflictException(
                                 "初始建议仅可用于空计划；重规划请提交完整 items"
                             )
-                        proposal = suggested_delivery_plan(spec, design)
+                        repair_payload = snapshot.get("implementation_repair_request")
+                        proposal = suggested_delivery_plan(
+                            spec,
+                            design,
+                            repair_request=(
+                                repair_payload["content"]
+                                if isinstance(repair_payload, dict)
+                                else None
+                            ),
+                            completed=[
+                                item
+                                for item in current["work_items"]
+                                if item.get("status") == "completed"
+                            ],
+                        )
                         if call.arguments["suggested_plan_hash"] != proposal["content_hash"]:
                             raise ConflictException(
                                 "建议计划版本已变化，请核对当前完整建议后重新提交"
@@ -593,6 +734,11 @@ class _EngineeringNodes:
                         [PlannedWorkItem.model_validate(row) for row in proposed],
                         current["work_items"],
                         design,
+                        repair_request=(
+                            snapshot["implementation_repair_request"]["content"]
+                            if isinstance(snapshot.get("implementation_repair_request"), dict)
+                            else None
+                        ),
                     )
                     if revised == current["work_items"] and not current.get("needs_delivery_plan"):
                         raise ConflictException("计划没有变化，请执行已就绪任务")
@@ -619,7 +765,7 @@ class _EngineeringNodes:
                     result = rejected_tool(call, exc)
             if call.name == "run_check":
                 result = self._remember_check(
-                    current, str(call.arguments.get("check_id", "unknown")), result
+                    current, str(call.arguments.get("check_id", "unknown")), result, root=root
                 )
             else:
                 result = record_feedback(current, result)
@@ -711,9 +857,18 @@ class _EngineeringNodes:
 
     @staticmethod
     def _remember_check(
-        checkpoint: dict[str, Any], check_id: str, result: ToolExecutionResult
+        checkpoint: dict[str, Any],
+        check_id: str,
+        result: ToolExecutionResult,
+        *,
+        root: Path | None = None,
     ) -> ToolExecutionResult:
+        if root is not None:
+            hydrate_legacy_failed_api_probes(checkpoint)
+            result = guard_passing_smoke_check(checkpoint, result, root / "forgeai.smoke.json")
         result = record_feedback(checkpoint, result, check_id=check_id)
+        if root is not None:
+            record_failed_api_probes(checkpoint, result, root / "forgeai.smoke.json")
         if result.error_code in {
             "CHECK_ENVIRONMENT_UNAVAILABLE",
             "CHECK_TIMEOUT",
@@ -785,10 +940,14 @@ class _EngineeringNodes:
             and cached.get("data", {}).get("source_hash") == source_hash
             and cached.get("data", {}).get("runtime_version") == check_tools.CHECK_RUNTIME_VERSION
         ):
+            summary = str(cached.get("summary") or "")
+            prefix = "复用同版本检查证据："
+            while summary.startswith(prefix):
+                summary = summary[len(prefix) :]
             return ToolExecutionResult.model_validate(cached).model_copy(
                 update={
                     "tool_call_id": tool_call_id,
-                    "summary": f"复用同版本检查证据：{cached['summary']}",
+                    "summary": f"{prefix}{summary}",
                     "data": {
                         **cached["data"],
                         "cache_hit": True,
@@ -842,7 +1001,13 @@ class _EngineeringNodes:
             )
             current = current_item(checkpoint.get("work_items") or [])
             if checkpoint.get("needs_delivery_plan"):
-                current = planning_item(spec).model_dump(mode="json")
+                repair_payload = snapshot.get("implementation_repair_request")
+                current = planning_item(
+                    spec,
+                    repair_request=(
+                        repair_payload["content"] if isinstance(repair_payload, dict) else None
+                    ),
+                ).model_dump(mode="json")
             if current is None:
                 block_checkpoint(
                     checkpoint,
@@ -959,7 +1124,7 @@ class _EngineeringNodes:
 
         with self._session_factory() as db:
             execution, current_snapshot, current = _locked_current(db, state)
-            result = self._remember_check(current, check_id, result)
+            result = self._remember_check(current, check_id, result, root=root)
             current["tool_calls"] = int(current.get("tool_calls") or 0) + 1
             if result.ok and check_id == "all":
                 current["integration_baseline"] = {

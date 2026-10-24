@@ -629,7 +629,7 @@ def run_browser_smoke(manifest, variables, base_url):
     command(
         ["node", "/opt/forgeai/probe.mjs", base_url, str(rendered_path)],
         ROOT / "frontend",
-        timeout=_smoke.SMOKE_CONTRACT["limits"]["browser_timeout_seconds"],
+        timeout=_smoke.browser_smoke_timeout_seconds(rendered),
     )
 
 

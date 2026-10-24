@@ -78,6 +78,12 @@ def feedback(result: ToolExecutionResult, *, check_id: str | None = None) -> Too
         elif code in {"SOURCE_CHANGED", "WRITE_CONFLICT"}:
             diagnostic.disposition = "refresh_evidence"
             diagnostic.verification = "重新读取当前源码与 hash，再修改或执行原检查。"
+        elif code == "INSPECTION_ACTION_REQUIRED":
+            diagnostic.disposition = "needs_decision"
+            diagnostic.verification = (
+                "读取未执行；依据当前 available_tools 实现、验证、有效重规划，"
+                "或用 report_blocked 说明缺少的具体源码。"
+            )
         if analysis:
             diagnostic.fingerprint = analysis.fingerprint
         if is_check:

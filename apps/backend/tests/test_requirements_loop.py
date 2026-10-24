@@ -50,6 +50,7 @@ from app.schemas.requirements import (
 from app.services import leader, product_manager, task, task_execution
 from app.services.app_spec import approve_requirements
 from app.services.requirements import (
+    continue_engineering,
     continue_requirements,
     get_requirements_status,
     pause_active_execution,
@@ -302,6 +303,49 @@ class RequirementsLoopTests(ProductManagerWorkflowFixture):
 
         self.assertIs(result, running)
         get_task.assert_not_called()
+
+    def test_quality_continuation_grants_budget_only_for_exact_exhaustion(self):
+        from app.agents.test_engineer import TEST_ENGINEER_BUDGET_EXHAUSTED
+
+        task = SimpleNamespace(recipient="Test Engineer", task_id="task_quality")
+        for error, grants_budget in (
+            (TEST_ENGINEER_BUDGET_EXHAUSTED, True),
+            ("QA 上下文超限，可恢复", False),
+        ):
+            with self.subTest(error=error):
+                paused = RequirementsStatus(
+                    project_id=self.project.id,
+                    run_id=self.run.run_id,
+                    state="retry_available",
+                    task_id=task.task_id,
+                    execution_id="exec_quality_failed",
+                    error=error,
+                )
+                resumed = RequirementsStatus(
+                    project_id=self.project.id,
+                    run_id=self.run.run_id,
+                    state="quality_running",
+                    task_id=task.task_id,
+                    execution_id="exec_quality_next",
+                )
+                with (
+                    self.session_factory() as db,
+                    patch(
+                        "app.services.requirements.get_requirements_status",
+                        side_effect=[paused, resumed],
+                    ),
+                    patch(
+                        "app.services.requirements.task_service.get_user_task",
+                        return_value=task,
+                    ),
+                    patch("app.services.requirements.run_test_engineer_task") as run_quality,
+                ):
+                    result = continue_engineering(db, self.owner, self.project.id, self.run.run_id)
+                self.assertIs(result, resumed)
+                self.assertEqual(
+                    run_quality.call_args.kwargs["manual_budget_extension"], grants_budget
+                )
+                self.assertTrue(run_quality.call_args.kwargs["allow_execution_budget_extension"])
 
     def test_quality_infrastructure_block_can_retry_same_code_in_qa(self):
         blocked = RequirementsStatus(

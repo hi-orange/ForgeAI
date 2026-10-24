@@ -48,6 +48,11 @@ class EngineeringCheckTests(unittest.TestCase):
 
     def test_smoke_contract_is_the_authoritative_action_protocol(self):
         contract = load_smoke_contract()
+        login, protected = contract["api"]["authenticated_example"]
+        self.assertIn("headers", contract["api"]["fields"])
+        self.assertIn("capture", contract["api"]["fields"])
+        self.assertEqual(login["capture"], {"seeker_token": "data.access_token"})
+        self.assertEqual(protected["headers"], {"Authorization": "Bearer ${seeker_token}"})
         browser = contract["browser"]
         self.assertIn("navigate", browser["actions"])
         self.assertEqual(browser["actions"]["expect_count"]["fields"]["count"]["type"], "integer")
@@ -225,6 +230,22 @@ class EngineeringCheckTests(unittest.TestCase):
         self.assertEqual(result.data["source_hash"], source_snapshot(self.root)[1])
         self.assertEqual(cleanup.call_args.args[0][0:3], ["docker", "rm", "-f"])
         self.assertTrue(cleanup.call_args.args[0][-1].startswith("forgeai-check-"))
+
+    def test_all_check_outer_timeout_allows_scaled_browser_manifest(self):
+        manifest_path = self.root / "forgeai.smoke.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        baseline = manifest["browser_checks"][0]
+        manifest["browser_checks"] = [{**baseline, "id": f"browser-{index}"} for index in range(20)]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with (
+            patch("app.tools.checks.shutil.which", return_value="docker"),
+            patch("app.tools.checks.settings.engineering_check_timeout_seconds", 1200),
+            patch("app.tools.checks._execute", return_value=(0, "passed", False)) as execute,
+            patch("app.tools.checks.subprocess.run"),
+        ):
+            result = run_check(self.root, check_id="all")
+        self.assertTrue(result.ok)
+        self.assertEqual(execute.call_args.args[2], 665)
 
     def test_security_failure_has_distinct_error_code(self):
         with (

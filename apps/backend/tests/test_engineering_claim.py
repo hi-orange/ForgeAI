@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 from sqlalchemy import select, update
@@ -15,6 +16,7 @@ from test_product_manager_workflow import (
 
 from app.core.exceptions import BusinessException, ConflictException
 from app.generation import DEFAULT_TEMPLATE_VERSION
+from app.generation.engineering.checkpoint import EXECUTION_MODE
 from app.models.build_run import BuildRun
 from app.models.configuration_item import ConfigurationItem
 from app.models.plan import Plan
@@ -24,7 +26,7 @@ from app.models.task_result import TaskResult
 from app.schemas.app_spec import AppSpec
 from app.schemas.requirements import RequirementsApproval
 from app.schemas.system_design import SystemDesign
-from app.services import architect, leader, product_manager
+from app.services import architect, leader, product_manager, run_revision
 from app.services import task as task_service
 from app.services.app_spec import approve_requirements
 from app.services.engineering import (
@@ -152,6 +154,7 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         self.assertEqual(snapshot["template_version"], DEFAULT_TEMPLATE_VERSION)
         self.assertEqual(snapshot["tool_strategy_version"], TOOL_STRATEGY_VERSION)
         self.assertEqual(snapshot["base_revision_id"], None)
+        self.assertIsNone(snapshot["implementation_repair_request"])
         self.assertEqual(snapshot["workspace_key"], self.run.run_id)
         self.assertEqual(
             snapshot["approved_spec_digest"],
@@ -242,6 +245,102 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         _, replay = self._claim(delivery.task_id)
         self.assertEqual(read_frozen_input_snapshot(replay), frozen)
         self.assertEqual(frozen["approved_item_id"], published.item_id)
+
+    def test_terminal_implementation_repair_freezes_its_user_message(self):
+        published = self._publish_only()
+        request_text = "修复其他账号能看到我的私有阅读记录；保持已批准的读书功能。"
+        with self.session_factory() as db:
+            source_run = db.get(BuildRun, self.run.id)
+            source_run.status = "failed"
+            source_run.active_slot = None
+            db.add(
+                ConfigurationItem(
+                    item_id="ci_repair_baseline_code",
+                    project_id=self.project.id,
+                    producer_run_id=self.run.run_id,
+                    semantic_type="code",
+                    version=1,
+                    schema_version=1,
+                    payload={"source_hash": "a" * 64},
+                    content_hash="b" * 64,
+                    upstream_item_ids=[published.item_id],
+                    state="usable",
+                )
+            )
+            message = ProjectMessage(
+                project_id=self.project.id,
+                sequence=99,
+                sender="user",
+                content=request_text,
+                client_message_id="repair-private-records",
+            )
+            db.add(message)
+            db.commit()
+            revision_run = run_revision.create_revision_run(
+                db,
+                self.owner,
+                self.project.id,
+                source_run_id=self.run.run_id,
+                cause_message_id=message.id,
+                kind="implementation_repair",
+            )
+            with (
+                patch.object(
+                    leader, "ensure_code_workspace", return_value=(Path(self.workspace_root), False)
+                ),
+                patch.object(leader, "prepare_engineering_workspace"),
+            ):
+                delivery = leader.create_engineering_delivery_task(
+                    db,
+                    self.owner,
+                    self.project.id,
+                    revision_run.run_id,
+                    published.item_id,
+                    allow_direct=True,
+                )
+            _, execution = claim_code_engineer_task(
+                db,
+                self.owner,
+                self.project.id,
+                revision_run.run_id,
+                delivery.task_id,
+            )
+            frozen = read_frozen_input_snapshot(execution)
+            assert frozen is not None
+            revision = run_revision.get_revision_for_target(
+                db, self.project.id, revision_run.run_id
+            )
+            assert revision is not None
+            self.assertEqual(
+                frozen["implementation_repair_request"],
+                {
+                    "revision_id": revision.revision_id,
+                    "source_run_id": self.run.run_id,
+                    "baseline_code_item_id": "ci_repair_baseline_code",
+                    "message_id": message.id,
+                    "content": request_text,
+                },
+            )
+            self.assertEqual(frozen["approved_item_id"], published.item_id)
+            db.add(
+                ProjectMessage(
+                    project_id=self.project.id,
+                    sequence=100,
+                    sender="user",
+                    content="再加一个未获批的新功能",
+                    client_message_id="later-unapproved-feature",
+                )
+            )
+            db.commit()
+            _, replay = claim_code_engineer_task(
+                db,
+                self.owner,
+                self.project.id,
+                revision_run.run_id,
+                delivery.task_id,
+            )
+            self.assertEqual(replay.execution_id, execution.execution_id)
+            self.assertEqual(read_frozen_input_snapshot(replay), frozen)
 
     def test_status_refresh_does_not_create_another_execution(self):
         published = self._publish_only()
@@ -387,3 +486,39 @@ class EngineeringClaimTests(ProductManagerWorkflowFixture):
         self.assertEqual(progress.state, "retry_available")
         self.assertIn("预算", progress.error or "")
         self.assertEqual(progress.execution_id, execution.execution_id)
+
+    def test_budget_cited_block_is_manual_retry_but_real_blocker_is_not(self):
+        published = self._publish_only()
+        delivery = self._assign(published.item_id)
+        _, execution = self._claim(delivery.task_id)
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, execution.execution_id)
+            snapshot = dict(row.draft)
+            snapshot["call_budget"]["max_model_turns"] = 96
+            snapshot["checkpoint"] = {
+                "kind": "engineering_checkpoint",
+                "schema_version": 17,
+                "work_items": [],
+                "activity": [],
+                "outcome": "blocked",
+                "blocked_reason": "剩余模型轮次仅 1 次，当前工作项尚未完成",
+                "blocked_executor_runtime_version": EXECUTION_MODE,
+                "model_turns": 95,
+                "tool_calls": 101,
+            }
+            row.draft = snapshot
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(row, "draft")
+            db.commit()
+
+        progress = self._status()
+        self.assertEqual(progress.state, "retry_available")
+        self.assertFalse(progress.retryable)
+
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, execution.execution_id)
+            row.draft["checkpoint"]["blocked_reason"] = "缺少已批准的 API 契约"
+            flag_modified(row, "draft")
+            db.commit()
+        self.assertTrue(self._status().retryable)

@@ -12,6 +12,7 @@ from app.agents.roles import get_role_profile
 from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_with_tools
+from app.core.settings import settings
 from app.models.task import TaskRecipient
 from app.schemas.agent_action import ToolExecutionResult
 from app.schemas.app_spec import AppSpec
@@ -78,7 +79,8 @@ def generate_system_design(
         role_name="Architect",
         max_turns=MAX_ARCHITECT_TOOL_TURNS,
         temperature=0.1,
-        max_tokens=8192,
+        max_tokens=16384 if settings.architect_thinking else 8192,
+        thinking=settings.architect_thinking,
         missing_message="Architect 未调用工具提交系统设计",
         exhausted_message="Architect 工具调用预算已用尽，尚未提交系统设计",
         execute_tool=lambda call: execute_architect_tool(call, state),

@@ -6,9 +6,36 @@
     "browser_checks": 50,
     "actions_per_check": 80,
     "total_browser_actions": 400,
-    "browser_timeout_seconds": 120
+    "browser_timeout_seconds": 120,
+    "browser_timeout_per_additional_check_seconds": 15,
+    "browser_timeout_per_action_seconds": 2,
+    "browser_timeout_max_seconds": 900,
+    "browser_setup_timeout_seconds": 180,
+    "all_timeout_max_seconds": 1200
   },
   "top_level_fields": ["version", "visual_contract", "api_checks", "browser_checks"],
+  "api": {
+    "fields": ["id", "method", "path", "json", "expect_status", "expect_json_paths", "capture", "headers"],
+    "defaults": { "method": "GET", "expect_status": 200 },
+    "capture": "Map a variable name to a JSON response path. Checks run in list order, and captured variables are available to later checks.",
+    "variables": "Use ${name} in later API path, json body, or headers; the same captured variables are available to browser checks. A variable must first be captured by an earlier API check.",
+    "authenticated_example": [
+      {
+        "id": "login",
+        "method": "POST",
+        "path": "/api/v1/auth/login",
+        "json": { "username": "seeker", "password": "example-password" },
+        "expect_status": 200,
+        "capture": { "seeker_token": "data.access_token" }
+      },
+      {
+        "id": "read-profile",
+        "path": "/api/v1/profile",
+        "headers": { "Authorization": "Bearer ${seeker_token}" },
+        "expect_status": 200
+      }
+    ]
+  },
   "browser": {
     "kinds": ["integration", "ui"],
     "default_kind": "integration",

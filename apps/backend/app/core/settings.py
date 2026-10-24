@@ -31,7 +31,11 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
+    leader_thinking: bool = False
+    product_manager_thinking: bool = False
+    architect_thinking: bool = False
     code_engineer_thinking: bool = False
+    test_engineer_thinking: bool = False
 
     # Optional Volcengine Ark / Seedream image generation. The capability stays
     # disabled until a dedicated key is configured; it never reuses the chat key.
@@ -54,7 +58,7 @@ class Settings(BaseSettings):
 
     # Disposable Linux check containers for generated fullstack-react-v1 apps.
     engineering_check_image: str = "forgeai-checks:fullstack-react-v1"
-    engineering_check_timeout_seconds: int = 300
+    engineering_check_timeout_seconds: int = 1200
     security_scanner_version: str = "forgeai-security-v1"
 
     # Local loopback preview of a completed generated app (not a multi-tenant gateway).

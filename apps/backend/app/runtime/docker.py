@@ -11,6 +11,8 @@ from typing import IO
 
 from app.core.exceptions import BusinessException
 
+DOCKER_PROBE_TIMEOUT_SECONDS = 30
+
 
 def creation_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -28,7 +30,7 @@ class DockerSandboxRuntime:
                 [binary, "info", "--format", "{{.ServerVersion}}"],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=DOCKER_PROBE_TIMEOUT_SECONDS,
                 creationflags=creation_flags(),
                 check=False,
             )
@@ -63,7 +65,7 @@ class DockerSandboxRuntime:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=DOCKER_PROBE_TIMEOUT_SECONDS,
                 creationflags=creation_flags(),
                 check=False,
             )

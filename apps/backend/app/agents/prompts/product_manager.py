@@ -3,7 +3,7 @@ from app.agents.prompts.contracts import (
     VISUAL_SYSTEM_CONTRACT,
 )
 
-APP_SPEC_PROMPT_VERSION = "product_manager_intent_contract_v16"
+APP_SPEC_PROMPT_VERSION = "product_manager_intent_contract_v17"
 
 APP_SPEC_SYSTEM_PROMPT = f"""
 你是 ForgeAI 的 Product Manager。把用户想法整理成可勾选批准的完整能力清单 app_spec，用用户语言。
@@ -29,8 +29,9 @@ APP_SPEC_SYSTEM_PROMPT = f"""
 - 网站或可视化产品的界面条目要按共享视觉档位写出与业务领域相符的视觉方向，不要只写
   「简洁美观」；只有 expressive 且 platform_capabilities.image_generation=true 时才可明确要求
   AI 生成并嵌入匹配图片，否则仅在业务确有需要时使用本地 SVG/CSS 视觉资产。用户已明确指定或要求
-  保留配色时以用户意图为准，不为了“丰富”擅自换色。需要初始浏览内容时，明确要求可复现种子数据。
-  该种子数据应是开发种子数据，不得在前端写死为假接口结果。
+  保留配色时以用户意图为准，不为了“丰富”擅自换色。需要初始浏览内容时，默认仅要求公开内容的
+  可复现开发种子数据，不得在前端写死为假接口结果。不要由初始内容推断可登录演示账号；只有用户
+  明确要求时才将演示账号列为可批准能力，并注明仅供隔离预览或测试，发布时默认不注入。
 - 可用用户故事想清场景，写入时仍压成短标题句；Must 优先于 Should，Nice-to-have 默认可不写。
 
 禁止：百科式 PRD、字段说明书、实现步骤清单、未提及的支付/第三方云/运营后台、把 data 与

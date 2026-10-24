@@ -7,12 +7,13 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.agents.test_engineer import TEST_ENGINEER_BUDGET_EXHAUSTED
 from app.core.exceptions import BusinessException, ConflictException
 from app.core.settings import settings
 from app.generation.engineering.checkpoint import (
     EXECUTION_MODE,
-    is_terminal_engineering_failure,
     prepare_manual_repair_retry,
+    requires_manual_repair_retry,
 )
 from app.generation.workspace import default_workspace_path, workspace_is_ready
 from app.models.build_run import BuildRun, BuildRunStage
@@ -524,6 +525,11 @@ def continue_engineering(
                 recovery_execution_id=(
                     status.execution_id if status.state == "retry_available" else None
                 ),
+                manual_budget_extension=(
+                    status.state == "retry_available"
+                    and status.error == TEST_ENGINEER_BUDGET_EXHAUSTED
+                ),
+                allow_execution_budget_extension=(status.state == "retry_available"),
             )
         except BusinessException:
             # Task already recorded quality_error / failed execution; surface as paused status.
@@ -1269,7 +1275,8 @@ def get_requirements_status(db: Session, user: User, project_id: int) -> Require
                     or "构建已暂停，可继续处理。"
                 )
                 result.retryable = not (
-                    is_terminal_engineering_failure(checkpoint)
+                    snapshot is not None
+                    and requires_manual_repair_retry(snapshot)
                     and checkpoint.get("blocked_executor_runtime_version") == EXECUTION_MODE
                 )
                 result.code_ready = _checkpoint_has_written_code(checkpoint)

@@ -16,10 +16,12 @@ from app.generation.engineering.checkpoint import (
 )
 from app.generation.engineering.work_memory import (
     implementation_stalled,
+    inspection_action_required,
     item_memory,
     progress_guidance,
     record_progress,
     record_result,
+    suppress_redundant_read,
     working_context,
 )
 from app.schemas.agent_action import ToolExecutionResult
@@ -59,7 +61,7 @@ class WorkMemoryTests(unittest.TestCase):
         self.assertEqual(self.c["steps_without_delivery"], 6)
 
     def test_text_omitted_from_model_context_is_not_marked_as_already_read(self):
-        body = "".join(f"{i:03d}:" + "x" * 95 + "\n" for i in range(100))
+        body = "".join(f"{i:03d}:" + "x" * 95 + "\n" for i in range(200))
         observation = ToolExecutionResult(
             tool_call_id="read",
             name="read_file",
@@ -69,26 +71,451 @@ class WorkMemoryTests(unittest.TestCase):
                 "path": "large.py",
                 "content_hash": "h",
                 "start_line": 1,
-                "end_line": 100,
+                "end_line": 200,
                 "content": body,
             },
         )
         record_progress(self.c, observation)
-        self.assertEqual(self.c["read_coverage"]["large.py"]["ranges"], [[1, 60]])
+        self.assertEqual(self.c["read_coverage"]["large.py"]["ranges"], [[1, 120]])
         tail = observation.model_copy(
             update={
                 "data": {
                     **observation.data,
-                    "start_line": 61,
-                    "content": "".join(body.splitlines(keepends=True)[60:]),
+                    "start_line": 121,
+                    "content": "".join(body.splitlines(keepends=True)[120:]),
                 }
             }
         )
         record_progress(self.c, tail)
         self.assertEqual(self.c["no_progress_steps"], 0)
-        self.assertEqual(self.c["read_coverage"]["large.py"]["ranges"], [[1, 100]])
+        self.assertEqual(self.c["read_coverage"]["large.py"]["ranges"], [[1, 200]])
         record_progress(self.c, tail)
         self.assertEqual(self.c["no_progress_steps"], 1)
+
+    def test_medium_file_is_fully_visible_and_repeated_reads_require_action(self):
+        body = "\n".join(f"const line{i} = '{'x' * 23}'" for i in range(240))
+        self.assertTrue(6000 < len(body) < 12000)
+        (self.root / "JobsPage.tsx").write_text(body, encoding="utf-8")
+        first = read_file(self.root, path="JobsPage.tsx", start_line=1, end_line=240)
+        record_result(self.c, first)
+        evidence = working_context(self.c, self.root)["source_evidence"]
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["end_line"], 240)
+        self.assertFalse(evidence[0]["content_truncated"])
+
+        for _ in range(4):
+            repeated = suppress_redundant_read(
+                self.c, self.root, read_file(self.root, path="JobsPage.tsx", end_line=240)
+            )
+            self.assertTrue(repeated.data["already_visible"])
+            self.assertNotIn("content", repeated.data)
+            record_progress(self.c, repeated)
+        self.assertTrue(inspection_action_required(self.c))
+        self.assertFalse(implementation_stalled(self.c))
+
+        (self.root / "JobsPage.tsx").write_text(body + "\n// new version", encoding="utf-8")
+        changed = suppress_redundant_read(
+            self.c, self.root, read_file(self.root, path="JobsPage.tsx", end_line=241)
+        )
+        self.assertNotIn("already_visible", changed.data)
+
+    def test_evicted_source_rereads_keep_bytes_but_close_read_only_window(self):
+        first = self.read("evicted.py", "IMPORTANT = 1\n")
+        record_progress(self.c, first)
+        for index in range(12):
+            self.read(f"other{index}.py", f"VALUE = {index}\n")
+        self.assertNotIn("evicted.py", self.c["source_evidence"])
+
+        for count in range(1, 5):
+            repeated = suppress_redundant_read(
+                self.c, self.root, read_file(self.root, path="evicted.py")
+            )
+            # An evicted excerpt is not available in the current model context.
+            # Keep the source text for safe editing, but count the repeated range.
+            self.assertNotIn("already_visible", repeated.data)
+            self.assertEqual(repeated.data["content"], "IMPORTANT = 1")
+            record_progress(self.c, repeated)
+            self.assertEqual(item_memory(self.c)["redundant_read_steps"], count)
+        self.assertTrue(inspection_action_required(self.c))
+
+        (self.root / "evicted.py").write_text("IMPORTANT = 2\n", encoding="utf-8")
+        changed = suppress_redundant_read(
+            self.c, self.root, read_file(self.root, path="evicted.py")
+        )
+        record_progress(self.c, changed)
+        self.assertEqual(item_memory(self.c)["redundant_read_steps"], 0)
+        self.assertFalse(inspection_action_required(self.c))
+
+    def test_written_source_keeps_first_explicit_read_result(self):
+        path = "backend/app/api/router.py"
+        raw = b"from app.api import auth, health\napi_router = auth.router\n"
+        target = self.root / path
+        target.parent.mkdir(parents=True)
+        target.write_bytes(raw)
+        record_result(
+            self.c,
+            ToolExecutionResult(
+                tool_call_id="install",
+                name="install_capability",
+                ok=True,
+                summary="installed",
+            ),
+            updates={path: raw},
+        )
+        evidence = working_context(self.c, self.root)["source_evidence"]
+        self.assertIn(path, [entry["path"] for entry in evidence])
+        legacy = load_checkpoint(json.loads(json.dumps({"checkpoint": self.c})))
+        for fragment in legacy["source_evidence"][path]["fragments"]:
+            fragment.pop("explicit_read", None)
+        self.assertNotIn(
+            "already_visible",
+            suppress_redundant_read(legacy, self.root, read_file(self.root, path=path)).data,
+        )
+
+        first = suppress_redundant_read(self.c, self.root, read_file(self.root, path=path))
+        self.assertNotIn("already_visible", first.data)
+        self.assertEqual(first.data["content"], raw.decode().rstrip("\n"))
+        record_progress(self.c, first)
+        record_result(self.c, first)
+        repeated = suppress_redundant_read(self.c, self.root, read_file(self.root, path=path))
+        self.assertTrue(repeated.data["already_visible"])
+        self.assertNotIn("content", repeated.data)
+
+    def test_contained_reads_reuse_written_full_source_without_false_read_provenance(self):
+        path = "employer_jobs.py"
+        body = "".join(f"LINE_{i:03d} = {i}\n" for i in range(1, 190))
+        raw = body.encode()
+        (self.root / path).write_bytes(raw)
+        record_result(
+            self.c,
+            ToolExecutionResult(tool_call_id="write", name="write_files", ok=True, summary="saved"),
+            updates={path: raw},
+        )
+        first = read_file(self.root, path=path, start_line=1, end_line=40)
+        record_progress(self.c, first)
+        record_result(self.c, first)
+        second = read_file(self.root, path=path, start_line=40, end_line=60)
+        record_progress(self.c, second)
+        record_result(self.c, second)
+
+        fragments = self.c["source_evidence"][path]["fragments"]
+        self.assertEqual(len(fragments), 1)
+        self.assertEqual((fragments[0]["start_line"], fragments[0]["end_line"]), (1, 189))
+        self.assertFalse(fragments[0]["explicit_read"])
+        self.assertEqual(fragments[0]["explicit_read_ranges"], [[1, 60]])
+        self.assertEqual(len(working_context(self.c, self.root)["source_evidence"]), 1)
+        self.assertTrue(
+            suppress_redundant_read(
+                self.c, self.root, read_file(self.root, path=path, start_line=1, end_line=40)
+            ).data["already_visible"]
+        )
+        self.assertNotIn(
+            "already_visible",
+            suppress_redundant_read(self.c, self.root, read_file(self.root, path=path)).data,
+        )
+
+        restored = load_checkpoint(json.loads(json.dumps({"checkpoint": self.c})))
+        self.assertEqual(len(working_context(restored, self.root)["source_evidence"]), 1)
+        tail = read_file(self.root, path=path, start_line=61, end_line=189)
+        record_progress(restored, tail)
+        record_result(restored, tail)
+        self.assertEqual(len(restored["source_evidence"][path]["fragments"]), 1)
+        self.assertTrue(restored["source_evidence"][path]["fragments"][0]["explicit_read"])
+        self.assertTrue(
+            suppress_redundant_read(restored, self.root, read_file(self.root, path=path)).data[
+                "already_visible"
+            ]
+        )
+
+    def test_existing_checkpoint_compacts_overlapping_source_on_projection(self):
+        path = "employer_jobs.py"
+        body = "".join(f"LINE_{i:03d} = {i}\n" for i in range(1, 190))
+        raw = body.encode()
+        (self.root / path).write_bytes(raw)
+        record_result(
+            self.c,
+            ToolExecutionResult(tool_call_id="write", name="write_files", ok=True, summary="saved"),
+            updates={path: raw},
+        )
+        full = dict(self.c["source_evidence"][path]["fragments"][0])
+        partial = read_file(self.root, path=path, start_line=1, end_line=40)
+        self.c["source_evidence"][path]["fragments"] = [
+            full,
+            {**partial.data, "explicit_read": True, "work_item_id": "auth", "model_turn": 2},
+        ]
+        projected = working_context(self.c, self.root)["source_evidence"]
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0]["explicit_read_ranges"], [[1, 40]])
+        self.assertEqual(len(self.c["source_evidence"][path]["fragments"]), 1)
+
+    def test_current_item_read_promotes_cached_file_ahead_of_older_large_source(self):
+        self.c["model_turns"] = 5
+        self.read("App.tsx", "a" * 4000)
+        self.c["model_turns"] = 10
+        self.read("forgeai.smoke.json", "s" * 12000)
+        self.c["current_work_item_id"] = "browse"
+        self.c["model_turns"] = 20
+        record_result(self.c, read_file(self.root, path="App.tsx"))
+        self.c["model_turns"] = 21
+        self.read("jobs.py", "j" * 12000)
+
+        app = self.c["source_evidence"]["App.tsx"]
+        self.assertEqual((app["work_item_id"], app["model_turn"]), ("browse", 20))
+        context = working_context(self.c, self.root)
+        self.assertIn("App.tsx", [row["path"] for row in context["source_evidence"]])
+        self.assertIn("forgeai.smoke.json", context["omitted_evidence_paths"])
+
+    def test_large_smoke_does_not_displace_small_current_item_source(self):
+        paths = [f"feature{i}.py" for i in range(5)]
+        for path in paths:
+            self.read(path, "x" * 4000)
+        self.read("forgeai.smoke.json", "s" * 12000)
+
+        context = working_context(self.c, self.root)
+        projected = {entry["path"] for entry in context["source_evidence"]}
+        self.assertTrue(set(paths).issubset(projected))
+        self.assertNotIn("forgeai.smoke.json", projected)
+        self.assertIn("forgeai.smoke.json", context["omitted_evidence_paths"])
+        self.assertTrue(
+            any(
+                entry["path"] == "forgeai.smoke.json"
+                for entry in context["omitted_evidence_ranges"]
+            )
+        )
+        self.assertLessEqual(
+            sum(len(entry["content"]) for entry in context["source_evidence"]), 24000
+        )
+        reread = suppress_redundant_read(
+            self.c, self.root, read_file(self.root, path="forgeai.smoke.json")
+        )
+        self.assertNotIn("already_visible", reread.data)
+
+        (self.root / paths[0]).write_text("changed", encoding="utf-8")
+        stale = working_context(self.c, self.root)
+        self.assertIn(paths[0], stale["stale_evidence_paths"])
+        self.assertNotIn(paths[0], {entry["path"] for entry in stale["source_evidence"]})
+
+    def test_current_edits_outrank_smaller_current_item_dependencies(self):
+        changed = {
+            "backend/app/api/employer_jobs.py": 9400,
+            "frontend/src/pages/employer-jobs.tsx": 8200,
+            "frontend/src/router.tsx": 2200,
+        }
+        for path, size in changed.items():
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            raw = b"x" * size
+            target.write_bytes(raw)
+            record_result(
+                self.c,
+                ToolExecutionResult(
+                    tool_call_id="write", name="write_files", ok=True, summary="written"
+                ),
+                updates={path: raw},
+            )
+        for index in range(5):
+            self.read(f"ui{index}.tsx", "u" * 1500)
+        self.read("forgeai.smoke.json", "s" * 12000)
+
+        context = working_context(self.c, self.root)
+        projected = {entry["path"] for entry in context["source_evidence"]}
+        self.assertTrue(set(changed).issubset(projected))
+        self.assertIn("forgeai.smoke.json", context["omitted_evidence_paths"])
+        self.assertLessEqual(
+            sum(len(entry["content"]) for entry in context["source_evidence"]), 24000
+        )
+
+    def test_legacy_read_replay_keeps_historical_file_priority(self):
+        self.c["model_turns"] = 5
+        read = self.read("App.tsx", "old source")
+        self.c.update(schema_version=15, current_work_item_id="browse", model_turns=100)
+        self.c["observations"] = [read.model_copy(update={"model_turn": 7}).model_dump(mode="json")]
+        loaded = load_checkpoint(json.loads(json.dumps({"checkpoint": self.c})))
+        app = loaded["source_evidence"]["App.tsx"]
+        self.assertEqual((app["work_item_id"], app["model_turn"]), ("auth", 7))
+
+        without_cache = json.loads(json.dumps(self.c))
+        without_cache["source_evidence"] = {}
+        recovered = load_checkpoint({"checkpoint": without_cache})
+        app = recovered["source_evidence"]["App.tsx"]
+        self.assertIsNone(app["work_item_id"])
+        self.assertEqual(app["model_turn"], 7)
+
+    def test_redundant_read_guidance_precedes_action_window(self):
+        path = "router.py"
+        (self.root / path).write_text("api_router = 1\n", encoding="utf-8")
+        first = read_file(self.root, path=path)
+        record_progress(self.c, first)
+        record_result(self.c, first)
+        self.assertIsNone(progress_guidance(self.c))
+
+        for count in (1, 2):
+            repeated = suppress_redundant_read(self.c, self.root, read_file(self.root, path=path))
+            self.assertTrue(repeated.data["already_visible"])
+            record_progress(self.c, repeated)
+            guidance = progress_guidance(self.c)
+            if count == 1:
+                self.assertIsNone(guidance)
+            else:
+                self.assertEqual(guidance["repeated_source_reads"], 2)
+            self.assertFalse(implementation_stalled(self.c))
+
+        for _ in range(2):
+            record_progress(self.c, suppress_redundant_read(self.c, self.root, first))
+        self.assertTrue(inspection_action_required(self.c))
+        self.assertFalse(implementation_stalled(self.c))
+
+    def test_truncated_read_names_next_range_without_claiming_unseen_lines(self):
+        body = "".join(f"{i:03d}:" + "x" * 95 + "\n" for i in range(200))
+        (self.root / "large.py").write_text(body, encoding="utf-8")
+        first = read_file(self.root, path="large.py", start_line=1, end_line=200)
+        record_result(self.c, first)
+        fragment = working_context(self.c, self.root)["source_evidence"][0]
+        self.assertEqual((fragment["end_line"], fragment["requested_end_line"]), (120, 200))
+        self.assertEqual(fragment["next_start_line"], 121)
+
+        repeated = suppress_redundant_read(self.c, self.root, first)
+        self.assertTrue(repeated.data["already_visible"])
+        self.assertEqual(repeated.data["next_start_line"], 121)
+        changed_request = read_file(self.root, path="large.py", start_line=1, end_line=199)
+        repeated_changed_request = suppress_redundant_read(self.c, self.root, changed_request)
+        self.assertTrue(repeated_changed_request.data["already_visible"])
+        self.assertEqual(repeated_changed_request.data["next_start_line"], 121)
+        tail = read_file(self.root, path="large.py", start_line=121, end_line=200)
+        self.assertNotIn("already_visible", suppress_redundant_read(self.c, self.root, tail).data)
+        record_result(self.c, tail)
+        fully_covered = suppress_redundant_read(self.c, self.root, first)
+        self.assertTrue(fully_covered.data["already_visible"])
+        self.assertNotIn("next_start_line", fully_covered.data)
+
+        spec = AppSpec.model_validate(valid_spec())
+        messages = build_code_engineer_messages(
+            spec=spec,
+            work_item=WorkItem(id="auth", title="Auth", requirement_ids=[spec.features[0].id]),
+            system_design=None,
+            engineering_context={"working_memory": working_context(self.c, self.root)},
+            observations=[first],
+        )
+        native_content = next(m["content"] for m in messages if m["role"] == "tool")
+        self.assertLessEqual(len(native_content), 20000)
+        native = json.loads(native_content)
+        self.assertEqual(native["data"]["end_line"], 120)
+        self.assertEqual(native["data"]["requested_end_line"], 200)
+        self.assertEqual(native["data"]["next_start_line"], 121)
+        self.assertTrue(native["data"]["content_truncated"])
+
+    def test_truncated_read_counts_complete_leading_blank_line(self):
+        body = "\n" + "x" * 13000
+        (self.root / "large.py").write_text(body, encoding="utf-8")
+        first = read_file(self.root, path="large.py", start_line=1, end_line=2)
+        record_result(self.c, first)
+        fragment = working_context(self.c, self.root)["source_evidence"][0]
+        self.assertEqual(fragment["content"], "\n")
+        self.assertEqual(fragment["end_line"], 1)
+        self.assertEqual(fragment["next_start_line"], 2)
+
+    def test_oversized_single_line_explains_range_read_limit(self):
+        (self.root / "minified.js").write_text("x" * 13000, encoding="utf-8")
+        first = read_file(self.root, path="minified.js", start_line=1, end_line=1)
+        record_result(self.c, first)
+        fragment = working_context(self.c, self.root)["source_evidence"][0]
+        self.assertTrue(fragment["line_too_long"])
+        self.assertNotIn("next_start_line", fragment)
+        repeated = suppress_redundant_read(self.c, self.root, first)
+        self.assertTrue(repeated.data["already_visible"])
+        self.assertNotIn("next_start_line", repeated.data)
+        self.assertIn("按行重读无法显示剩余内容", repeated.summary)
+
+    def test_escaped_source_keeps_structured_visible_range_in_native_result(self):
+        body = "\n".join([r"\"" * 55] * 110)
+        (self.root / "escaped.ts").write_text(body, encoding="utf-8")
+        first = read_file(self.root, path="escaped.ts", start_line=1, end_line=110)
+        record_result(self.c, first)
+        fragment = working_context(self.c, self.root)["source_evidence"][0]
+        self.assertLess(fragment["end_line"], 110)
+        spec = AppSpec.model_validate(valid_spec())
+        messages = build_code_engineer_messages(
+            spec=spec,
+            work_item=WorkItem(id="auth", title="Auth", requirement_ids=[spec.features[0].id]),
+            system_design=None,
+            engineering_context={"working_memory": working_context(self.c, self.root)},
+            observations=[first],
+        )
+        native_content = next(m["content"] for m in messages if m["role"] == "tool")
+        self.assertLessEqual(len(native_content), 20000)
+        native = json.loads(native_content)
+        self.assertIn("content", native["data"])
+        self.assertNotIn("excerpt", native["data"])
+        self.assertEqual(native["data"]["end_line"], fragment["end_line"])
+        self.assertEqual(native["data"]["next_start_line"], fragment["next_start_line"])
+
+    def test_long_read_path_cannot_collapse_native_result_to_excerpt(self):
+        path = "segment/" * 400 + "escaped.ts"
+        body = "\n".join([r"\"" * 55] * 110)
+        observation = ToolExecutionResult(
+            tool_call_id="long_path",
+            name="read_file",
+            ok=True,
+            summary=f"读取 {path} 第 1-110 行",
+            data={
+                "path": path,
+                "content_hash": "h",
+                "start_line": 1,
+                "end_line": 110,
+                "line_count": 110,
+                "content": body,
+            },
+            arguments={"path": path},
+        )
+        spec = AppSpec.model_validate(valid_spec())
+        messages = build_code_engineer_messages(
+            spec=spec,
+            work_item=WorkItem(id="auth", title="Auth", requirement_ids=[spec.features[0].id]),
+            system_design=None,
+            engineering_context={},
+            observations=[observation],
+        )
+        native_content = next(m["content"] for m in messages if m["role"] == "tool")
+        self.assertLessEqual(len(native_content), 20000)
+        native = json.loads(native_content)
+        self.assertIn("content", native["data"])
+        self.assertIn("end_line", native["data"])
+        self.assertNotIn("excerpt", native["data"])
+        assistant_call = next(m["tool_calls"] for m in messages if m["role"] == "assistant")
+        self.assertEqual(json.loads(assistant_call[0]["function"]["arguments"])["path"], path)
+
+    def test_legacy_truncated_cache_does_not_suppress_new_full_read(self):
+        body = "\n".join(f"const line{i} = '{'x' * 23}'" for i in range(240))
+        (self.root / "JobsPage.tsx").write_text(body, encoding="utf-8")
+        first = read_file(self.root, path="JobsPage.tsx", start_line=1, end_line=240)
+        self.c["source_evidence"] = {
+            "JobsPage.tsx": {
+                "content_hash": first.data["content_hash"],
+                "work_item_id": "auth",
+                "model_turn": 1,
+                "fragments": [
+                    {
+                        **first.data,
+                        "content": body[:6000],
+                        "content_truncated": True,
+                        "work_item_id": "auth",
+                        "model_turn": 1,
+                    }
+                ],
+            }
+        }
+        restored = load_checkpoint({"checkpoint": self.c})
+        visible = working_context(restored, self.root)["source_evidence"][0]
+        self.assertLess(visible["end_line"], 240)
+        self.assertEqual(visible["requested_end_line"], 240)
+        self.assertNotIn(
+            "already_visible", suppress_redundant_read(restored, self.root, first).data
+        )
+        record_result(restored, first)
+        self.assertEqual(
+            working_context(restored, self.root)["source_evidence"][0]["end_line"], 240
+        )
+        self.assertTrue(suppress_redundant_read(restored, self.root, first).data["already_visible"])
 
     def test_guidance_survives_recovery_and_has_grace_before_stopping(self):
         observation = self.read()
@@ -106,11 +533,12 @@ class WorkMemoryTests(unittest.TestCase):
         self.assertFalse(implementation_stalled(loaded))
 
     def test_new_reads_do_not_hide_missing_implementation_and_cached_check_is_not_progress(self):
-        for i in range(50):
+        for i in range(16):
+            self.c["model_turns"] = i + 1
             record_progress(self.c, self.read(path=f"new_{i}.py"))
-        self.c.update(progress_guidance_turn=1, model_turns=4)
         self.assertEqual(self.c["no_progress_steps"], 0)
-        self.assertTrue(implementation_stalled(self.c))
+        self.assertTrue(inspection_action_required(self.c))
+        self.assertFalse(implementation_stalled(self.c))
         check = ToolExecutionResult(
             tool_call_id="c",
             name="run_check",
@@ -120,9 +548,69 @@ class WorkMemoryTests(unittest.TestCase):
         )
         record_progress(self.c, check)
         self.assertIsNone(progress_guidance(self.c))
+        self.assertFalse(inspection_action_required(self.c))
         for _ in range(12):
             record_progress(self.c, check)
         self.assertIsNotNone(progress_guidance(self.c))
+
+    def test_inspection_window_counts_model_decisions_not_files_and_resets_on_progress(self):
+        self.c["model_turns"] = 1
+        for index in range(16):
+            record_progress(self.c, self.read(path=f"batch_{index}.py"))
+        self.assertEqual(item_memory(self.c)["inspection_model_turns"], 1)
+        self.assertFalse(inspection_action_required(self.c))
+        for turn in range(2, 17):
+            self.c["model_turns"] = turn
+            record_progress(self.c, self.read(path=f"next_{turn}.py"))
+        self.assertEqual(item_memory(self.c)["inspection_model_turns"], 16)
+        self.assertTrue(inspection_action_required(self.c))
+        self.assertTrue(progress_guidance(self.c)["inspection_action_required"])
+
+        record_progress(
+            self.c,
+            ToolExecutionResult(tool_call_id="write", name="write_files", ok=True, summary="saved"),
+            changed=True,
+        )
+        self.assertEqual(item_memory(self.c)["inspection_model_turns"], 0)
+        self.assertFalse(inspection_action_required(self.c))
+        self.c["model_turns"] = 17
+        record_progress(self.c, self.read(path="after_write.py"))
+        self.assertEqual(item_memory(self.c)["inspection_model_turns"], 1)
+        record_progress(
+            self.c,
+            ToolExecutionResult(
+                tool_call_id="plan", name="update_delivery_plan", ok=True, summary="replanned"
+            ),
+            plan_changed=True,
+        )
+        self.assertEqual(item_memory(self.c)["inspection_model_turns"], 0)
+
+    def test_redundant_reads_require_action_before_the_stop_loss(self):
+        memory = item_memory(self.c)
+        memory["inspection_model_turns"] = 5
+        memory["redundant_read_steps"] = 4
+        self.c.update(
+            model_turns=25,
+            no_progress_steps=10,
+            steps_without_delivery=10,
+            progress_guidance_turn=22,
+        )
+        self.assertTrue(inspection_action_required(self.c))
+        self.assertTrue(progress_guidance(self.c)["inspection_action_required"])
+        self.assertFalse(implementation_stalled(self.c))
+
+        # The existing no-progress limit remains available if the next
+        # constrained decisions still do not produce a change or check.
+        self.c["no_progress_steps"] = 24
+        self.assertTrue(implementation_stalled(self.c))
+
+    def test_cache_omitted_reads_require_action_before_generic_stop(self):
+        memory = item_memory(self.c)
+        memory["inspection_model_turns"] = 8
+        memory["redundant_read_steps"] = 0
+        self.c.update(no_progress_steps=12, steps_without_delivery=12)
+        self.assertTrue(inspection_action_required(self.c))
+        self.assertFalse(implementation_stalled(self.c))
 
     def test_complementary_ranges_survive_alternation_and_history_rollover(self):
         path = "large.py"
@@ -325,7 +813,7 @@ class WorkMemoryTests(unittest.TestCase):
             updates={"auth.py": raw},
         )
         for i in range(30):
-            self.read(f"f{i}.py", "x" * 8000)
+            self.read(f"f{i}.py", "x" * 16000)
         self.assertLessEqual(len(self.c["source_evidence"]), 12)
         context = working_context(self.c, self.root)
         self.assertLessEqual(sum(len(x["content"]) for x in context["source_evidence"]), 24000)
@@ -367,6 +855,7 @@ class WorkMemoryTests(unittest.TestCase):
 
     def test_explicit_stall_retry_keeps_evidence_without_forced_focus(self):
         self.read()
+        item_memory(self.c)["redundant_read_steps"] = 4
         self.c.update(
             outcome="blocked",
             blocked_reason_code="NO_SOURCE_PROGRESS",
@@ -374,11 +863,15 @@ class WorkMemoryTests(unittest.TestCase):
             model_turns=40,
             tool_calls=90,
         )
+        self.assertEqual(
+            item_memory(load_checkpoint({"checkpoint": self.c}))["redundant_read_steps"], 4
+        )
         retried = prepare_manual_repair_retry({"checkpoint": self.c})["checkpoint"]
         self.assertEqual((retried["model_turns"], retried["tool_calls"]), (40, 90))
         self.assertIn("user.py", retried["source_evidence"])
         self.assertNotIn("correction", working_context(retried, self.root))
         self.assertTrue(retried["recovery_context"]["historical"])
+        self.assertEqual(item_memory(retried)["redundant_read_steps"], 0)
         self.assertEqual(retried["outcome"], "running")
 
     def test_work_item_switch_keeps_memory_separate(self):

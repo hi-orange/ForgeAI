@@ -8,9 +8,38 @@ SMOKE_CONTRACT = json.loads(
     Path(__file__).with_name("smoke_contract.json").read_text(encoding="utf-8")
 )
 BROWSER_CONTRACT = SMOKE_CONTRACT["browser"]
+API_CONTRACT = SMOKE_CONTRACT["api"]
 SMOKE_ACTIONS = BROWSER_CONTRACT["actions"]
 SMOKE_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 REQUIRED_THEME_TOKENS = {"--color-primary", "--color-accent", "--color-muted"}
+
+
+def browser_smoke_timeout_seconds(manifest: dict) -> int:
+    """Budget the full serial browser manifest without allowing an unbounded run."""
+
+    limits = SMOKE_CONTRACT["limits"]
+    checks = manifest["browser_checks"]
+    action_count = sum(len(check.get("actions", [])) for check in checks)
+    return min(
+        limits["browser_timeout_max_seconds"],
+        limits["browser_timeout_seconds"]
+        + max(0, len(checks) - 1) * limits["browser_timeout_per_additional_check_seconds"]
+        + action_count * limits["browser_timeout_per_action_seconds"],
+    )
+
+
+def all_check_timeout_seconds(manifest: dict, configured_timeout: int) -> int:
+    """Leave bounded time for builds and API probes before the browser budget."""
+
+    limits = SMOKE_CONTRACT["limits"]
+    return max(
+        10,
+        min(
+            configured_timeout,
+            limits["all_timeout_max_seconds"],
+            browser_smoke_timeout_seconds(manifest) + limits["browser_setup_timeout_seconds"],
+        ),
+    )
 
 
 def parse_smoke_manifest(content: str, *, root: Path, template_metadata: dict) -> dict:
@@ -159,6 +188,18 @@ def validate_smoke_manifest(manifest: object, *, root: Path, template_metadata: 
         if check["id"] in seen:
             raise ValueError(f"联调项 id 重复：{check['id']}")
         seen.add(check["id"])
+        unknown = sorted(set(check) - set(API_CONTRACT["fields"]))
+        if unknown:
+            advice = ""
+            if "auth" in unknown:
+                advice = (
+                    "；auth 不受支持：先在登录探针用 capture "
+                    '{"seeker_token":"data.access_token"} 捕获令牌，'
+                    '后续请求用 headers {"Authorization":"Bearer ${seeker_token}"}'
+                )
+            raise ValueError(
+                f"api_checks[{check['id']}] 包含契约外字段：{', '.join(unknown)}{advice}"
+            )
         method = str(check.get("method") or "GET").upper()
         if method not in SMOKE_METHODS:
             raise ValueError(f"不支持的 API 联调方法：{method}")

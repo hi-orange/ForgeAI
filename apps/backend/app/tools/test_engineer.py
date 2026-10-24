@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.agents.qa_context import unresolved_login_transition_test_ids
 from app.core.exceptions import BusinessException, ConflictException
 from app.schemas.agent_action import (
     ToolCall,
@@ -13,19 +14,33 @@ from app.schemas.agent_action import (
     ToolExecutionResult,
     inline_model_json_schema,
 )
-from app.schemas.qa_suite import QAScript, QASuite
+from app.schemas.qa_suite import BrowserStep, QAScript, QASuite
 from app.schemas.test_report import (
     DefectRecord,
     TestReport,
+    TestReportDecision,
 )
-from app.services.qa_assets import suite_test_results, validate_suite
-from app.services.qa_verification import QAVerificationState, is_reusable_check, validate_report
+from app.services.qa_assets import (
+    RUNNER_VERSION,
+    suite_test_results,
+    validate_manifest,
+    validate_suite,
+)
+from app.services.qa_verification import (
+    DefectResolution,
+    QAVerificationState,
+    build_test_report_from_decision,
+    is_reusable_check,
+    unresolved_script_blockers,
+    validate_defect_resolution,
+    validate_report,
+)
 from app.tools import checks as check_tools
 from app.tools import files as file_tools
 from app.tools import qa_runner
 
 _DEFECT_SCHEMA = inline_model_json_schema(DefectRecord)
-_TEST_REPORT_SCHEMA = inline_model_json_schema(TestReport)
+_TEST_REPORT_DECISION_SCHEMA = inline_model_json_schema(TestReportDecision)
 TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="design_test_cases",
@@ -52,9 +67,43 @@ TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
         },
     ),
     ToolDefinition(
+        name="adapt_test_script",
+        description=(
+            "只改当前独立脚本的一个定位器/路径，或在指定浏览器步骤后插入纯同步 wait_for_visible；"
+            "平台保留原输入、操作、断言并生成新 suite_hash。step_index 从 0 开始。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "test_id": {"type": "string"},
+                "expected_suite_hash": {"type": "string"},
+                "step_index": {"type": "integer", "minimum": 0},
+                "selector": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "path": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "insert_wait_for_visible_selector": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                },
+            },
+            "required": ["test_id", "expected_suite_hash", "step_index"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
         name="run_acceptance_tests",
         description="冻结源码/测试快照，在无外网隔离应用执行独立 API/浏览器断言并记录证据。",
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        parameters={
+            "type": "object",
+            "properties": {
+                "override_reason": {
+                    "type": "string",
+                    "enum": ["final_blocked_evidence"],
+                    "description": "仅测试资产修订预算耗尽后，显式允许最后一次阻断证据执行。",
+                }
+            },
+            "additionalProperties": False,
+        },
     ),
     ToolDefinition(
         name="read_artifact",
@@ -152,12 +201,33 @@ TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
         },
     ),
     ToolDefinition(
-        name="write_test_report",
-        description="提交覆盖 PRD、检查结果、缺陷和质量结论的最终 test_report。",
+        name="resolve_defect",
+        description=(
+            "将历史业务缺陷标为已解决；须引用当前 suite_hash 和最新执行 id，"
+            "且该缺陷关联的全部用例已由当前独立执行器真实通过。历史记录保留。"
+        ),
         parameters={
             "type": "object",
-            "properties": {"test_report": _TEST_REPORT_SCHEMA},
-            "required": ["test_report"],
+            "properties": {
+                "defect_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                "suite_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "execution_id": {"type": "string", "minLength": 1, "maxLength": 64},
+            },
+            "required": ["defect_id", "suite_hash", "execution_id"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
+        name="write_test_report",
+        description=(
+            "提交当前准确 suite_hash、execution_id、质量结论和摘要。"
+            "平台从冻结 QA 状态填入完整套件、逐项执行证据、需求/检查结果与已记录缺陷；"
+            "不要回传原始响应、令牌或完整测试资产。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"report_decision": _TEST_REPORT_DECISION_SCHEMA},
+            "required": ["report_decision"],
             "additionalProperties": False,
         },
     ),
@@ -226,10 +296,127 @@ def execute_test_engineer_tool(
                     "suite": suite.model_dump(mode="json"),
                 },
             ), None
+        if call.name == "adapt_test_script":
+            if not state.suite_versions or len(state.suite_versions) >= 32:
+                raise BusinessException("请先设计场景，或测试资产修订预算已用尽")
+            previous = state.suite_versions[-1]
+            if call.arguments.get("expected_suite_hash") != previous.digest():
+                raise BusinessException("测试资产已更新；须提供准确 expected_suite_hash")
+            key = str(call.arguments.get("test_id") or "")
+            existing_script = previous.scripts.get(key)
+            if existing_script is None:
+                raise BusinessException("指定用例没有独立脚本")
+            index = call.arguments.get("step_index")
+            if type(index) is not int or not 0 <= index < len(existing_script.steps):
+                raise BusinessException("脚本步骤索引无效")
+            edits = {
+                name: call.arguments[name]
+                for name in ("selector", "path", "insert_wait_for_visible_selector")
+                if name in call.arguments
+            }
+            if len(edits) != 1:
+                raise BusinessException("每次只能修改一个定位器/路径或插入一个等待步骤")
+            steps = list(existing_script.steps)
+            step = steps[index]
+            if "insert_wait_for_visible_selector" in edits:
+                if not isinstance(step, BrowserStep):
+                    raise BusinessException("只能在浏览器步骤后插入等待步骤")
+                steps.insert(
+                    index + 1,
+                    BrowserStep.model_validate(
+                        {
+                            "action": "wait_for_visible",
+                            "selector": edits["insert_wait_for_visible_selector"],
+                        }
+                    ),
+                )
+            else:
+                field, value = next(iter(edits.items()))
+                if field == "selector" and (
+                    not isinstance(step, BrowserStep)
+                    or step.action
+                    not in {
+                        "fill",
+                        "click",
+                        "select",
+                        "expect_count",
+                        "expect_visible",
+                        "wait_for_visible",
+                    }
+                ):
+                    raise BusinessException("该步骤没有可修改的浏览器定位器")
+                if field == "path" and not (
+                    step.kind == "api"
+                    or (isinstance(step, BrowserStep) and step.action == "navigate")
+                ):
+                    raise BusinessException("该步骤不允许修改路径")
+                steps[index] = type(step).model_validate(
+                    {**step.model_dump(mode="json"), field: value}
+                )
+            updated_script = QAScript.model_validate({"steps": steps})
+            suite = previous.model_copy(
+                update={
+                    "revision": previous.revision + 1,
+                    "scripts": {**previous.scripts, key: updated_script},
+                }
+            )
+            suite = QASuite.model_validate(suite.model_dump())
+            validate_suite(suite, state.app_spec, state.acceptance_test_plan, previous)
+            state.suite_versions.append(suite)
+            return _ok_result(
+                call,
+                summary="独立脚本已安全适配并生成新测试资产版本",
+                data={
+                    "suite_hash": suite.digest(),
+                    "revision": suite.revision,
+                    "test_id": key,
+                    "step_index": index,
+                },
+            ), None
         if call.name == "run_acceptance_tests":
-            if not state.suite_versions or len(state.executions) >= 6:
+            if not state.suite_versions or len(state.executions) >= state.execution_budget:
                 raise BusinessException("独立场景尚未设计，或执行预算已用尽")
             suite = state.suite_versions[-1]
+            unresolved = unresolved_script_blockers(state)
+            unresolved_login = unresolved_login_transition_test_ids(state)
+            override_reason = call.arguments.get("override_reason")
+            if override_reason is not None and override_reason != "final_blocked_evidence":
+                raise BusinessException("独立验收重跑覆盖理由无效")
+            if override_reason is not None and (
+                not (unresolved or unresolved_login) or len(state.suite_versions) < 32
+            ):
+                raise BusinessException("只有测试资产修订预算耗尽且仍有脚本阻断时可覆盖重跑门禁")
+            if (unresolved or unresolved_login) and override_reason is None:
+                raise BusinessException(
+                    "上次独立执行后仍有未适配的用例："
+                    + ", ".join([*unresolved, *unresolved_login])
+                    + "；脚本阻断按失败步骤修订，登录点击后立即导航且首个断言超时的用例"
+                    "可在点击后插入 wait_for_visible。全部处理后再运行整套独立验收"
+                )
+            if any(
+                item.get("suite_hash") == suite.digest()
+                and item.get("source_hash") == state.code_source_hash
+                and item.get("runner_version") == RUNNER_VERSION
+                and not (
+                    any(
+                        row.get("status") == "blocked" and row.get("failure_kind") == "environment"
+                        for row in item.get("results", [])
+                    )
+                    and all(
+                        row.get("status") == "passed"
+                        or (
+                            row.get("status") == "blocked"
+                            and row.get("failure_kind") == "environment"
+                        )
+                        for row in item.get("results", [])
+                    )
+                )
+                for item in state.executions
+            ):
+                raise BusinessException(
+                    "当前源码、测试资产和执行器已有独立执行证据；"
+                    "请先修订脚本生成新 suite_hash，不能重复启动同一快照"
+                )
             result = qa_runner.run_acceptance_tests(
                 state.workspace_root,
                 code_item_id=state.code_item_id,
@@ -240,6 +427,10 @@ def execute_test_engineer_tool(
             manifest = result.data.get("manifest")
             if isinstance(manifest, dict):
                 state.executions.append(manifest)
+            if override_reason is not None:
+                result.data["qa_override_reason"] = override_reason
+                result.data["unresolved_script_test_ids"] = unresolved
+                result.data["unresolved_login_transition_test_ids"] = unresolved_login
             state.checks["acceptance"] = result
             return result.model_copy(
                 update={
@@ -422,10 +613,60 @@ def execute_test_engineer_tool(
                 ),
                 None,
             )
-        if call.name == "write_test_report":
-            report = validate_report(
-                TestReport.model_validate(call.arguments.get("test_report")), state
+        if call.name == "resolve_defect":
+            defect_id = call.arguments.get("defect_id")
+            if not isinstance(defect_id, str) or defect_id not in state.defects:
+                raise BusinessException("缺陷编号不存在，不能解决")
+            if defect_id in state.defect_resolutions:
+                raise BusinessException("缺陷已经解决")
+            if not state.suite_versions or not state.executions:
+                raise BusinessException("缺陷解决须有当前套件的真实独立复测")
+            suite = state.suite_versions[-1]
+            execution = state.executions[-1]
+            if (
+                call.arguments.get("suite_hash") != suite.digest()
+                or call.arguments.get("execution_id") != execution.get("execution_id")
+                or execution.get("runner_version") != RUNNER_VERSION
+            ):
+                raise BusinessException("缺陷解决须引用当前套件和最新独立执行器复测")
+            validate_manifest(
+                execution,
+                {
+                    "execution_id": execution["execution_id"],
+                    "code_item_id": state.code_item_id,
+                    "source_hash": state.code_source_hash,
+                    "suite_hash": suite.digest(),
+                },
+                suite,
             )
+            resolution = DefectResolution.model_validate(
+                {
+                    "defect_id": defect_id,
+                    "suite_hash": suite.digest(),
+                    "execution_id": execution["execution_id"],
+                    "runner_version": RUNNER_VERSION,
+                }
+            )
+            validate_defect_resolution(state, resolution)
+            state.defect_resolutions[defect_id] = resolution
+            return (
+                _ok_result(
+                    call,
+                    summary=f"缺陷 {defect_id} 已由独立复测解决；历史记录保留",
+                    data={"defect_resolution": resolution.model_dump(mode="json")},
+                ),
+                None,
+            )
+        if call.name == "write_test_report":
+            if "report_decision" in call.arguments:
+                report = build_test_report_from_decision(
+                    TestReportDecision.model_validate(call.arguments["report_decision"]), state
+                )
+            else:
+                # Historical direct callers may still submit the full report.
+                report = validate_report(
+                    TestReport.model_validate(call.arguments.get("test_report")), state
+                )
             return (
                 _ok_result(
                     call,

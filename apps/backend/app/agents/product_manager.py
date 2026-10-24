@@ -12,6 +12,7 @@ from app.agents.roles import get_role_profile
 from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_with_tools
+from app.core.settings import settings
 from app.models.task import TaskRecipient
 from app.schemas.app_spec import AppSpec
 from app.schemas.product_manager import ProductManagerInput
@@ -65,7 +66,8 @@ def generate_app_spec(
         role_name="Product Manager",
         max_turns=MAX_PRODUCT_MANAGER_TOOL_TURNS,
         temperature=0.0,
-        max_tokens=8192,
+        max_tokens=16384 if settings.product_manager_thinking else 8192,
+        thinking=settings.product_manager_thinking,
         missing_message="Product Manager 未调用工具提交 PRD",
         exhausted_message="Product Manager 工具调用预算已用尽，尚未提交 PRD",
         execute_tool=lambda call: execute_product_manager_tool(call, state),

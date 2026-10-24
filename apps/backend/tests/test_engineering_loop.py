@@ -9,8 +9,8 @@ from test_engineering_claim import EngineeringClaimTests
 from test_product_manager_workflow import valid_spec
 
 from app.agents.code_engineer import CODE_ENGINEER_PROFILE, CODE_ENGINEER_TOOLS, decide_next_action
-from app.core.exceptions import BusinessException, ProviderException
-from app.generation.delivery import planning_item
+from app.core.exceptions import BusinessException, ModelProtocolException, ProviderException
+from app.generation.delivery import planning_item, suggested_delivery_plan
 from app.generation.engineering.checkpoint import (
     EXECUTION_MODE,
     load_checkpoint,
@@ -21,7 +21,11 @@ from app.generation.engineering.checkpoint import (
 from app.generation.workspace import default_workspace_path
 from app.models.task_execution import TaskExecution
 from app.models.workflow_event import WorkflowEvent
-from app.orchestration.code_engineer import run_engineering_workflow
+from app.orchestration.code_engineer import (
+    _EngineeringNodes,
+    _unchanged_failed_checks,
+    run_engineering_workflow,
+)
 from app.schemas.agent_action import ChatWithToolsResult, ToolCall, ToolExecutionResult
 from app.schemas.app_spec import AppSpec
 from app.services.engineering import read_frozen_input_snapshot
@@ -41,6 +45,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
         (self.root / "frontend/src/index.css").write_text(source_body, encoding="utf-8")
 
         def decide(*, work_item, observations, engineering_context, tools, **kwargs):
+            self.assertNotIn("completed_work_items", engineering_context)
             if work_item.id == "engineering_plan":
                 self.assertEqual(engineering_context["optional_capabilities"], [])
                 self.assertNotIn("install_capability", {tool.name for tool in tools})
@@ -79,6 +84,9 @@ class EngineeringLoopTests(EngineeringClaimTests):
                 return turn(
                     "complete_work_item", work_item_id=work_item.id, summary="Verified theme"
                 )
+            self.assertTrue(
+                any(item["status"] == "completed" for item in engineering_context["delivery_plan"])
+            )
             return self._implement(work_item=work_item, observations=observations)
 
         self.model.side_effect = decide
@@ -464,7 +472,7 @@ class EngineeringLoopTests(EngineeringClaimTests):
             },
         )
 
-    def test_repeated_reads_keep_tools_and_then_use_completion_gates(self):
+    def test_distinct_reads_keep_tools_and_then_use_completion_gates(self):
         self._start()
         batches = 0
         observed_tools = []
@@ -482,7 +490,9 @@ class EngineeringLoopTests(EngineeringClaimTests):
                 return ChatWithToolsResult(
                     tool_calls=[
                         ToolCall(
-                            id=f"r{batches}_{i}", name="read_file", arguments={"path": "README.md"}
+                            id=f"r{batches}_{i}",
+                            name="read_file",
+                            arguments={"path": f"context_{(batches - 1) * 16 + i}.md"},
                         )
                         for i in range(16)
                     ]
@@ -493,7 +503,8 @@ class EngineeringLoopTests(EngineeringClaimTests):
             )
             return self._implement(work_item=work_item, observations=observations)
 
-        (self.root / "README.md").write_text("Source evidence", encoding="utf-8")
+        for index in range(32):
+            (self.root / f"context_{index}.md").write_text("Source evidence", encoding="utf-8")
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "generated")
         self.assertTrue(all(names == observed_tools[0] for names in observed_tools))
@@ -505,6 +516,63 @@ class EngineeringLoopTests(EngineeringClaimTests):
             len([a for a in self._checkpoint()["activity"] if a["name"] == "read_file"]), 32
         )
 
+    def test_long_read_only_work_item_must_act_before_more_inspection(self):
+        self._start()
+        for index in range(16):
+            (self.root / f"context_{index}.md").write_text("Source evidence", encoding="utf-8")
+        reads = 0
+        gate_seen = False
+        gate_refused = False
+        reopened = False
+
+        def decide(*, work_item, observations, tools, engineering_context, **kwargs):
+            nonlocal reads, gate_seen, gate_refused, reopened
+            if work_item.id != "visual":
+                return self._implement(work_item=work_item, observations=observations)
+            names = {tool.name for tool in tools}
+            has_write = any(o.name == "write_files" and o.ok for o in observations)
+            if reads < 16:
+                self.assertIn("read_file", names)
+                path = f"context_{reads}.md"
+                reads += 1
+                return turn("read_file", path=path)
+            if not has_write:
+                gate_seen = True
+                self.assertNotIn("read_file", names)
+                self.assertNotIn("list_files", names)
+                self.assertNotIn("search_code", names)
+                self.assertTrue(
+                    {"write_files", "run_check", "update_delivery_plan", "report_blocked"} <= names
+                )
+                self.assertTrue(
+                    engineering_context["progress_guidance"]["inspection_action_required"]
+                )
+                if not gate_refused:
+                    gate_refused = True
+                    return turn("read_file", path="context_0.md")
+                refusal = next(
+                    row
+                    for row in observations
+                    if row.tool_call_id == "action"
+                    and row.name == "read_file"
+                    and row.error_code == "INSPECTION_ACTION_REQUIRED"
+                )
+                self.assertFalse(refusal.ok)
+                self.assertIn("未执行", refusal.summary)
+                self.assertEqual(refusal.data["diagnostic"]["disposition"], "needs_decision")
+                self.assertNotIn("重新执行 read_file", refusal.data["diagnostic"]["verification"])
+            elif gate_seen:
+                reopened = True
+                self.assertIn("read_file", names)
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertEqual(reads, 16)
+        self.assertTrue(gate_seen)
+        self.assertTrue(gate_refused)
+        self.assertTrue(reopened)
+
     def test_repeated_implementation_reads_stop_at_total_model_budget(self):
         self._start()
         with self.session_factory() as db:
@@ -514,13 +582,18 @@ class EngineeringLoopTests(EngineeringClaimTests):
             row.draft = snapshot
             flag_modified(row, "draft")
             db.commit()
-        (self.root / "README.md").write_text("evidence", encoding="utf-8")
+        for index in range(20):
+            (self.root / f"context_{index}.md").write_text("evidence", encoding="utf-8")
+        reads = 0
 
         def decide(*, work_item, observations, tools, **kwargs):
+            nonlocal reads
             if work_item.id == "engineering_plan":
                 return self._implement(work_item=work_item, observations=observations)
             self.assertIn("write_files", {t.name for t in tools})
-            return turn("read_file", path="README.md")
+            path = f"context_{reads}.md"
+            reads += 1
+            return turn("read_file", path=path)
 
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "blocked")
@@ -603,26 +676,55 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertTrue(all(i["status"] == "pending" for i in items))
         self.assertEqual([c.kwargs["check_id"] for c in self.checks.call_args_list], ["all"])
 
-    def test_repeated_implementation_reads_get_guidance_then_stop_without_tool_ban(self):
+    def test_redundant_implementation_reads_force_an_action_before_stopping(self):
         self._start()
         (self.root / "README.md").write_text("same evidence", encoding="utf-8")
-        guided = []
+        available_tools = []
+        saw_duplicate_feedback = []
 
         def decide(*, work_item, observations, tools, engineering_context, **kwargs):
             if work_item.id == "engineering_plan":
                 return self._implement(work_item=work_item, observations=observations)
-            self.assertIn("read_file", {t.name for t in tools})
-            self.assertIn("write_files", {t.name for t in tools})
-            if engineering_context["progress_guidance"]:
-                guided.append(engineering_context["progress_guidance"])
-            return turn("read_file", path="README.md", end_line=len(guided) + 10)
+            names = {t.name for t in tools}
+            available_tools.append(names)
+            saw_duplicate_feedback.append(
+                any(o.name == "read_file" and o.data.get("already_visible") for o in observations)
+            )
+            if "read_file" not in names or any(
+                o.ok and o.name == "write_files" for o in observations
+            ):
+                return self._implement(work_item=work_item, observations=observations)
+            return turn("read_file", path="README.md")
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        checkpoint = self._checkpoint()
+        self.assertTrue(any(saw_duplicate_feedback))
+        self.assertTrue(
+            any("read_file" not in names and "write_files" in names for names in available_tools)
+        )
+        self.assertTrue((self.root / "frontend/src/visual.ts").exists())
+        self.assertLess(checkpoint["tool_calls"], 20)
+
+    def test_redundant_reads_that_ignore_action_window_still_stop(self):
+        self._start()
+        (self.root / "README.md").write_text("same evidence", encoding="utf-8")
+        available_tools = []
+
+        def decide(*, work_item, observations, tools, **kwargs):
+            if work_item.id == "engineering_plan":
+                return self._implement(work_item=work_item, observations=observations)
+            available_tools.append({t.name for t in tools})
+            return turn("read_file", path="README.md")
 
         self.model.side_effect = decide
         self.assertEqual(self._run()["outcome"], "blocked")
-        self.assertGreaterEqual(len(guided), 3)
         checkpoint = self._checkpoint()
-        self.assertEqual(checkpoint["blocked_reason_code"], "NO_SOURCE_PROGRESS")
-        self.assertLess(checkpoint["tool_calls"], 120)
+        self.assertTrue(any("read_file" not in names for names in available_tools))
+        self.assertIn(
+            checkpoint["blocked_reason_code"], {"NO_SOURCE_PROGRESS", "REPEATED_TOOL_FAILURE"}
+        )
+        self.assertLess(checkpoint["tool_calls"], 20)
 
     def test_valid_model_call_resolves_protocol_refusal_and_keeps_audit(self):
         self._start()
@@ -654,6 +756,53 @@ class EngineeringLoopTests(EngineeringClaimTests):
         )
         self.assertTrue(
             any(h["scope"] == "tool:model_response:" for h in checkpoint["diagnostic_history"])
+        )
+
+    def test_malformed_write_retry_uses_existing_evidence_before_more_reads(self):
+        self._start()
+        protocol_failed = False
+        read_refused = False
+        retried_without_reads = False
+        reads_reopened = False
+
+        def decide(*, work_item, observations, engineering_context, tools, **kwargs):
+            nonlocal protocol_failed, read_refused, retried_without_reads, reads_reopened
+            if work_item.id != "visual":
+                return self._implement(work_item=work_item, observations=observations)
+            names = {tool.name for tool in tools}
+            if not protocol_failed:
+                protocol_failed = True
+                raise ModelProtocolException(
+                    "工具参数不是合法 JSON",
+                    data={
+                        "protocol_issue": "invalid_tool_arguments",
+                        "tool_name": "write_files",
+                        "tool_call_id": "bad_write",
+                    },
+                )
+            if not read_refused:
+                read_refused = True
+                self.assertNotIn("read_file", names)
+                return turn("read_file", path="README.md")
+            if not retried_without_reads:
+                retried_without_reads = True
+                self.assertEqual(engineering_context["protocol_retry"]["tool_name"], "write_files")
+                self.assertFalse({"read_file", "list_files", "search_code"} & names)
+                self.assertIn("write_files", names)
+            else:
+                reads_reopened = reads_reopened or "read_file" in names
+                self.assertIsNone(engineering_context["protocol_retry"])
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertTrue(retried_without_reads)
+        self.assertTrue(reads_reopened)
+        checkpoint = self._checkpoint()
+        self.assertTrue(any(row["name"] == "model_response" for row in checkpoint["observations"]))
+        self.assertIn(
+            checkpoint["diagnostic_state"]["tool:model_response:"]["status"],
+            {"resolved", "superseded"},
         )
 
     @staticmethod
@@ -941,7 +1090,98 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertTrue(repaired)
         self.assertIn("VALUE = 2", (self.root / "frontend/src/visual.ts").read_text())
 
-    def test_repeated_failed_completion_is_bounded(self):
+    def test_failed_check_on_unchanged_source_requires_repair_before_recheck(self):
+        self._start()
+        gated = False
+        reopened = False
+
+        def check(root, *, check_id, tool_call_id):
+            result = self._passing_check(root, check_id=check_id, tool_call_id=tool_call_id)
+            if check_id == "quick" and "VALUE = 1" in (root / "frontend/src/visual.ts").read_text(
+                encoding="utf-8"
+            ):
+                return result.model_copy(
+                    update={
+                        "ok": False,
+                        "error_code": "CHECK_FAILED",
+                        "summary": "browser smoke failed",
+                        "data": {**result.data, "output": "BROWSER_CHECK_FAILED home /"},
+                    }
+                )
+            return result
+
+        def decide(*, work_item, observations, engineering_context, tools, **kwargs):
+            nonlocal gated, reopened
+            if work_item.id != "visual":
+                return self._implement(work_item=work_item, observations=observations)
+            names = {tool.name for tool in tools}
+            written = next((o for o in observations if o.name == "write_files" and o.ok), None)
+            if written is None:
+                return self._implement(work_item=work_item, observations=observations)
+            failed = any(o.name == "run_check" and not o.ok for o in observations)
+            if not failed:
+                return turn("run_check", check_id="quick")
+            edited = any(o.name == "edit_file_by_replace" and o.ok for o in observations)
+            if not edited:
+                gated = True
+                self.assertNotIn("run_check", names)
+                self.assertNotIn("complete_work_item", names)
+                self.assertIn("edit_file_by_replace", names)
+                self.assertEqual(engineering_context["failed_check_repair"]["check_ids"], ["quick"])
+                self.assertTrue(engineering_context["active_diagnostics"])
+                return turn(
+                    "edit_file_by_replace",
+                    path="frontend/src/visual.ts",
+                    old_text="VALUE = 1",
+                    new_text="VALUE = 2",
+                    expected_hash=written.data["files"][0]["content_hash"],
+                )
+            reopened = "run_check" in names and "complete_work_item" in names
+            self.assertIsNone(engineering_context["failed_check_repair"])
+            return self._implement(work_item=work_item, observations=observations)
+
+        self.checks.side_effect = check
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "generated")
+        self.assertTrue(gated)
+        self.assertTrue(reopened)
+        self.assertEqual(
+            [call.kwargs["check_id"] for call in self.checks.call_args_list],
+            ["quick", "quick", "all", "all"],
+        )
+
+    def test_failed_check_gate_excludes_environment_and_stale_runtime(self):
+        self._start()
+        checkpoint = new_checkpoint()
+        source_hash = source_snapshot(self.root)[1]
+        row = ToolExecutionResult(
+            tool_call_id="check",
+            name="run_check",
+            ok=False,
+            summary="unavailable",
+            error_code="CHECK_ENVIRONMENT_UNAVAILABLE",
+            data={
+                "source_hash": source_hash,
+                "runtime_version": CHECK_RUNTIME_VERSION,
+            },
+        ).model_dump(mode="json")
+        checkpoint["check_cache"] = {"all": row}
+        self.assertIsNone(_unchanged_failed_checks(checkpoint, self.root))
+        row["error_code"] = "CHECK_FAILED"
+        row["data"]["runtime_version"] = "older"
+        self.assertIsNone(_unchanged_failed_checks(checkpoint, self.root))
+        row["data"]["runtime_version"] = CHECK_RUNTIME_VERSION
+        self.assertEqual(_unchanged_failed_checks(checkpoint, self.root)["check_ids"], ["all"])
+        row["summary"] = "复用同版本检查证据：复用同版本检查证据：原始失败"
+        cached = _EngineeringNodes._run_check(
+            self.root, checkpoint, check_id="all", tool_call_id="reuse"
+        )
+        self.assertEqual(cached.summary, "复用同版本检查证据：原始失败")
+        self.assertTrue(cached.data["cache_hit"])
+        (self.root / "frontend/src/changed.ts").write_text("export {}\n", encoding="utf-8")
+        self.assertIsNone(_unchanged_failed_checks(checkpoint, self.root))
+
+    def test_unchanged_failed_completion_cannot_recheck_and_ignoring_gate_is_bounded(self):
         self._start()
         self.checks.side_effect = lambda root, **kwargs: ToolExecutionResult(
             tool_call_id=kwargs["tool_call_id"],
@@ -958,8 +1198,14 @@ class EngineeringLoopTests(EngineeringClaimTests):
         )
         self.assertEqual(self._run()["outcome"], "blocked")
         self.assertEqual(self.checks.call_count, 1)
-        self.assertEqual(self._checkpoint()["repair_rounds"]["visual"], 3)
-        self.assertEqual(self._checkpoint()["blocked_reason_code"], "REPEATED_CHECK_FAILURE")
+        self.assertEqual(self._checkpoint()["repair_rounds"]["visual"], 1)
+        self.assertEqual(self._checkpoint()["blocked_reason_code"], "REPEATED_TOOL_FAILURE")
+        self.assertTrue(
+            any(
+                "complete_work_item" not in {tool.name for tool in call.kwargs["tools"]}
+                for call in self.model.call_args_list
+            )
+        )
 
     def test_environment_failure_does_not_spend_model_budget(self):
         self._start()
@@ -1017,8 +1263,8 @@ class EngineeringLoopTests(EngineeringClaimTests):
 
         self._start()
 
-        def stage_then_pause(call, root, hashes):
-            action = prepare_action(call, root, hashes)
+        def stage_then_pause(call, root, hashes, *, checkpoint=None):
+            action = prepare_action(call, root, hashes, checkpoint=checkpoint)
             self.assertTrue(action.updates)
             with self.session_factory() as db:
                 row = db.get(TaskExecution, self.execution.execution_id)
@@ -1100,6 +1346,99 @@ class EngineeringLoopTests(EngineeringClaimTests):
         self.assertEqual(self._run()["outcome"], "blocked")
         self.assertIn("missing approved", self._checkpoint()["blocked_reason"])
 
+    def test_frozen_implementation_repair_request_reaches_model_context(self):
+        self._start()
+        request = {
+            "revision_id": "rev_example",
+            "source_run_id": "run_previous",
+            "baseline_code_item_id": "ci_previous_code",
+            "message_id": 25,
+            "content": "修复其他用户能看到私有记录的缺陷",
+        }
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, self.execution.execution_id)
+            frozen = dict(row.draft)
+            frozen["implementation_repair_request"] = request
+            row.draft = frozen
+            flag_modified(row, "draft")
+            db.commit()
+        self.model.side_effect = None
+        self.model.return_value = turn("report_blocked", reason="missing repair dependency")
+        self.assertEqual(self._run()["outcome"], "blocked")
+        from app.agents.code_engineer import build_code_engineer_messages
+
+        decision = self.model.call_args.kwargs
+        self.assertEqual(decision["engineering_context"]["implementation_repair_request"], request)
+        messages = build_code_engineer_messages(
+            spec=decision["spec"],
+            work_item=decision["work_item"],
+            engineering_context=decision["engineering_context"],
+            system_design=decision["system_design"],
+            observations=decision["observations"],
+        )
+        current = json.loads(messages[-1]["content"])
+        self.assertEqual(current["engineering_context"]["implementation_repair_request"], request)
+
+    def test_paused_legacy_repair_plan_is_rescoped_before_model_continues(self):
+        self._start()
+        request = {
+            "revision_id": "rev_example",
+            "source_run_id": "run_previous",
+            "baseline_code_item_id": "ci_previous_code",
+            "message_id": 25,
+            "content": "1. 修复已修改的种子记录重启后重复。\n2. 修复跨账号私有数据泄漏。",
+        }
+        with self.session_factory() as db:
+            row = db.get(TaskExecution, self.execution.execution_id)
+            frozen = dict(row.draft)
+            spec = AppSpec.model_validate(valid_spec())
+            old = suggested_delivery_plan(spec)["items"]
+            old[0]["status"] = "completed"
+            old[0]["summary"] = "Verified existing theme"
+            checkpoint = new_checkpoint()
+            checkpoint.update(
+                {
+                    "work_items": old,
+                    "delivery_plan_version": 1,
+                    "needs_delivery_plan": False,
+                    "current_work_item_id": old[1]["id"],
+                    "model_turns": 19,
+                    "tool_calls": 20,
+                    "no_progress_steps": 8,
+                }
+            )
+            frozen["checkpoint"] = checkpoint
+            frozen["implementation_repair_request"] = request
+            row.draft = frozen
+            flag_modified(row, "draft")
+            db.commit()
+
+        def decide(*, work_item, engineering_context, **kwargs):
+            if work_item.id == "engineering_plan":
+                self.assertEqual(work_item.kind, "repair")
+                proposal = engineering_context["suggested_delivery_plan"]
+                self.assertEqual(len(proposal["items"]), 2)
+                self.assertEqual({row["kind"] for row in proposal["items"]}, {"repair"})
+                self.assertEqual(len(engineering_context["delivery_plan"]), 1)
+                return turn(
+                    "update_delivery_plan",
+                    suggested_plan_hash=proposal["content_hash"],
+                    reason="修复本次冻结的两个缺陷",
+                )
+            self.assertEqual(work_item.kind, "repair")
+            return turn("report_blocked", reason="Test stops before changing generated source")
+
+        self.model.side_effect = decide
+        self.assertEqual(self._run()["outcome"], "blocked")
+        state = self._checkpoint()
+        self.assertEqual(state["delivery_plan_scope"], "implementation_repair")
+        self.assertEqual(len(state["work_items"]), 3)
+        self.assertEqual(state["work_items"][0]["status"], "completed")
+        self.assertEqual({row["kind"] for row in state["work_items"][1:]}, {"repair"})
+        self.assertEqual(state["delivery_plan_history"][0]["items"], old)
+        self.assertGreaterEqual(state["model_turns"], 21)
+        self.assertGreaterEqual(state["tool_calls"], 21)
+
     def test_role_only_offers_implemented_tools(self):
         self.assertEqual(
             {tool.name for tool in CODE_ENGINEER_TOOLS}, CODE_ENGINEER_PROFILE.allowed_tools
@@ -1174,7 +1513,13 @@ class EngineeringLoopTests(EngineeringClaimTests):
             [message["role"] for message in messages],
             ["system", "user", "assistant", "tool", "user"],
         )
-        self.assertIn("已截断", json.loads(messages[-2]["content"])["data"]["content"])
+        data = json.loads(messages[-2]["content"])["data"]
+        self.assertTrue(data["content_truncated"])
+        self.assertTrue(data["partial_line"])
+        self.assertTrue(data["line_too_long"])
+        self.assertEqual(data["end_line"], 0)
+        self.assertNotIn("next_start_line", data)
+        self.assertIn("按行重读无法显示剩余内容", json.loads(messages[-2]["content"])["summary"])
 
     def test_latest_task_and_recovery_state_follow_historical_observations(self):
         from app.agents.code_engineer import build_code_engineer_messages

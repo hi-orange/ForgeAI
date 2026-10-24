@@ -28,10 +28,13 @@
 - A repair may create a new `code` and `source_hash` while retaining the same approved `app_spec` and `test_hash`.
 - A repair inherits the QA suite from its predecessor report and must rerun it on the new source.
   Endpoint/selector adaptation may produce a new suite version, but cannot delete scenarios,
-  operations, input data or assertions. Expected-result changes require a challenge.
+  operations, input data or assertions. A visibility-only wait can be inserted or removed without
+  changing that contract. Expected-result changes require a challenge.
 - Acceptance plan schema v3 names independent QA execution. Report schema v3 embeds the suite;
-  QA checkpoint v2 retains version history, execution records and spent budgets. v1/v2 artifacts
-  remain readable; only new runner-bound evidence can satisfy a new passing publication.
+  QA checkpoint v5 retains version history, execution records, spent turns, defect-resolution audit
+  and up to three explicit budget grant attempt ids. v1/v2/v3/v4 checkpoints
+  and QA runner v1 executions remain readable; only current runner-bound evidence can satisfy a new
+  passing publication.
 - A product change creates a new approved `app_spec`, acceptance plan and `test_hash`; it does not mutate the old frozen plan.
 - A change after a terminal run creates a new BuildRun and explicit `RunRevision`; old artifacts and
   execution state remain immutable. Implementation repair may clone the source workspace but must

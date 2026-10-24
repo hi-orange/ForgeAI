@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -70,6 +71,152 @@ def _http_error_retryable(response: httpx.Response | None) -> bool:
     return status == 429 or status >= 500
 
 
+def _stream_error() -> ProviderException:
+    return ProviderException("大模型流式响应不完整，请稍后重试", retryable=True)
+
+
+def _sse_data(response: httpx.Response) -> Iterator[str]:
+    """Read complete SSE data events, ignoring comments and other event fields."""
+    lines: list[str] = []
+    for line in response.iter_lines():
+        if line.startswith("data:"):
+            value = line[5:]
+            if value.startswith(" "):
+                value = value[1:]
+            if value == "[DONE]":
+                if lines:
+                    yield "\n".join(lines)
+                yield value
+                return
+            lines.append(value)
+        elif not line and lines:
+            yield "\n".join(lines)
+            lines = []
+    if lines:
+        yield "\n".join(lines)
+
+
+def _read_streamed_chat(response: httpx.Response) -> dict[str, Any]:
+    """Reassemble one complete DeepSeek turn before exposing any tool call."""
+    content: list[str] = []
+    reasoning: list[str] = []
+    saw_content = saw_reasoning = saw_done = False
+    calls: dict[int, dict[str, Any]] = {}
+    model: str | None = None
+    finish_reason: str | None = None
+    usage: dict[str, Any] | None = None
+
+    for event in _sse_data(response):
+        if event == "[DONE]":
+            saw_done = True
+            break
+        try:
+            chunk = json.loads(event)
+        except json.JSONDecodeError as exc:
+            raise _stream_error() from exc
+        if not isinstance(chunk, dict):
+            raise _stream_error()
+        if isinstance(chunk.get("model"), str):
+            model = chunk["model"]
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise _stream_error()
+        choice = choices[0]
+        if choice.get("index") != 0 or not isinstance(choice.get("delta"), dict):
+            raise _stream_error()
+        delta = choice["delta"]
+        if finish_reason is not None and any(
+            delta.get(key) for key in ("content", "reasoning_content", "tool_calls")
+        ):
+            raise _stream_error()
+        for key, parts in (("content", content), ("reasoning_content", reasoning)):
+            value = delta.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise _stream_error()
+            parts.append(value)
+            if key == "content":
+                saw_content = True
+            else:
+                saw_reasoning = True
+        fragments = delta.get("tool_calls")
+        if fragments is None:
+            fragments = []
+        if not isinstance(fragments, list):
+            raise _stream_error()
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                raise _stream_error()
+            index = fragment.get("index")
+            if type(index) is not int or index < 0:
+                raise _stream_error()
+            call = calls.setdefault(
+                index, {"id": None, "type": None, "name": None, "arguments": []}
+            )
+            for key in ("id", "type"):
+                value = fragment.get(key)
+                if value is None or value == "":
+                    continue
+                if not isinstance(value, str) or (call[key] is not None and call[key] != value):
+                    raise _stream_error()
+                call[key] = value
+            function = fragment.get("function")
+            if function is None:
+                function = {}
+            if not isinstance(function, dict):
+                raise _stream_error()
+            name = function.get("name")
+            if name is not None and name != "":
+                if not isinstance(name, str) or (call["name"] is not None and call["name"] != name):
+                    raise _stream_error()
+                call["name"] = name
+            arguments = function.get("arguments")
+            if arguments is not None:
+                if not isinstance(arguments, str):
+                    raise _stream_error()
+                call["arguments"].append(arguments)
+        terminal = choice.get("finish_reason")
+        if terminal is not None:
+            if not isinstance(terminal, str) or finish_reason is not None:
+                raise _stream_error()
+            finish_reason = terminal
+            final_usage = chunk.get("usage")
+            if not isinstance(final_usage, dict):
+                raise _stream_error()
+            usage = final_usage
+
+    if not saw_done or finish_reason is None or usage is None:
+        raise _stream_error()
+    tool_calls = []
+    if finish_reason != "length":
+        for index in sorted(calls):
+            call = calls[index]
+            if not call["id"] or call["type"] != "function" or not call["name"]:
+                raise _stream_error()
+            tool_calls.append(
+                {
+                    "id": call["id"],
+                    "type": call["type"],
+                    "function": {"name": call["name"], "arguments": "".join(call["arguments"])},
+                }
+            )
+    return {
+        "model": model,
+        "usage": usage,
+        "choices": [
+            {
+                "finish_reason": finish_reason,
+                "message": {
+                    "content": "".join(content) if saw_content else None,
+                    "reasoning_content": "".join(reasoning) if saw_reasoning else None,
+                    "tool_calls": tool_calls,
+                },
+            }
+        ],
+    }
+
+
 def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
     """向 DeepSeek chat/completions 发请求，统一处理超时与 HTTP 错误。"""
     if not settings.deepseek_api_key:
@@ -82,9 +229,16 @@ def _post_chat(body: dict[str, object], *, timeout: float) -> dict[str, Any]:
     }
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, headers=headers, json=body)
-            response.raise_for_status()
-            data = response.json()
+            if body.get("stream") is True:
+                with client.stream("POST", url, headers=headers, json=body) as response:
+                    if response.status_code >= 300:
+                        response.read()
+                    response.raise_for_status()
+                    data = _read_streamed_chat(response)
+            else:
+                response = client.post(url, headers=headers, json=body)
+                response.raise_for_status()
+                data = response.json()
     except httpx.TimeoutException as exc:
         logger.warning("LLM request timed out")
         raise ProviderException(
@@ -198,6 +352,29 @@ def _parse_arguments(raw: object) -> dict[str, Any]:
     return parsed
 
 
+def _parse_call_arguments(raw: object, *, name: str, call_id: str) -> dict[str, Any]:
+    """Keep a malformed native call identifiable without retaining its source body."""
+    try:
+        return _parse_arguments(raw)
+    except BusinessException as exc:
+        cause = exc.__cause__
+        location = (
+            {"line": cause.lineno, "column": cause.colno}
+            if isinstance(cause, json.JSONDecodeError)
+            else {}
+        )
+        raise ModelProtocolException(
+            str(exc),
+            data={
+                "protocol_issue": "invalid_tool_arguments",
+                "tool_name": name[:128],
+                "tool_call_id": call_id[:128],
+                "argument_length": len(raw) if isinstance(raw, str) else None,
+                **location,
+            },
+        ) from exc
+
+
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """json.loads 的 object_pairs_hook：拒绝重复键，避免静默覆盖。"""
     result: dict[str, Any] = {}
@@ -237,7 +414,11 @@ def parse_agent_action(payload: dict[str, Any]) -> ChatWithToolsResult:
                 ToolCall(
                     id=str(call_id),
                     name=name.strip(),
-                    arguments=_parse_arguments(function.get("arguments", item.get("arguments"))),
+                    arguments=_parse_call_arguments(
+                        function.get("arguments", item.get("arguments")),
+                        name=name.strip(),
+                        call_id=str(call_id),
+                    ),
                 )
             )
         return ChatWithToolsResult(
@@ -312,6 +493,7 @@ def chat_with_tools(
     max_tokens: int = 4096,
     timeout: float = 120.0,
     thinking: bool = False,
+    parallel_tool_calls: bool = False,
 ) -> ChatWithToolsResult:
     """带 tools 的一轮对话；允许只有 tool_calls、content 为空。"""
     body: dict[str, object] = {
@@ -320,7 +502,7 @@ def chat_with_tools(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "thinking": {"type": "disabled"},
-        "parallel_tool_calls": False,
+        "parallel_tool_calls": parallel_tool_calls,
         "tools": [
             {
                 "type": "function",
@@ -336,6 +518,8 @@ def chat_with_tools(
     if thinking:
         body["thinking"] = {"type": "enabled"}
         body["reasoning_effort"] = "high"
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
         body.pop("temperature", None)
         # Legacy non-thinking exchanges have no reasoning to replay. Do not
         # mutate checkpoint-owned dictionaries or invent reasoning for them.

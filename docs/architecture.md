@@ -29,7 +29,8 @@ turned into an isolated, traceable and recoverable generated application.
 10. Terminal runs are immutable. A post-completion product change or implementation repair creates a
     new `BuildRun` with an explicit `RunRevision` edge to the exact prior app specification and code
     baseline. Product changes return to approval; repairs retain approved intent and receive a new
-    code identity and acceptance run.
+    code identity and acceptance run. An implementation repair freezes the initiating user message
+    in the new engineering execution, so later project messages cannot change its repair target.
 11. Stop and pause are different transitions. Pause prevents new job claims for the BuildRun,
     releases any current job lease, fences the active execution, and preserves queued work and
     checkpoints for explicit resume. Cancel atomically closes the active execution, task, plan and
@@ -117,16 +118,30 @@ an unavailable dependency is an environment block, never a product pass.
 Each execution binds `code_item_id`, `source_hash`, `suite_hash`, runner version and a unique execution
 id. Operation/expectation/observation records produce case statuses; neither model-authored requirement
 conclusions, smoke nor screenshots can create case passes. Every required case must pass the current
-snapshot, the supplemental smoke/visual gates must pass, and no recorded defect may remain before
+snapshot, the supplemental smoke/visual gates must pass, and no active defect may remain before
 delivery. The publication service revalidates persisted platform observations under the execution
 lease, independently of model report submission.
 
 QA assets and execution history are versioned JSON in the existing fenced task checkpoint, and the
 final report embeds its frozen suite for durable repair handoff. Local execution files are diagnostic
 copies, not the recovery authority. Adapter revisions preserve scenarios, input/action order and
-assertions; changing expected behavior or assertions enters explicit challenge resolution. Product
+assertions. A visibility wait may be inserted or removed solely as a synchronization barrier; it
+does not replace an assertion. Changing expected behavior or assertions enters explicit challenge resolution. Product
 repair inherits the original suite and reruns all scenarios against the new source; old observations
 cannot be restored into the new identity. Recovery preserves tool, revision and execution budgets.
+Recorded QA defects remain in the checkpoint audit. The Test Engineer may explicitly resolve one only
+when every related case passes the latest current-suite, current-runner independent execution on the
+same source; the report includes active defects only. A new execution is withheld while known
+script-blocked cases still have unchanged scripts, preserving the limited execution budget.
+QA starts with 64 model/tool turns. A user-triggered continuation after exact budget exhaustion may
+grant 64 more turns on the same fenced task, at most three times (256 total); the checkpoint records
+each execution attempt id and cumulative spent turns, so ordinary retries cannot mint extra budget.
+After independent execution exists, twelve consecutive read-only model turns without a QA action or
+new check evidence stop the attempt while preserving its suite and runner evidence; a recovered older
+checkpoint starts this inspection count at recovery rather than guessing past activity.
+Independent runner executions start with six. A user-triggered continuation at exact exhaustion may
+grant two more, at most three times; the checkpoint records each grant attempt and preserves earlier
+execution evidence. Ordinary retries cannot reset this budget.
 Legacy plans/reports remain readable. New report publication cannot use legacy implicit synthesis
 to satisfy independent evidence requirements.
 
@@ -160,6 +175,14 @@ available. The engineer explicitly adopts the displayed proposal by its content 
 custom graph. Adoption uses the same validation, fencing, history and budgets; it is not automatic
 completion or product approval. An existing plan and independent QA repair cannot be replaced through
 this shortcut. Changed proposals require a fresh matching hash.
+
+An implementation repair uses the initiating frozen defect request as its work scope while retaining
+the approved AppSpec as the behavior boundary. Its proposal contains only those defect targets, with
+optional links to affected approved features. A repair plan does not replay every original feature or
+require a new visual foundation; existing source and completed work remain the baseline. On recovery
+from an older full-feature repair graph, the platform keeps completed nodes and spent budgets, records
+the superseded graph, and replans only pending repair work. The final integration and independent QA
+gates still cover the complete approved application.
 
 The runtime validates exact approved feature coverage, unique task ids, existing dependency targets,
 acyclicity and frozen architecture dependencies. A visual foundation establishes or verifies reuse of
@@ -196,13 +219,24 @@ code result. Engineering extends the mutable smoke manifest with the
 current capability and retains probes for already implemented behavior; unimplemented scenarios enter
 with their owning work item. Final completion still requires `all` and independent QA. Passing smoke
 proves only the probes executed, not semantic coverage of every approved requirement.
+An API smoke probe that actually failed with 404 while expecting success remains part of the
+engineering evidence for that BuildRun. Later source edits may strengthen it or fix credentials,
+but removing its id, substituting another endpoint, or weakening its status/query/assertions cannot
+turn the same failed behavior into a passing `all` result. Existing checkpoints recover the executed
+request from durable check history before honoring a newer mutable manifest.
 
 The `all` runner performs syntax and TypeScript checks once, followed by frontend build, migrations,
 API smoke and browser smoke in the same container. A failed early stage prevents costly later stages.
+Browser smoke and its outer `all` process receive bounded time based on the validated manifest size;
+larger suites must execute their checks, and an expired budget remains a failed check.
 Check cache reuse requires both exact source hash and runtime version. Host elapsed time and bounded
 runner phase observations distinguish execution from cache reuse; timings are diagnostic data, never
 quality authority. A targeted repair recheck cannot resolve a broader failed gate. A passing `all`
 may resolve the narrower checks it actually includes, with explicit coverage and source provenance.
+After a code-corrective check fails, the engineer must change source or perform the diagnosed
+regeneration before another check against the same source and runner version; the decision loop
+withholds check and completion tools for that unchanged snapshot. Environment failures do not impose
+this source-edit gate, and bounded no-progress protection still applies.
 
 Engineering reuses the template's API envelope/error handling and database/migration primitives.
 Authentication remains opt-in to approved intent. After backend contracts are implemented,
@@ -229,11 +263,15 @@ durable audit history keeps them. Independent QA defects can only be resolved by
 
 Engineering tracks returned file-version/range coverage separately from source and verification
 progress. Changing read arguments, rereading overlapping ranges, or replaying a cached check does not
-create new progress. Continued inspection receives one replaceable current-state guidance note, with
-all implementation tools still available. After a grace period, continued lack of source/check
-progress pauses the attempt under the existing recoverable stop policy. These thresholds are bounded
-engineering heuristics to evaluate, not a semantic proof that investigation is unnecessary. Automatic
-recovery preserves counters and guidance; only explicit retry grants another bounded attempt.
+create new progress. Source excerpts report the lines actually visible to the model; omitted tails
+retain a next-range hint, while an oversized single line reports that line-based rereads cannot reveal
+its remainder. A reread whose visible content is already in context returns concise feedback without
+another copy of the source. Four redundant reads without new evidence or delivery pause the attempt
+with a recoverable no-progress reason. Other continued inspection receives one replaceable current-state
+guidance note, with all implementation tools still available. After a grace period, continued lack of
+source/check progress also pauses under the existing recoverable stop policy. These thresholds are
+bounded engineering heuristics to evaluate, not a semantic proof that investigation is unnecessary.
+Automatic recovery preserves counters and guidance; only explicit retry grants another bounded attempt.
 Outstanding failed checks also retain a separate bounded counter across edits and observations.
 Only a passing result for that check clears it; unrelated passing checks and arbitrary source edits
 cannot indefinitely defer a recoverable stop. This remains a heuristic, not proof of product progress.
@@ -297,6 +335,9 @@ gates.
   co-located prerequisite/dependent requirements still require explicit task separation under the
   current graph contract. The checkpoint retains distinct raw failures and source-bound correction
   attempts, while model context carries the latest plan/check exchanges and unresolved diagnostics.
+  Long check logs are abbreviated in that model history while retaining check and source identities,
+  structured diagnostics and a short excerpt; the checkpoint keeps the original output for audit and
+  recovery.
   Plan correction also carries a bounded structural summary of recent failed submissions since the
   last accepted plan. Repeated conflicts are matched by rule and affected requirement or dependency,
   independently of cosmetic plan changes; returning conflicts flag possible regressions, not proof
@@ -308,14 +349,24 @@ gates.
   Work-item memory retains actual changed paths, bounded source excerpts and recent actions beyond
   the rolling tool history. Source evidence is keyed by path, source hash and read range: complementary
   ranges coexist, identical range reads are deduplicated, and a new source version replaces all old
-  fragments. The latest native exchange for each range remains visible. Recovery can seed compatible
+  fragments. Recent native read batches retain immediate feedback; older current ranges remain in
+  hash-checked work memory without replaying every read call. Recovery can seed compatible
   ranges from saved observations without resetting usage or resuming a stopped run. Per-file cached
   text and aggregate projected source text are bounded; omitted ranges are explicit. Source versions
   remain known even when their text is omitted from the context budget.
   Excerpts are hash-checked against the workspace before reuse; omitted,
-  truncated and stale evidence is explicit. Writes do not prove completion. Repeated inspection
-  during implementation does not disable tools or require a model-authored correction plan; total
-  call budgets still bound execution. Historical focus state is retained only for audit on upgrade.
+  truncated and stale evidence is explicit. Writes do not prove completion. Consecutive read-only
+  model decisions have a bounded exploration window; a batch of independent reads counts as one
+  decision. Repeated reads of visible source or prolonged inspection without new evidence close the
+  read tools early, before the no-progress stop-loss. At the boundary, the next decision offers
+  implementation, verification, valid pending-plan revision and explicit blocking rather than more
+  reads. A committed source change, new check evidence or accepted plan revision opens another bounded
+  window. This action gate preserves source evidence,
+  frozen inputs and spent call budgets; an explicit manual retry may reopen limited inspection without
+  erasing prior audit evidence. During the gate, old successful read calls are omitted from the
+  model's replay while current source excerpts remain in working memory. An attempted unavailable
+  read is recorded with its actual call id as an unexecuted failure so the next decision sees a
+  concrete correction. Historical focus state is retained only for audit on upgrade.
   Protocol refusals apply to the tool set offered for that response: a changed set supersedes them,
   and a validated model tool call resolves them without clearing unrelated failures. Protocol errors
   are current diagnostics, not fictitious tool-call history. Recovery reasons are explicitly historical;

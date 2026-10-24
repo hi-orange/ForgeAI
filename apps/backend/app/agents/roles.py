@@ -117,6 +117,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
             {
                 "design_test_cases",
                 "write_test_script",
+                "adapt_test_script",
                 "run_acceptance_tests",
                 "read_artifact",
                 "list_files",
@@ -125,6 +126,7 @@ ROLE_PROFILES: dict[TaskRecipient, AgentRoleProfile] = {
                 "run_check",
                 "capture_screenshots",
                 "record_defect",
+                "resolve_defect",
                 "write_test_report",
             }
         ),

@@ -30,10 +30,11 @@ COPY sandbox/smoke_contract.json /opt/forgeai/smoke_contract.json
 COPY sandbox/smoke_manifest.py /opt/forgeai/smoke_manifest.py
 COPY sandbox/capture.mjs /opt/forgeai/capture.mjs
 COPY sandbox/probe.mjs /opt/forgeai/probe.mjs
+COPY sandbox/probe_actions.mjs /opt/forgeai/probe_actions.mjs
 COPY sandbox/smoke_responses.mjs /opt/forgeai/smoke_responses.mjs
 COPY sandbox/acceptance.py /opt/forgeai/acceptance.py
 COPY sandbox/acceptance.mjs /opt/forgeai/acceptance.mjs
-LABEL org.forgeai.check-runtime-version="20"
+LABEL org.forgeai.check-runtime-version="22"
 LABEL org.forgeai.preview-runtime-version="3"
 LABEL org.forgeai.dependency-runtime-version="3"
 ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1

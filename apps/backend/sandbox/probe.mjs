@@ -1,6 +1,7 @@
 import playwright from '/opt/visual/node_modules/playwright-core/index.js'
 import fs from 'node:fs/promises'
 import { expectedResourceError, matchesResponse } from './smoke_responses.mjs'
+import { runBrowserActions } from './probe_actions.mjs'
 
 const { chromium } = playwright
 const [baseUrl, manifestPath] = process.argv.slice(2)
@@ -67,6 +68,7 @@ const results = []
 let failed = false
 try {
   for (const check of checks) {
+    console.log(`BROWSER_CHECK_START ${check.id} ${check.route}`)
     const context = await browser.newContext({
       viewport: check.viewport || contract.browser.default_viewport,
       locale: 'zh-CN',
@@ -114,12 +116,7 @@ try {
       for (const text of check.expect_text || []) {
         await page.getByText(text, { exact: false }).first().waitFor({ state: 'visible' })
       }
-      for (const action of check.actions || []) {
-        const handler = actionHandlers[action.type]
-        if (!handler) throw new Error('unsupported browser action: ' + action.type)
-        await handler(page, action)
-        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
-      }
+      await runBrowserActions(page, check.actions || [], actionHandlers)
       for (const expected of check.expect_api || []) {
         if (!apiResponses.some((item) => matchesResponse(expected, item))) {
           errors.push(`missing expected frontend API response: ${JSON.stringify(expected)}`)
@@ -160,6 +157,7 @@ try {
       api_responses: apiResponses,
     })
     await context.close()
+    console.log(`BROWSER_CHECK_RESULT ${check.id} ${errors.length ? 'failed' : 'passed'}`)
   }
 } finally {
   await browser.close()

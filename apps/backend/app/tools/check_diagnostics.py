@@ -25,6 +25,9 @@ _API_STATUS_ERROR = re.compile(
     r"^(?:RuntimeError: )?API 联调失败 (?P<check>[^：]+)：期望 HTTP "
     r"(?P<expected>\d+)，实际 (?P<actual>\d+)；(?P<detail>.*)$"
 )
+_HTTP_ACCESS_LOG = re.compile(
+    r'"(?P<method>[A-Z]+) (?P<route>/\S+) HTTP/[^\s"]+"\s+(?P<status>\d{3})\b'
+)
 _TRACEBACK_FILE = re.compile(r'^\s*File\s+"(?P<path>[^"]+)",\s+line\s+(?P<line>\d+)')
 _PYTHON_EXCEPTION = re.compile(
     r"^(?:(?:[\w]+\.)+)?(?P<code>"
@@ -60,6 +63,9 @@ class CheckDiagnostic:
     actual: str | None = None
     symbol: str | None = None
     related_module: str | None = None
+    method: str | None = None
+    route: str | None = None
+    suggested_action: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -119,10 +125,18 @@ def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
     diagnostics: list[CheckDiagnostic] = []
     last_file: str | None = None
     last_line: int | None = None
+    last_request: tuple[str, str, str] | None = None
     for raw_line in output.splitlines():
         line = raw_line.strip()
         if not line:
             continue
+        request_match = _HTTP_ACCESS_LOG.search(line)
+        if request_match and request_match.group("route").startswith("/api/v1/"):
+            last_request = (
+                request_match.group("method"),
+                request_match.group("route"),
+                request_match.group("status"),
+            )
         file_match = _TRACEBACK_FILE.match(raw_line)
         if file_match:
             # Keep the last generated-workspace frame. Library frames after it
@@ -137,14 +151,28 @@ def extract_check_diagnostics(output: str) -> tuple[CheckDiagnostic, ...]:
         python_match = _PYTHON_EXCEPTION.match(line)
         api_match = _API_STATUS_ERROR.match(line)
         if api_match:
+            actual = api_match.group("actual")
+            request = last_request if last_request and last_request[2] == actual else None
+            expected = api_match.group("expected")
+            missing_successful_api = actual == "404" and 200 <= int(expected) < 300
             diagnostics.append(
                 CheckDiagnostic(
                     kind="api",
                     code=api_match.group("check"),
                     message=line,
                     raw=line,
-                    expected=api_match.group("expected"),
-                    actual=api_match.group("actual"),
+                    expected=expected,
+                    actual=actual,
+                    method=request[0] if request else None,
+                    route=request[1] if request else None,
+                    suggested_action=(
+                        "按此探针 id 核对 forgeai.smoke.json 中的方法、路径和已批准验收；"
+                        "检查实际注册的后端路由（如 /openapi.json）及对应查询。"
+                        "若批准功能要求该请求成功，补齐真实接口和响应；"
+                        "保留等价强度的探针，只有证实探针地址错误时才修正它。"
+                        if missing_successful_api
+                        else None
+                    ),
                 )
             )
         elif browser_match:
@@ -288,6 +316,8 @@ def analyze_check_failure(result: ToolExecutionResult) -> CheckFailureAnalysis:
                     "column": item.column,
                     "code": item.code,
                     "message": item.message,
+                    "method": item.method,
+                    "route": item.route,
                 }
                 for item in actionable
             ],

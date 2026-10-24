@@ -97,6 +97,19 @@ class TestChallenge(BaseModel):
     requested_resolution: ReportText
 
 
+class TestReportDecision(BaseModel):
+    """Model-authored judgment; platform attaches exact frozen suite and runner facts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    suite_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    execution_id: str | None = Field(default=None, max_length=64)
+    quality_conclusion: QualityConclusion
+    summary: ReportText
+    residual_risks: list[ReportText] = Field(default_factory=list, max_length=50)
+    test_challenges: list[TestChallenge] = Field(default_factory=list, max_length=50)
+
+
 class TestReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

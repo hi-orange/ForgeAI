@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from app.core.exceptions import AppException, ConflictException
+from app.generation.engineering.smoke_guard import smoke_probe_violation
 from app.schemas.agent_action import ToolCall, ToolExecutionResult
 from app.tools import files
 from app.tools.code_engineer import (
@@ -50,7 +51,13 @@ def writable_path(root: Path, path: str) -> str:
     return canonical
 
 
-def prepare_action(call: ToolCall, root: Path, observed_hashes: dict[str, str]) -> PreparedAction:
+def prepare_action(
+    call: ToolCall,
+    root: Path,
+    observed_hashes: dict[str, str],
+    *,
+    checkpoint: dict | None = None,
+) -> PreparedAction:
     """Network/model/container work happens here, outside database transactions."""
     try:
         call = validate_tool_call(call)
@@ -108,7 +115,9 @@ def prepare_action(call: ToolCall, root: Path, observed_hashes: dict[str, str]) 
                 or observed_hashes.get(path) != call.arguments["expected_hash"]
             ):
                 raise ConflictException(
-                    "修改已有源码前必须 read_file 并使用该次读取的 content_hash"
+                    "修改已有源码缺少匹配的已观察 content_hash；"
+                    "使用初始源码上下文或工作记忆中完整、当前的内容与哈希，"
+                    "缺失或过期时再定向 read_file"
                 )
         if writes is not None:
             for row in writes:
@@ -116,7 +125,11 @@ def prepare_action(call: ToolCall, root: Path, observed_hashes: dict[str, str]) 
                     not row.get("expected_hash")
                     or observed_hashes.get(row["path"]) != row["expected_hash"]
                 ):
-                    raise ConflictException(f"修改 {row['path']} 前必须读取并使用 content_hash")
+                    raise ConflictException(
+                        f"修改 {row['path']} 缺少匹配的已观察 content_hash；"
+                        "使用初始源码上下文或工作记忆中完整、当前的内容与哈希，"
+                        "缺失或过期时再定向 read_file"
+                    )
         with TemporaryDirectory(prefix="forgeai-tool-stage-") as directory:
             staging = Path(directory)
             for path, original in originals.items():
@@ -137,10 +150,28 @@ def prepare_action(call: ToolCall, root: Path, observed_hashes: dict[str, str]) 
                     metadata = updates.get("template.json")
                     if metadata is None:
                         metadata = safe_path_under_root(root, "template.json").read_bytes()
-                    parse_smoke_manifest(
+                    manifest = parse_smoke_manifest(
                         updates["forgeai.smoke.json"].decode("utf-8"),
                         root=root.resolve(),
                         template_metadata=json.loads(metadata),
+                    )
+                    if checkpoint is not None:
+                        violation = smoke_probe_violation(checkpoint, manifest)
+                        if violation is not None:
+                            raise ConflictException(violation)
+                if not updates and call.name in {
+                    "write_files",
+                    "write_file",
+                    "edit_file_by_replace",
+                }:
+                    result = result.model_copy(
+                        update={
+                            "summary": (
+                                "提交的文件内容与当前源码相同，没有产生修改；"
+                                "请继续检查或实现缺失能力"
+                            ),
+                            "data": {**result.data, "unchanged_files": paths},
+                        }
                     )
             return PreparedAction(result, originals, updates)
     except (AppException, ValueError, OSError) as exc:

@@ -50,6 +50,7 @@ class BrowserStep(QAAsset):
         "expect_count",
         "expect_path",
         "expect_visible",
+        "wait_for_visible",
     ]
     path: Text | None = None
     selector: Text | None = None
@@ -60,9 +61,20 @@ class BrowserStep(QAAsset):
     def required_arguments(self) -> Self:
         if self.action in {"navigate", "expect_path"} and self.path is None:
             raise ValueError("浏览器路由缺失")
-        if self.action in {"fill", "click", "select", "expect_count", "expect_visible"}:
+        if self.action in {
+            "fill",
+            "click",
+            "select",
+            "expect_count",
+            "expect_visible",
+            "wait_for_visible",
+        }:
             if self.selector is None:
                 raise ValueError("浏览器选择器缺失")
+        if self.action == "wait_for_visible" and any(
+            value is not None for value in (self.path, self.value, self.count)
+        ):
+            raise ValueError("纯同步步骤只接受 selector")
         if self.action in {"fill", "select", "expect_text"} and self.value is None:
             raise ValueError("浏览器输入或预期文本缺失")
         if self.action == "expect_text" and not (self.value or "").strip():
@@ -142,6 +154,9 @@ def assertion_contract(script: QAScript) -> list[dict[str, Any]]:
     """
     contract = []
     for step in script.steps:
+        if isinstance(step, BrowserStep) and step.action == "wait_for_visible":
+            # A bounded visibility barrier changes no input, operation or business assertion.
+            continue
         raw = step.model_dump(mode="json")
         adaptable = ("path", "capture") if isinstance(step, APIStep) else ("selector",)
         if isinstance(step, BrowserStep) and step.action == "navigate":

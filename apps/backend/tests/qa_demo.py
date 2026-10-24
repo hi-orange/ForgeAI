@@ -65,6 +65,7 @@ def demo_suite():
             browser("fill", selector='[data-testid="username"]', value="alice"),
             browser("fill", selector='[data-testid="password"]', value="test-only"),
             browser("click", selector='[data-testid="login"]'),
+            browser("wait_for_visible", selector='p:has-text("Signed in as alice")'),
             browser("expect_text", value="Signed in as alice"),
             browser("fill", selector='[data-testid="title"]', value="Browser persistent record"),
             browser("click", selector='[data-testid="save"]'),

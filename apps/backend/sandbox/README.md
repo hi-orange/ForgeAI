@@ -36,7 +36,14 @@ docker tag registry-1.docker.io/library/python:3.13-slim-bookworm python:3.13-sl
 
 `smoke_contract.json` 是模型、写入校验和隔离执行的共同契约。配置在源码暂存阶段和检查
 启动前校验；`all` 先验证配置并编译前端，再迁移临时数据库。当前上限为 50 个 API 用例、
-50 个浏览器用例、每例 80 个动作、累计 400 个动作；浏览器总时限仍为 120 秒。
+50 个浏览器用例、每例 80 个动作、累计 400 个动作。浏览器从 120 秒起，
+按新增用例和动作数增加总时限，最高 900 秒；每个 Playwright 动作仍单独限时，
+浏览器在初次导航和整组动作结束后等待网络空闲，显式选择器等待仍逐项执行。
+用例起止会写入检查日志，超时不能变为通过。
+需要认证的 API 探针先在登录响应中用 `"capture":{"seeker_token":"data.access_token"}`
+捕获令牌；后续探针用 `"headers":{"Authorization":"Bearer ${seeker_token}"}`。
+API 探针按数组顺序运行，`${name}` 可用于后续请求的路径、JSON 请求体和请求头。
+`auth` 不是 API 探针字段，写入时会被拒绝；实际登录路径及响应 JSON 路径以生成应用为准。
 纯 UI 用例使用 `kind: "ui"` 并提供可观察断言；默认集成用例仍要求 `expect_api`。
 负向 HTTP 场景可声明 `{"method":"POST","path":"/api/v1/apply","status":409}`，
 方法、含查询串的路径和状态必须精确匹配。意外 HTTP 错误、业务 console.error 和脚本异常
@@ -44,7 +51,9 @@ docker tag registry-1.docker.io/library/python:3.13-slim-bookworm python:3.13-sl
 依赖工具按 npm 注册表规格和 Python PEP 508 分别解析；不接受本地路径、URL 或 VCS。
 
 配置：`ENGINEERING_CHECK_IMAGE`（默认上述标签）与
-`ENGINEERING_CHECK_TIMEOUT_SECONDS`（默认 300 秒，平台硬限制 300 秒）。
+`ENGINEERING_CHECK_TIMEOUT_SECONDS`（默认 1200 秒，作为 `all` 总时限的上限；
+`all` 根据清单浏览器预算再加 180 秒构建/API 余量，平台硬限制 1200 秒；
+其他工程检查仍最多 300 秒）。
 预览使用 `PREVIEW_RUNTIME_IMAGE`（默认复用同一镜像），并可通过
 `PREVIEW_CONTAINER_CPUS`、`PREVIEW_CONTAINER_MEMORY_MB`、
 `PREVIEW_CONTAINER_PIDS_LIMIT` 设置容器资源上限。
@@ -74,7 +83,8 @@ Test Engineer 的 `design_test_cases` 提交场景，`write_test_script` 生成�
 JSON 脚本，`run_acceptance_tests` 冻结整个套件并实际执行。它不读取 smoke 来生成逐项结论。
 `sandbox/acceptance.py` 与 `acceptance.mjs` 是镜像内的可信解释器，不执行模型提供的任意代码。
 API 支持站内请求、JSON 断言和响应变量；浏览器支持导航、输入、点击、选择、刷新、返回及
-文本/元素/路径断言。API 准备步骤在浏览器操作之前；每个浏览器用例使用独立会话。
+文本/元素/路径断言，以及不计入业务断言的 `wait_for_visible` 状态等待。
+API 准备步骤在浏览器操作之前；每个浏览器用例使用独立会话。
 
 QA 容器禁用网络，不挂载宿主目录/socket，不传平台密钥。应用、迁移和前端构建使用 nobody；
 可信控制器使用 root，capabilities 限于 SETUID/SETGID/CHOWN/KILL，并保留 no-new-privileges
@@ -83,9 +93,9 @@ QA 容器禁用网络，不挂载宿主目录/socket，不传平台密钥。应�
 
 QA 执行不联网安装依赖。当前要求依赖与所选镜像预装清单相符；否则明确 environment/blocked，
 需准备匹配依赖的检查镜像。本轮没有实现按项目自动构建离线依赖镜像。
-更新运行器或共享契约后重新构建镜像（检查运行时版本 20，依赖运行时版本 3）。
+更新运行器或共享契约后重新构建镜像（检查运行时版本 22，依赖运行时版本 3）。
 
-版本 20 的 `all` 在同一个容器里依次运行 Python 语法、TypeScript、前端构建、迁移、
+版本 22 的 `all` 在同一个容器里依次运行 Python 语法、TypeScript、前端构建、迁移、
 API 和浏览器 smoke；类型检查与依赖准备不再因 `quick → all` 重复执行。
 运行器输出分阶段耗时，平台另记录总耗时及缓存命中；这些字段不作为验收依据。
 

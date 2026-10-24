@@ -10,6 +10,27 @@ from app.runtime.docker import DockerSandboxRuntime
 
 
 class DockerSandboxRuntimeTests(unittest.TestCase):
+    def test_require_image_gives_both_docker_desktop_probes_time_to_finish(self) -> None:
+        daemon = subprocess.CompletedProcess([], 0, "29.8.2\n", "")
+        image = subprocess.CompletedProcess([], 0, "1\n", "")
+        runtime = DockerSandboxRuntime()
+        with (
+            patch("app.runtime.docker.shutil.which", return_value="docker"),
+            patch("app.runtime.docker.subprocess.run", side_effect=[daemon, image]) as run,
+        ):
+            binary = runtime.require_image(
+                "trusted",
+                label="org.forgeai.runtime",
+                version="1",
+                purpose="测试",
+            )
+
+        self.assertEqual(binary, "docker")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0][:2], ["docker", "info"])
+        self.assertEqual(run.call_args_list[1].args[0][:3], ["docker", "image", "inspect"])
+        self.assertTrue(all(call.kwargs["timeout"] >= 20 for call in run.call_args_list))
+
     def test_require_image_rejects_stale_runtime(self) -> None:
         daemon = subprocess.CompletedProcess([], 0, "27.5.1\n", "")
         stale = subprocess.CompletedProcess([], 0, "0\n", "")

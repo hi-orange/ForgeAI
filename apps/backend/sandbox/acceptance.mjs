@@ -48,6 +48,7 @@ try {
       case 'back': await page.goBack({ waitUntil: 'domcontentloaded' }); break
       case 'expect_text': await page.getByText(step.value, { exact: false }).first().waitFor(); break
       case 'expect_visible': await locator.waitFor({ state: 'visible' }); break
+      case 'wait_for_visible': await locator.first().waitFor({ state: 'visible' }); break
       case 'expect_path': await page.waitForURL(url => url.pathname === step.path); break
       case 'expect_count': {
         const deadline = Date.now() + 15000

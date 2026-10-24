@@ -12,6 +12,7 @@ from app.generation.delivery import (
     DeliveryPlanError,
     PlannedWorkItem,
     WorkItem,
+    migrate_implementation_repair_plan,
     replace_delivery_plan,
     suggested_delivery_plan,
     validate_delivery_plan,
@@ -96,6 +97,98 @@ def visual_prerequisite_plan():
 
 
 class DeliveryDependencyTests(unittest.TestCase):
+    def test_implementation_repair_proposal_only_contains_frozen_defects(self):
+        content = (
+            "修复这些缺陷：\n"
+            "1. 演示账号不能在生产环境启用固定密码。\n"
+            "2. 切换招聘方后不能看到前一个账号的候选人。\n"
+            "3. 已修改的种子职位重启后不能复制。\n"
+            "4. 无效手机号和邮箱应返回字段级 422。"
+        )
+        spec = dependency_spec()
+        proposal = suggested_delivery_plan(spec, dependency_design(), repair_request=content)
+        self.assertEqual(len(proposal["items"]), 4)
+        self.assertEqual({item["kind"] for item in proposal["items"]}, {"repair"})
+        self.assertTrue(all(item["requirement_ids"] == [] for item in proposal["items"]))
+        self.assertEqual(
+            len(
+                replace_delivery_plan(
+                    spec,
+                    [PlannedWorkItem.model_validate(row) for row in proposal["items"]],
+                    [],
+                    dependency_design(),
+                    repair_request=content,
+                )
+            ),
+            4,
+        )
+        incomplete = [PlannedWorkItem.model_validate(row) for row in proposal["items"][:-1]]
+        with self.assertRaises(DeliveryPlanError) as raised:
+            replace_delivery_plan(spec, incomplete, [], dependency_design(), repair_request=content)
+        self.assertIn(
+            "MISSING_REPAIR_TARGET",
+            {issue["code"] for issue in raised.exception.diagnostic.issues},
+        )
+        original = [
+            PlannedWorkItem.model_validate(row)
+            for row in suggested_delivery_plan(spec, dependency_design())["items"]
+        ]
+        with self.assertRaises(DeliveryPlanError) as raised:
+            replace_delivery_plan(spec, original, [], dependency_design(), repair_request=content)
+        self.assertIn(
+            "OUT_OF_SCOPE_REPAIR_ITEMS",
+            {issue["code"] for issue in raised.exception.diagnostic.issues},
+        )
+        with self.assertRaises(DeliveryPlanError):
+            replace_delivery_plan(
+                spec, [PlannedWorkItem.model_validate(row) for row in proposal["items"]], []
+            )
+
+    def test_repair_scope_migration_retains_completed_node_and_spent_budget(self):
+        spec = dependency_spec()
+        old = replace_delivery_plan(
+            spec,
+            [PlannedWorkItem.model_validate(row) for row in suggested_delivery_plan(spec)["items"]],
+            [],
+        )
+        old[0]["status"] = "completed"
+        old[0]["summary"] = "Existing theme verified"
+        checkpoint = {
+            "work_items": deepcopy(old),
+            "delivery_plan_version": 1,
+            "needs_delivery_plan": False,
+            "current_work_item_id": old[1]["id"],
+            "model_turns": 29,
+            "tool_calls": 31,
+            "modified_files": [],
+            "no_progress_steps": 9,
+        }
+        request = {"revision_id": "rev_1", "message_id": 19, "content": "修复登录后的私有数据泄漏"}
+        self.assertTrue(migrate_implementation_repair_plan(checkpoint, request))
+        self.assertEqual(len(checkpoint["work_items"]), 1)
+        self.assertEqual(checkpoint["work_items"][0], old[0])
+        self.assertTrue(checkpoint["needs_delivery_plan"])
+        self.assertEqual(checkpoint["model_turns"], 29)
+        self.assertEqual(checkpoint["tool_calls"], 31)
+        self.assertEqual(checkpoint["delivery_plan_history"][-1]["items"], old)
+        proposal = suggested_delivery_plan(
+            spec, repair_request=request["content"], completed=checkpoint["work_items"]
+        )
+        revised = replace_delivery_plan(
+            spec,
+            [PlannedWorkItem.model_validate(row) for row in proposal["items"]],
+            checkpoint["work_items"],
+            repair_request=request["content"],
+        )
+        self.assertEqual(len(revised), 2)
+        self.assertEqual(revised[0]["status"], "completed")
+        self.assertEqual(current_item(revised)["kind"], "repair")
+        self.assertFalse(migrate_implementation_repair_plan(checkpoint, request))
+        with self.assertRaisesRegex(ConflictException, "身份不一致"):
+            migrate_implementation_repair_plan(
+                checkpoint, {**request, "revision_id": "rev_changed"}
+            )
+
     def test_suggested_plan_uses_explicit_edges_and_keeps_cross_feature_acceptance_late(self):
         spec, design = dependency_spec(), dependency_design()
         proposal = suggested_delivery_plan(spec, design)

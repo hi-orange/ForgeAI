@@ -68,6 +68,7 @@ class ToolModelCall(Protocol):
         tools: list[ToolDefinition],
         temperature: float = 0.2,
         max_tokens: int = 4096,
+        thinking: bool = False,
     ) -> ChatWithToolsResult: ...
 
 
@@ -119,6 +120,7 @@ def run_bounded_tool_loop[AgentOutputT](
     max_turns: int,
     temperature: float,
     max_tokens: int,
+    thinking: bool = False,
     missing_message: str,
     exhausted_message: str,
     execute_tool: Callable[[ToolCall], tuple[ToolExecutionResult, AgentOutputT | None]],
@@ -156,11 +158,13 @@ def run_bounded_tool_loop[AgentOutputT](
         progress["turns"] = turn + 1
         save()  # Reserve paid work before calling the provider, including failed calls.
         try:
+            model_kwargs: dict[str, Any] = {"thinking": True} if thinking else {}
             result = model_call(
                 messages=list(history),
                 tools=turn_tools,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **model_kwargs,
             )
         except ModelProtocolException as exc:
             history.append(

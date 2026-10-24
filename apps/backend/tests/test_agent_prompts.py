@@ -29,6 +29,13 @@ from app.agents.prompts.product_manager import (
 
 
 class AgentPromptContractTests(unittest.TestCase):
+    def test_engineering_tool_descriptions_accept_current_source_context(self):
+        descriptions = {tool.name: tool.description for tool in CODE_ENGINEER_TOOLS}
+        for tool_name in ("write_files", "edit_file_by_replace"):
+            with self.subTest(tool=tool_name):
+                self.assertIn("初始源码上下文", descriptions[tool_name])
+        self.assertIn("已有上下文", descriptions["read_file"])
+
     def test_engineer_prompt_matches_the_active_tool_loop(self):
         prompt_identifiers = set(re.findall(r"[A-Za-z][A-Za-z0-9_]*", CODE_ENGINEER_SYSTEM_PROMPT))
         exposed_tools = {tool.name for tool in CODE_ENGINEER_TOOLS}
@@ -59,7 +66,7 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("冻结验收资产", CODE_ENGINEER_SYSTEM_PROMPT)
 
     def test_product_manager_research_is_optional_and_approval_safe(self):
-        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v16"))
+        self.assertTrue(APP_SPEC_PROMPT_VERSION.endswith("_v17"))
         self.assertIn("条目顺序不是工程施工顺序", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("普通、明确的应用需求不强制联网", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("需由用户勾选、编辑和批准", APP_SPEC_SYSTEM_PROMPT)
@@ -75,6 +82,9 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("PostgreSQL", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("刷新后仍能读取持久化结果", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("开发种子数据", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("默认仅要求公开内容", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("不要由初始内容推断可登录演示账号", APP_SPEC_SYSTEM_PROMPT)
+        self.assertIn("仅供隔离预览或测试", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("utilitarian", APP_SPEC_SYSTEM_PROMPT)
         self.assertIn("awaiting_approval", APP_SPEC_SYSTEM_PROMPT)
         self.assertNotIn("初始化全栈项目：Vue", APP_SPEC_SYSTEM_PROMPT)
@@ -82,7 +92,7 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertNotIn("模式 2", APP_SPEC_SYSTEM_PROMPT)
 
     def test_architect_produces_implementation_ready_cross_layer_contracts(self):
-        self.assertTrue(ARCHITECT_PROMPT_VERSION.endswith("_v9"))
+        self.assertTrue(ARCHITECT_PROMPT_VERSION.endswith("_v10"))
         self.assertIn("implementation_dependencies", ARCHITECT_SYSTEM_PROMPT)
         self.assertIn("update_delivery_plan", CODE_ENGINEER_SYSTEM_PROMPT)
         self.assertIn("批准功能 → 模块 → 接口 → 数据结构", ARCHITECT_SYSTEM_PROMPT)
@@ -93,6 +103,9 @@ class AgentPromptContractTests(unittest.TestCase):
         self.assertIn("工具型产品不强制图片或插画", ARCHITECT_SYSTEM_PROMPT)
         self.assertIn("ui_state", INTERACTION_CONTRACT)
         self.assertIn("不强制图片或插画", ARCHITECT_SYSTEM_PROMPT)
+        self.assertIn("不为浏览内容自动创建可登录账号", ARCHITECT_SYSTEM_PROMPT)
+        self.assertIn("凭据经私密配置按项目生成", ARCHITECT_SYSTEM_PROMPT)
+        self.assertIn("发布时默认不创建或启用演示", ARCHITECT_SYSTEM_PROMPT)
 
     def test_leader_routes_by_intent_complexity_and_exact_results(self):
         self.assertIn("breaking_public_contract", LEADER_SYSTEM_PROMPT)

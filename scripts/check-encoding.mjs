@@ -11,9 +11,12 @@ const ignoredDirectories = new Set([
   '.turbo',
   '.venv',
   '__pycache__',
+  'artifact-data',
   'coverage',
   'dist',
   'node_modules',
+  'output',
+  'runtime-data',
 ])
 const textExtensions = new Set([
   '.css',

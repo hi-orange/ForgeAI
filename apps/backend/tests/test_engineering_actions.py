@@ -42,6 +42,26 @@ class EngineeringActionTests(unittest.TestCase):
         restore_workspace_revision(self.root, revision_id="execution")
         self.assertEqual((self.root / path).read_bytes(), b"VALUE = 1\n")
 
+    def test_unchanged_write_reports_no_source_progress(self):
+        path = "backend/app/module.py"
+        digest = self.source(path)
+        action = prepare_action(
+            ToolCall(
+                id="same",
+                name="write_files",
+                arguments={
+                    "writes": [{"path": path, "content": "VALUE = 1\n", "expected_hash": digest}]
+                },
+            ),
+            self.root,
+            {path: digest},
+        )
+        self.assertEqual(action.updates, {})
+        result = commit_action(action, self.root, revision_id="same")
+        self.assertTrue(result.ok)
+        self.assertIn("没有产生修改", result.summary)
+        self.assertEqual(result.data["unchanged_files"], [path])
+
     def test_guessed_hash_without_read_evidence_is_rejected(self):
         digest = self.source("module.py")
         action = prepare_action(
@@ -59,6 +79,40 @@ class EngineeringActionTests(unittest.TestCase):
         )
         self.assertFalse(action.result.ok)
         self.assertEqual(action.updates, {})
+        self.assertIn("初始源码上下文", action.result.summary)
+
+    def test_existing_file_can_be_edited_from_observed_context_without_extra_read(self):
+        path = "backend/app/module.py"
+        digest = self.source(path)
+        calls = [
+            ToolCall(
+                id="replace",
+                name="edit_file_by_replace",
+                arguments={
+                    "path": path,
+                    "old_text": "VALUE = 1",
+                    "new_text": "VALUE = 2",
+                    "expected_hash": digest,
+                },
+            ),
+            ToolCall(
+                id="write",
+                name="write_files",
+                arguments={
+                    "writes": [{"path": path, "content": "VALUE = 2\n", "expected_hash": digest}]
+                },
+            ),
+        ]
+        for call in calls:
+            with self.subTest(tool=call.name):
+                action = prepare_action(call, self.root, {path: digest})
+                self.assertTrue(action.result.ok, action.result.summary)
+                self.assertEqual(action.updates[path], b"VALUE = 2\n")
+                self.assertEqual((self.root / path).read_bytes(), b"VALUE = 1\n")
+
+                missing = prepare_action(call, self.root, {})
+                self.assertFalse(missing.result.ok)
+                self.assertIn("初始源码上下文", missing.result.summary)
 
     def test_unified_write_supports_single_and_multiple_files(self):
         for count in (1, 2, 8):

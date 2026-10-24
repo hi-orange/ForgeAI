@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -22,9 +23,8 @@ class PlannedWorkItem(BaseModel):
 
     id: RequirementId
     requirement_ids: list[RequirementId] = Field(
-        min_length=1,
         max_length=50,
-        description="关联获批需求以追踪来源；只有 kind=feature 的关联计入功能覆盖。",
+        description="关联获批需求以追踪来源；修复项可由冻结修复请求追踪。",
     )
     provides_requirement_ids: list[RequirementId] = Field(
         default_factory=list,
@@ -36,7 +36,7 @@ class PlannedWorkItem(BaseModel):
         ),
     )
     title: PlanText
-    kind: Literal["foundation", "visual_foundation", "feature"] = "feature"
+    kind: Literal["foundation", "visual_foundation", "feature", "repair"] = "feature"
     depends_on: list[RequirementId] = Field(default_factory=list, max_length=100)
     rationale: str = Field(default="", max_length=2000)
     acceptance: list[PlanText] = Field(default_factory=list, max_length=50)
@@ -54,8 +54,16 @@ class WorkItem(PlannedWorkItem):
     summary: str | None = None
 
 
-def planning_item(spec: AppSpec) -> WorkItem:
+def planning_item(spec: AppSpec, *, repair_request: str | None = None) -> WorkItem:
     """Decision context only; never persisted as an executable source task."""
+    if repair_request is not None:
+        return WorkItem(
+            id="engineering_plan",
+            requirement_ids=[],
+            title="根据冻结缺陷请求和现有源码提交限域修复计划",
+            kind="repair",
+            acceptance=repair_targets(repair_request),
+        )
     return WorkItem(
         id="engineering_plan",
         requirement_ids=[feature.id for feature in spec.features],
@@ -63,12 +71,86 @@ def planning_item(spec: AppSpec) -> WorkItem:
     )
 
 
-def suggested_delivery_plan(spec: AppSpec, design: SystemDesign | None = None) -> dict[str, Any]:
+def repair_targets(content: str) -> list[str]:
+    """Keep each numbered user defect intact; otherwise use one atomic request."""
+    lines = content.strip().splitlines()
+    numbered = re.compile(r"^\s*(?:[-*]\s*)?\d{1,2}[.、)]\s*(.+)$")
+    targets: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        match = numbered.match(line)
+        if match:
+            if current:
+                targets.append(" ".join(" ".join(current).split()))
+            current = [match.group(1)]
+        elif current and line.strip():
+            current.append(line.strip())
+    if current:
+        targets.append(" ".join(" ".join(current).split()))
+    # A long enumerated document is safer as one target than a truncated list.
+    return targets if 1 <= len(targets) <= 20 else [" ".join(content.split())]
+
+
+def _hashed_plan(items: list[PlannedWorkItem]) -> dict[str, Any]:
+    payload = [item.model_dump(mode="json") for item in items]
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return {"items": payload, "content_hash": digest}
+
+
+def suggested_repair_plan(
+    spec: AppSpec,
+    content: str,
+    *,
+    completed: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """A bounded proposal from the frozen defect request, not the original feature list."""
+    used = {str(item.get("id")) for item in completed or []}
+    items: list[PlannedWorkItem] = []
+    for index, target in enumerate(repair_targets(content), 1):
+        item_id = f"repair_{index}"
+        suffix = 1
+        while item_id in used:
+            suffix += 1
+            item_id = f"repair_{index}_{suffix}"
+        used.add(item_id)
+        items.append(
+            PlannedWorkItem(
+                id=item_id,
+                title=target,
+                kind="repair",
+                requirement_ids=[],
+                acceptance=[target],
+                deliverables=[
+                    "只修改解决该缺陷所需的源码，并保留已获批且已通过的行为",
+                    "用当前源码运行完整集成检查，再交独立验收",
+                ],
+            )
+        )
+    validate_delivery_plan(
+        spec,
+        [WorkItem.model_validate(row) for row in completed or []]
+        + [WorkItem(**item.model_dump()) for item in items],
+        repair_request=content,
+    )
+    return _hashed_plan(items)
+
+
+def suggested_delivery_plan(
+    spec: AppSpec,
+    design: SystemDesign | None = None,
+    *,
+    repair_request: str | None = None,
+    completed: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """A validated initial proposal derived solely from frozen requirements and edges.
 
     It is neither accepted work nor completion evidence. The engineer must explicitly
     adopt this exact hash or submit its own graph through the normal validation gate.
     """
+    if repair_request is not None:
+        return suggested_repair_plan(spec, repair_request, completed=completed)
     ids = {feature.id for feature in spec.features}
     visual_id = "visual_foundation"
     suffix = 0
@@ -116,11 +198,7 @@ def suggested_delivery_plan(spec: AppSpec, design: SystemDesign | None = None) -
     ]
     # Use the same authority as model-authored graphs. No fallback may waive a rule.
     validate_delivery_plan(spec, [WorkItem(**item.model_dump()) for item in items], design)
-    payload = [item.model_dump(mode="json") for item in items]
-    digest = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    return {"items": payload, "content_hash": digest}
+    return _hashed_plan(items)
 
 
 def plan_quality_repair(spec: AppSpec, report: TestReport) -> list[WorkItem]:
@@ -193,6 +271,35 @@ def plan_quality_repair(spec: AppSpec, report: TestReport) -> list[WorkItem]:
     return items
 
 
+def migrate_implementation_repair_plan(checkpoint: dict[str, Any], request: dict[str, Any]) -> bool:
+    """Retire a legacy full-feature repair graph without erasing completed work."""
+    identity = [request.get("revision_id"), request.get("message_id")]
+    if checkpoint.get("delivery_plan_scope") == "implementation_repair":
+        if checkpoint.get("repair_plan_identity") != identity:
+            raise ConflictException("修复计划与冻结的用户请求身份不一致")
+        return False
+    previous = checkpoint.get("work_items") or []
+    completed = [row for row in previous if row.get("status") == "completed"]
+    if previous:
+        checkpoint.setdefault("delivery_plan_history", []).append(
+            {
+                "reason": "旧全功能计划已由冻结实现修复请求限域；已完成工作保留",
+                "items": previous,
+                "model_turn": checkpoint.get("model_turns", 0),
+                "superseded": True,
+            }
+        )
+    checkpoint["work_items"] = completed
+    checkpoint["current_work_item_id"] = None
+    checkpoint["needs_delivery_plan"] = True
+    checkpoint["delivery_plan_scope"] = "implementation_repair"
+    checkpoint["repair_plan_identity"] = identity
+    # These are consecutive-stall counters for the retired node, not spent budgets.
+    checkpoint["no_progress_steps"] = 0
+    checkpoint["steps_without_delivery"] = 0
+    return True
+
+
 class DeliveryPlanError(ConflictException):
     """All currently detectable violations, with an actionable location."""
 
@@ -211,7 +318,11 @@ class DeliveryPlanError(ConflictException):
 
 
 def validate_delivery_plan(
-    spec: AppSpec, items: list[WorkItem], design: SystemDesign | None = None
+    spec: AppSpec,
+    items: list[WorkItem],
+    design: SystemDesign | None = None,
+    *,
+    repair_request: str | None = None,
 ) -> None:
     feature_ids = {feature.id for feature in spec.features}
     if not feature_ids:
@@ -232,6 +343,10 @@ def validate_delivery_plan(
         )
     issues: list[dict[str, Any]] = []
     for item in items:
+        if not item.requirement_ids and item.kind != "repair":
+            issues.append({"code": "MISSING_REQUIREMENT_LINK", "work_item_id": item.id})
+        if repair_request is None and item.kind == "repair":
+            issues.append({"code": "UNEXPECTED_REPAIR_ITEM", "work_item_id": item.id})
         unknown = set(item.requirement_ids) - feature_ids
         invalid = set(item.depends_on) - (set(ids) - {item.id})
         invalid_provisions = set(item.provides_requirement_ids) - set(item.requirement_ids)
@@ -291,6 +406,40 @@ def validate_delivery_plan(
         for key in ready:
             deps = remaining.pop(key)
             ancestors[key] = deps | {parent for dep in deps for parent in ancestors[dep]}
+    if repair_request is not None:
+        repair_items = [item for item in items if item.kind == "repair"]
+        if not repair_items or len(repair_items) > 20:
+            issues.append(
+                {
+                    "code": "REPAIR_ITEM_COUNT",
+                    "actual": len(repair_items),
+                    "expected": "将本次冻结修复请求拆为 1 至 20 个修复工作项",
+                }
+            )
+        unrelated = [
+            item.id for item in items if item.status != "completed" and item.kind != "repair"
+        ]
+        if unrelated:
+            issues.append(
+                {
+                    "code": "OUT_OF_SCOPE_REPAIR_ITEMS",
+                    "work_item_ids": unrelated,
+                    "expected": "本次只提交 kind=repair 的待做项；旧已完成项由平台保留",
+                }
+            )
+        observations = [" ".join(" ".join(item.acceptance).split()) for item in repair_items]
+        for target in repair_targets(repair_request):
+            if not any(target in observation for observation in observations):
+                issues.append(
+                    {
+                        "code": "MISSING_REPAIR_TARGET",
+                        "target": target,
+                        "expected": "在修复项 acceptance 中保留冻结缺陷的完整原文",
+                    }
+                )
+        if issues:
+            raise DeliveryPlanError("实现修复计划未覆盖冻结请求或包含未授权工作项", issues)
+        return
     covered = {req for item in items if item.kind == "feature" for req in item.requirement_ids}
     if covered != feature_ids:
         missing = feature_ids - covered
@@ -417,6 +566,8 @@ def replace_delivery_plan(
     proposed: list[PlannedWorkItem],
     previous: list[dict[str, Any]],
     design: SystemDesign | None = None,
+    *,
+    repair_request: str | None = None,
 ) -> list[dict[str, Any]]:
     """Models own pending plans, never completion state or approved coverage."""
     items = [WorkItem(**item.model_dump()) for item in proposed]
@@ -425,6 +576,10 @@ def replace_delivery_plan(
         old = WorkItem.model_validate(raw)
         replacement = by_id.get(old.id)
         if old.status == "completed":
+            if replacement is None and repair_request is not None:
+                items.insert(0, old)
+                by_id[old.id] = old
+                continue
             if replacement is None or (
                 PlannedWorkItem.model_validate(old.model_dump(exclude={"status", "summary"}))
                 != PlannedWorkItem.model_validate(
@@ -445,7 +600,7 @@ def replace_delivery_plan(
                 )
             replacement.status = old.status
             replacement.summary = old.summary
-    validate_delivery_plan(spec, items, design)
+    validate_delivery_plan(spec, items, design, repair_request=repair_request)
     return work_items_to_json(items)
 
 

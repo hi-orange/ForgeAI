@@ -14,6 +14,7 @@ from app.agents.roles import LEADER_PROFILE
 from app.agents.tool_protocol import run_bounded_tool_loop
 from app.core.exceptions import BusinessException
 from app.core.llm import chat_with_tools
+from app.core.settings import settings
 from app.schemas.leader import LeaderContext, LeaderIntentDecision, LeaderOutcome
 from app.schemas.plan import PlanCreate
 from app.schemas.project_message_classification import ProjectMessageClassificationDecision
@@ -79,7 +80,8 @@ def classify_message(
         role_name="Leader",
         max_turns=1,
         temperature=0.0,
-        max_tokens=256,
+        max_tokens=4096 if settings.leader_thinking else 256,
+        thinking=settings.leader_thinking,
         missing_message="Leader 未调用工具提交消息分类",
         exhausted_message="Leader 未能提交消息分类",
         execute_tool=execute_message_classification_tool,
@@ -146,7 +148,8 @@ def lead_project_turn(
         role_name="Leader",
         max_turns=budget,
         temperature=0.0,
-        max_tokens=8192,
+        max_tokens=16384 if settings.leader_thinking else 8192,
+        thinking=settings.leader_thinking,
         missing_message="Leader 未调用工具更新计划或结束本轮",
         exhausted_message="Leader 工具调用预算已用尽，尚未结束本轮管理",
         # 每次模型点工具，都带着同一份 state 去执行。

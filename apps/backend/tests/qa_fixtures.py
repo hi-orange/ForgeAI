@@ -1,7 +1,7 @@
 """Synthetic runner facts for unit tests only, never integration evidence."""
 
 from app.schemas.qa_suite import QASuite
-from app.services.qa_assets import suite_test_results
+from app.services.qa_assets import RUNNER_VERSION, suite_test_results
 
 
 def unit_suite():
@@ -43,7 +43,7 @@ def unit_suite():
 def unit_manifest(suite=None, status="passed", source_hash="a" * 64):
     suite = suite or unit_suite()
     return {
-        "runner_version": "forgeai-qa-v1",
+        "runner_version": RUNNER_VERSION,
         "execution_id": "qa_unit_fixture",
         "code_item_id": "ci_code",
         "source_hash": source_hash,

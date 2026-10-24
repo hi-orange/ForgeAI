@@ -9,6 +9,7 @@ from test_architect import valid_design
 from test_delivery_dependencies import dependency_items, dependency_spec
 
 from app.agents.code_engineer import build_code_engineer_messages
+from app.core.exceptions import ConflictException
 from app.generation.delivery import (
     DeliveryPlanError,
     PlannedWorkItem,
@@ -19,6 +20,7 @@ from app.generation.engineering.checkpoint import (
     load_checkpoint,
     new_checkpoint,
     prepare_manual_repair_retry,
+    requires_manual_repair_retry,
     resume_blocked_checkpoint,
 )
 from app.generation.engineering.diagnostics import (
@@ -624,6 +626,49 @@ class EngineeringDiagnosticTests(unittest.TestCase):
         self.assertEqual(len(retry["diagnostic_history"]), 1)
         self.assertEqual(retry["diagnostic_state"]["check:quick"]["repeated_attempts"], 0)
         self.assertEqual(state["diagnostic_state"]["check:quick"]["repeated_attempts"], 3)
+
+    def test_budget_cited_block_requires_explicit_bounded_retry(self):
+        checkpoint = new_checkpoint()
+        checkpoint.update(
+            outcome="blocked",
+            blocked_reason="剩余模型轮次仅 1 次，当前工作项尚未完成",
+            model_turns=95,
+            tool_calls=101,
+            current_work_item_id="feat_profile",
+        )
+        checkpoint["work_memory"] = {
+            "feat_profile": {
+                "inspection_model_turns": 11,
+                "last_inspection_model_turn": 95,
+                "redundant_read_steps": 2,
+            }
+        }
+        snapshot = {
+            "approved_item_id": "ci_approved",
+            "call_budget": {"max_model_turns": 96, "max_tool_calls": 140},
+            "checkpoint": checkpoint,
+        }
+        self.assertTrue(requires_manual_repair_retry(snapshot))
+        prepared = prepare_manual_repair_retry(snapshot)
+        self.assertEqual(prepared["approved_item_id"], "ci_approved")
+        self.assertEqual(prepared["checkpoint"]["model_turns"], 95)
+        self.assertEqual(prepared["checkpoint"]["tool_calls"], 101)
+        self.assertEqual(prepared["call_budget"]["max_model_turns"], 175)
+        self.assertEqual(prepared["call_budget"]["max_tool_calls"], 221)
+        self.assertEqual(prepared["checkpoint"]["outcome"], "running")
+        retried_memory = prepared["checkpoint"]["work_memory"]["feat_profile"]
+        self.assertEqual(retried_memory["inspection_model_turns"], 0)
+        self.assertEqual(retried_memory["redundant_read_steps"], 0)
+        self.assertNotIn("last_inspection_model_turn", retried_memory)
+        self.assertEqual(checkpoint["outcome"], "blocked")
+
+        checkpoint["blocked_reason"] = "缺少已批准的 API 契约"
+        self.assertFalse(requires_manual_repair_retry(snapshot))
+        with self.assertRaises(ConflictException):
+            prepare_manual_repair_retry(snapshot)
+        checkpoint["blocked_reason"] = "剩余模型轮次仅 1 次，当前工作项尚未完成"
+        checkpoint["model_turns"] = 50
+        self.assertFalse(requires_manual_repair_retry(snapshot))
 
     def test_old_checkpoint_gets_additive_diagnostic_fields(self):
         state = new_checkpoint()

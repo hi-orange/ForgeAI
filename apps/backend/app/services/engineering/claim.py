@@ -19,6 +19,8 @@ from app.models.build_run import BuildRun, BuildRunStage
 from app.models.configuration_item import ConfigurationItem, ConfigurationItemType
 from app.models.plan import Plan, PlanStatus
 from app.models.project import Project
+from app.models.project_message import ProjectMessage, ProjectMessageSender
+from app.models.run_revision import RunRevision
 from app.models.task import Task, TaskRecipient, TaskStatus
 from app.models.task_execution import TaskExecution
 from app.models.user import User
@@ -34,8 +36,8 @@ from app.services.engineering.handoff import ENGINEERING_TASK_KEY, load_engineer
 from app.services.task_execution import EXECUTION_LEASE, latest_execution, utc_now
 
 INPUT_SNAPSHOT_KIND = "engineering_input_snapshot"
-INPUT_SNAPSHOT_SCHEMA_VERSION = 5
-SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
+INPUT_SNAPSHOT_SCHEMA_VERSION = 6
+SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
 TOOL_STRATEGY_VERSION = "evidence_tool_loop_v1"
 
 
@@ -68,6 +70,7 @@ def build_frozen_input_snapshot(
     acceptance_test_plan: AcceptanceTestPlan | None = None,
     quality_report_item_id: str | None = None,
     quality_report: TestReport | None = None,
+    implementation_repair_request: dict[str, Any] | None = None,
     template_version: str = DEFAULT_TEMPLATE_VERSION,
     base_revision_id: str | None = None,
     call_budget: dict[str, int] | None = None,
@@ -103,6 +106,7 @@ def build_frozen_input_snapshot(
         "quality_report": (
             quality_report.model_dump(mode="json") if quality_report is not None else None
         ),
+        "implementation_repair_request": implementation_repair_request,
         "base_revision_id": base_revision_id,
         "template_version": template_version,
         "template_digest": template_digest(template_version),
@@ -129,6 +133,47 @@ def read_frozen_input_snapshot(execution: TaskExecution) -> dict[str, Any] | Non
     if draft.get("schema_version") not in SUPPORTED_INPUT_SNAPSHOT_SCHEMA_VERSIONS:
         return None
     return draft
+
+
+def _implementation_repair_request(
+    db: Session,
+    *,
+    project_id: int,
+    run_id: str,
+    approved_item_id: str,
+    cause_message_id: int,
+) -> dict[str, Any] | None:
+    """Freeze the exact user repair request from this BuildRun's lineage."""
+    revision = db.scalar(
+        select(RunRevision).where(
+            RunRevision.project_id == project_id,
+            RunRevision.target_run_id == run_id,
+        )
+    )
+    if revision is None or revision.kind != "implementation_repair":
+        return None
+    if (
+        revision.baseline_app_spec_item_id != approved_item_id
+        or revision.baseline_code_item_id is None
+        or revision.cause_message_id != cause_message_id
+    ):
+        raise ConflictException("实现修复任务与固定修订基线或用户消息不一致")
+    message = db.scalar(
+        select(ProjectMessage).where(
+            ProjectMessage.id == cause_message_id,
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.sender == ProjectMessageSender.USER.value,
+        )
+    )
+    if message is None or not message.content.strip() or len(message.content) > 8000:
+        raise ConflictException("实现修复缺少当前项目的有效用户请求")
+    return {
+        "revision_id": revision.revision_id,
+        "source_run_id": revision.source_run_id,
+        "baseline_code_item_id": revision.baseline_code_item_id,
+        "message_id": message.id,
+        "content": message.content,
+    }
 
 
 def claim_code_engineer_task(
@@ -335,6 +380,13 @@ def claim_code_engineer_task(
             raise ConflictException("任务已被领取或已结束，不能重复领取")
         if plan.status not in (PlanStatus.PENDING.value, PlanStatus.RUNNING.value):
             raise ConflictException("计划已结束，不能领取其中的任务")
+        implementation_repair_request = _implementation_repair_request(
+            db,
+            project_id=project_id,
+            run_id=run_id,
+            approved_item_id=approved_item_id,
+            cause_message_id=plan.cause_message_id,
+        )
 
         build_run_service.stage_running(
             db,
@@ -367,6 +419,7 @@ def claim_code_engineer_task(
             acceptance_test_plan=acceptance_test_plan,
             quality_report_item_id=quality_report_item_id,
             quality_report=quality_report,
+            implementation_repair_request=implementation_repair_request,
             template_version=template_version,
         )
         execution = TaskExecution(

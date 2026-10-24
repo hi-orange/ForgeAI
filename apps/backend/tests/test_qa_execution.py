@@ -16,17 +16,19 @@ from test_test_engineer import passed_report, visual_result
 
 from app.core.exceptions import BusinessException
 from app.schemas.agent_action import ToolCall
-from app.schemas.qa_suite import QAScript
+from app.schemas.qa_suite import QAScript, QASuite, assertion_contract
 from app.schemas.test_report import TestReport as Report
 from app.services.acceptance_testing import build_acceptance_test_plan
 from app.services.qa_assets import suite_test_results, validate_manifest, validate_suite
 from app.services.qa_verification import QAVerificationState as QAState
 from app.services.qa_verification import (
+    can_extend_qa_execution_budget,
     check_status,
     export_test_engineer_progress,
+    resolvable_defect_ids,
     restore_test_engineer_progress,
 )
-from app.tools.checks import source_snapshot
+from app.tools.checks import CHECK_RUNTIME_VERSION, source_snapshot
 from app.tools.test_engineer import execute_test_engineer_tool
 
 
@@ -65,11 +67,20 @@ def report_for(state):
         "check_results": checks,
         "test_results": results,
         "regression_test_ids": [case.test_id for case in suite.scenarios],
-        "defects": [item.model_dump(mode="json") for item in state.defects.values()],
+        "defects": [item.model_dump(mode="json") for item in state.active_defects.values()],
         "quality_conclusion": "failed" if failed else "passed" if passed else "blocked",
         "summary": "独立 QA 真实执行与回归验收",
         "residual_risks": [],
     }
+
+
+def two_case_suite():
+    payload = unit_suite().model_dump(mode="json")
+    second = copy.deepcopy(payload["scenarios"][0])
+    second["test_id"] = "test_ac_track_second"
+    payload["scenarios"].append(second)
+    payload["scripts"]["test_ac_track_second"] = copy.deepcopy(payload["scripts"]["test_ac_track"])
+    return QASuite.model_validate(payload)
 
 
 class IndependentQAContractTests(unittest.TestCase):
@@ -141,6 +152,48 @@ class IndependentQAContractTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("断言", result.summary)
 
+    def test_visibility_barrier_can_be_inserted_without_changing_approved_script(self):
+        raw = demo_suite().model_dump(mode="json")
+        original_steps = raw["scripts"]["test_ac_track"]["steps"]
+        original_steps[:] = [
+            step for step in original_steps if step.get("action") != "wait_for_visible"
+        ]
+        original = QASuite.model_validate(raw)
+        amended = copy.deepcopy(raw)
+        amended["revision"] += 1
+        steps = amended["scripts"]["test_ac_track"]["steps"]
+        login_click = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("selector") == '[data-testid="login"]'
+        )
+        steps.insert(
+            login_click + 1,
+            {
+                "kind": "browser",
+                "action": "wait_for_visible",
+                "selector": "[data-testid='identity']",
+            },
+        )
+        synchronized = QASuite.model_validate(amended)
+        validate_suite(synchronized, demo_spec(), None, original)
+        self.assertEqual(
+            assertion_contract(synchronized.scripts["test_ac_track"]),
+            assertion_contract(original.scripts["test_ac_track"]),
+        )
+        validate_suite(original, demo_spec(), None, synchronized)
+
+        weakened = copy.deepcopy(amended)
+        weakened["scripts"]["test_ac_track"]["steps"] = [
+            step
+            for step in weakened["scripts"]["test_ac_track"]["steps"]
+            if not (
+                step.get("action") == "expect_text" and step.get("value") == "Signed in as alice"
+            )
+        ]
+        with self.assertRaisesRegex(BusinessException, "不能删除操作"):
+            validate_suite(QASuite.model_validate(weakened), demo_spec(), None, original)
+
     def test_protocol_rejects_arbitrary_code_and_assertion_free_script(self):
         for script in (
             {"steps": [{"kind": "shell", "command": "true"}]},
@@ -156,6 +209,52 @@ class IndependentQAContractTests(unittest.TestCase):
                 ]
             }
         )
+        for script in (
+            {"steps": [{"kind": "browser", "action": "wait_for_visible"}]},
+            {
+                "steps": [
+                    {"kind": "browser", "action": "wait_for_visible", "selector": "main"},
+                ]
+            },
+            {
+                "steps": [
+                    {
+                        "kind": "browser",
+                        "action": "wait_for_visible",
+                        "selector": "main",
+                        "value": "passed",
+                    },
+                    {"kind": "browser", "action": "expect_text", "value": "passed"},
+                ]
+            },
+        ):
+            with self.assertRaises(ValidationError):
+                QAScript.model_validate(script)
+
+    def test_legacy_runner_manifest_is_readable_but_cannot_publish_new_report(self):
+        suite = unit_suite()
+        legacy = unit_manifest(suite)
+        legacy["runner_version"] = "forgeai-qa-v1"
+        identity = {
+            key: legacy[key]
+            for key in ("execution_id", "code_item_id", "source_hash", "suite_hash")
+        }
+        with self.assertRaisesRegex(BusinessException, "执行器版本"):
+            validate_manifest(legacy, identity, suite)
+        validate_manifest(legacy, identity, suite, allow_legacy=True)
+        self.state.suite_versions = [suite]
+        self.state.executions = [legacy]
+        restored = QAState(
+            app_spec=valid_spec(),
+            code_item_id="ci_code",
+            code_source_hash="a" * 64,
+            workspace_root=self.state.workspace_root,
+        )
+        restore_test_engineer_progress(restored, export_test_engineer_progress(self.state))
+        self.assertEqual(restored.executions, [legacy])
+        result, _ = call(restored, "write_test_report", test_report=passed_report())
+        self.assertFalse(result.ok)
+        self.assertIn("最新独立执行器", result.summary)
 
     def test_evidence_rejects_stale_forged_missing_case_and_incomplete_execution(self):
         suite = unit_suite()
@@ -182,7 +281,7 @@ class IndependentQAContractTests(unittest.TestCase):
         report = passed_report()
         result, _ = call(self.state, "write_test_report", test_report=report)
         self.assertFalse(result.ok)
-        self.assertIn("运行器证据", result.summary)
+        self.assertIn("重新执行", result.summary)
         add_unit_evidence(self.state)
         report["test_results"][0]["check_id"] = "all"
         self.assertFalse(call(self.state, "write_test_report", test_report=report)[0].ok)
@@ -254,6 +353,252 @@ class IndependentQAContractTests(unittest.TestCase):
         self.assertEqual(runner.call_count, 2)
         self.assertEqual(self.state.executions, [blocked, passed])
         self.assertEqual(self.state.suite_versions, [unit_suite()])
+
+    def test_same_suite_can_rerun_when_one_case_passed_and_another_was_environment_blocked(self):
+        from app.schemas.agent_action import ToolExecutionResult
+
+        suite = two_case_suite()
+        self.state.suite_versions = [suite]
+        partial = unit_manifest(suite)
+        partial["results"][1].update(status="blocked", failure_kind="environment")
+        recovered = unit_manifest(suite)
+        recovered["execution_id"] = "qa_recovered_mixed_fixture"
+        with patch(
+            "app.tools.test_engineer.qa_runner.run_acceptance_tests",
+            side_effect=[
+                ToolExecutionResult(
+                    tool_call_id="first",
+                    name="run_acceptance_tests",
+                    ok=False,
+                    summary="one case was unavailable",
+                    data={"manifest": partial},
+                ),
+                ToolExecutionResult(
+                    tool_call_id="second",
+                    name="run_acceptance_tests",
+                    ok=True,
+                    summary="environment recovered",
+                    data={"manifest": recovered},
+                ),
+            ],
+        ) as runner:
+            self.assertFalse(call(self.state, "run_acceptance_tests")[0].ok)
+            self.assertTrue(call(self.state, "run_acceptance_tests")[0].ok)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(self.state.executions, [partial, recovered])
+
+    def test_same_suite_still_rejects_rerun_after_product_failure_with_environment_block(self):
+        suite = two_case_suite()
+        self.state.suite_versions = [suite]
+        mixed = unit_manifest(suite, "failed")
+        mixed["results"][1].update(status="blocked", failure_kind="environment")
+        self.state.executions = [mixed]
+        with patch("app.tools.test_engineer.qa_runner.run_acceptance_tests") as runner:
+            result, _ = call(self.state, "run_acceptance_tests")
+        self.assertFalse(result.ok)
+        self.assertIn("不能重复启动同一快照", result.summary)
+        runner.assert_not_called()
+
+    def test_defect_resolution_requires_latest_full_pass_and_preserves_audit(self):
+        from app.schemas.agent_action import ToolExecutionResult
+
+        suite = two_case_suite()
+        self.state.suite_versions = [suite]
+        failed = unit_manifest(suite, "failed")
+        self.state.executions = [failed]
+        self.assertEqual(resolvable_defect_ids(self.state), [])
+        defect = {
+            "defect_id": "reading_flow_failure",
+            "severity": "major",
+            "title": "阅读流程失败",
+            "description": "两个独立路径均未满足验收预期。",
+            "evidence": "独立执行中的两个用例均为 product 失败。",
+            "related_requirement_ids": ["ac_track"],
+            "related_test_ids": ["test_ac_track", "test_ac_track_second"],
+            "execution_id": failed["execution_id"],
+        }
+        self.assertTrue(call(self.state, "record_defect", defect=defect)[0].ok)
+        self.assertEqual(set(self.state.active_defects), {defect["defect_id"]})
+        original_hash = suite.digest()
+        unresolved_args = {
+            "defect_id": defect["defect_id"],
+            "suite_hash": original_hash,
+            "execution_id": failed["execution_id"],
+        }
+        self.assertFalse(call(self.state, "resolve_defect", **unresolved_args)[0].ok)
+        self.assertTrue(
+            call(
+                self.state,
+                "adapt_test_script",
+                test_id="test_ac_track",
+                expected_suite_hash=original_hash,
+                step_index=0,
+                path="/api/v2/records",
+            )[0].ok
+        )
+        current_suite = self.state.suite_versions[-1]
+        self.assertFalse(
+            call(
+                self.state,
+                "resolve_defect",
+                defect_id=defect["defect_id"],
+                suite_hash=current_suite.digest(),
+                execution_id=failed["execution_id"],
+            )[0].ok
+        )
+        partial = unit_manifest(current_suite, source_hash=self.state.code_source_hash)
+        partial["execution_id"] = "qa_partial"
+        partial["results"][1].update(status="failed", failure_kind="product")
+        self.state.executions.append(partial)
+        self.assertEqual(resolvable_defect_ids(self.state), [])
+        self.assertFalse(
+            call(
+                self.state,
+                "resolve_defect",
+                defect_id=defect["defect_id"],
+                suite_hash=current_suite.digest(),
+                execution_id="qa_partial",
+            )[0].ok
+        )
+        passed = unit_manifest(current_suite, source_hash=self.state.code_source_hash)
+        passed["execution_id"] = "qa_full_pass"
+        self.state.executions.append(passed)
+        self.assertEqual(resolvable_defect_ids(self.state), [defect["defect_id"]])
+        self.assertFalse(
+            call(
+                self.state,
+                "resolve_defect",
+                defect_id=defect["defect_id"],
+                suite_hash=original_hash,
+                execution_id="qa_full_pass",
+            )[0].ok
+        )
+        resolution_args = {
+            "defect_id": defect["defect_id"],
+            "suite_hash": current_suite.digest(),
+            "execution_id": "qa_full_pass",
+        }
+        result, _ = call(self.state, "resolve_defect", **resolution_args)
+        self.assertTrue(result.ok, result.summary)
+        self.assertFalse(self.state.active_defects)
+        self.assertEqual(resolvable_defect_ids(self.state), [])
+        self.assertIn(defect["defect_id"], self.state.defects)
+        self.assertFalse(call(self.state, "resolve_defect", **resolution_args)[0].ok)
+        saved = export_test_engineer_progress(self.state)
+        self.assertEqual(len(saved["defects"]), 1)
+        self.assertEqual(len(saved["defect_resolutions"]), 1)
+        restored = QAState(
+            app_spec=valid_spec(),
+            code_item_id="ci_code",
+            code_source_hash="a" * 64,
+            workspace_root=self.state.workspace_root,
+        )
+        restore_test_engineer_progress(restored, saved)
+        self.assertEqual(restored.defects, self.state.defects)
+        self.assertEqual(restored.defect_resolutions, self.state.defect_resolutions)
+        self.assertFalse(restored.active_defects)
+        tampered = copy.deepcopy(saved)
+        tampered["defect_resolutions"][0]["execution_id"] = failed["execution_id"]
+        with self.assertRaisesRegex(BusinessException, "缺陷解决记录损坏"):
+            restore_test_engineer_progress(
+                QAState(
+                    app_spec=valid_spec(),
+                    code_item_id="ci_code",
+                    code_source_hash="a" * 64,
+                    workspace_root=self.state.workspace_root,
+                ),
+                tampered,
+            )
+        erased_audit = copy.deepcopy(saved)
+        del erased_audit["defects"]
+        with self.assertRaisesRegex(BusinessException, "缺陷审计记录损坏"):
+            restore_test_engineer_progress(
+                QAState(
+                    app_spec=valid_spec(),
+                    code_item_id="ci_code",
+                    code_source_hash="a" * 64,
+                    workspace_root=self.state.workspace_root,
+                ),
+                erased_audit,
+            )
+        self.state.checks["all"] = ToolExecutionResult(
+            tool_call_id="all",
+            name="run_check",
+            ok=True,
+            summary="all passed",
+            data={"check_id": "all", "source_hash": self.state.code_source_hash},
+        )
+        self.state.checks["visual"] = visual_result()
+        decision = {
+            "suite_hash": current_suite.digest(),
+            "execution_id": "qa_full_pass",
+            "quality_conclusion": "passed",
+            "summary": "最新独立复测及完整检查通过，先前缺陷已经解决。",
+        }
+        result, report = call(self.state, "write_test_report", report_decision=decision)
+        self.assertTrue(result.ok, result.summary)
+        self.assertEqual(report.defects, [])
+
+    def test_rerun_rejects_unchanged_script_blockers_without_spending_execution(self):
+        from app.schemas.agent_action import ToolExecutionResult
+
+        suite = two_case_suite()
+        self.state.suite_versions = [suite]
+        blocked = unit_manifest(suite, "blocked")
+        for row in blocked["results"]:
+            row["failure_kind"] = "script"
+        self.state.executions = [blocked]
+        self.assertTrue(
+            call(
+                self.state,
+                "adapt_test_script",
+                test_id="test_ac_track",
+                expected_suite_hash=suite.digest(),
+                step_index=0,
+                path="/api/v2/records",
+            )[0].ok
+        )
+        with patch("app.tools.test_engineer.qa_runner.run_acceptance_tests") as runner:
+            result, _ = call(self.state, "run_acceptance_tests")
+            self.assertFalse(result.ok)
+            self.assertIn("test_ac_track_second", result.summary)
+            self.assertEqual(len(self.state.executions), 1)
+            runner.assert_not_called()
+            result, _ = call(
+                self.state,
+                "run_acceptance_tests",
+                override_reason="final_blocked_evidence",
+            )
+            self.assertFalse(result.ok)
+            runner.assert_not_called()
+        current_hash = self.state.suite_versions[-1].digest()
+        self.assertTrue(
+            call(
+                self.state,
+                "adapt_test_script",
+                test_id="test_ac_track_second",
+                expected_suite_hash=current_hash,
+                step_index=0,
+                path="/api/v3/records",
+            )[0].ok
+        )
+        final_suite = self.state.suite_versions[-1]
+        passed = unit_manifest(final_suite, source_hash=self.state.code_source_hash)
+        passed["execution_id"] = "qa_after_all_script_edits"
+        with patch(
+            "app.tools.test_engineer.qa_runner.run_acceptance_tests",
+            return_value=ToolExecutionResult(
+                tool_call_id="rerun",
+                name="run_acceptance_tests",
+                ok=True,
+                summary="all passed",
+                data={"manifest": passed},
+            ),
+        ) as runner:
+            result, _ = call(self.state, "run_acceptance_tests")
+            self.assertTrue(result.ok, result.summary)
+            runner.assert_called_once()
+        self.assertEqual(len(self.state.executions), 2)
 
     def test_terminal_repair_inherits_only_exact_baseline_suite(self):
         from app.services import test_engineer as service
@@ -339,6 +684,379 @@ class IndependentQAContractTests(unittest.TestCase):
                     saved_progress=saved[-1],
                 )
         model.assert_not_called()
+
+    def test_explicit_qa_budget_extension_keeps_identity_evidence_and_thinking(self):
+        from app.agents.test_engineer import verify_code
+        from app.schemas.agent_action import ToolExecutionResult
+
+        self.state.tool_turns = 64
+        self.state.checks["all"] = ToolExecutionResult(
+            tool_call_id="all",
+            name="run_check",
+            ok=True,
+            summary="完整检查通过",
+            data={
+                "check_id": "all",
+                "source_hash": "a" * 64,
+                "runtime_version": CHECK_RUNTIME_VERSION,
+            },
+        )
+        previous = export_test_engineer_progress(self.state)
+        # The live failed execution predates thinking-mode persistence.
+        previous["schema_version"] = 2
+        previous.pop("execution_extension_attempts")
+        previous.pop("thinking_enabled")
+        previous.pop("budget_extension_attempt")
+        previous.pop("budget_extension_attempts")
+        saved = []
+        with (
+            patch("app.agents.test_engineer.settings.test_engineer_thinking", True),
+            patch(
+                "app.agents.test_engineer.chat_with_tools", side_effect=RuntimeError("offline")
+            ) as model,
+            self.assertRaisesRegex(RuntimeError, "offline"),
+        ):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="a" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=previous,
+                manual_budget_extension_attempt=4,
+                on_progress=saved.append,
+            )
+        self.assertEqual(saved[0]["budget_extension_attempt"], 4)
+        self.assertEqual(saved[0]["budget_extension_attempts"], [4])
+        self.assertEqual(saved[0]["tool_turns"], 64)
+        self.assertTrue(saved[0]["thinking_enabled"])
+        self.assertEqual(saved[-1]["tool_turns"], 65)
+        self.assertIn("all", saved[-1]["checks"])
+        self.assertTrue(model.call_args.kwargs["thinking"])
+        self.assertTrue(model.call_args.kwargs["parallel_tool_calls"])
+
+        restored = QAState(
+            app_spec=valid_spec(),
+            code_item_id="ci_code",
+            code_source_hash="a" * 64,
+            workspace_root=self.state.workspace_root,
+        )
+        restore_test_engineer_progress(restored, saved[-1])
+        self.assertEqual(restored.tool_budget, 128)
+        self.assertEqual(restored.budget_extension_attempt, 4)
+        self.assertEqual(restored.budget_extension_attempts, [4])
+        self.assertTrue(restored.thinking_enabled)
+        self.assertIn("all", restored.checks)
+        with self.assertRaisesRegex(BusinessException, "再次扩额"):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="a" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=saved[-1],
+                manual_budget_extension_attempt=5,
+            )
+
+    def test_three_explicit_qa_grants_preserve_spent_turns_and_stop_at_cap(self):
+        from app.agents.test_engineer import verify_code
+
+        self.state.tool_turns = 64
+        progress = export_test_engineer_progress(self.state)
+        for attempt, old_budget, new_budget in ((4, 64, 128), (6, 128, 192), (8, 192, 256)):
+            self.assertEqual(progress["tool_turns"], old_budget)
+            saved = []
+            with (
+                patch(
+                    "app.agents.test_engineer.chat_with_tools",
+                    side_effect=RuntimeError("offline"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "offline"),
+            ):
+                verify_code(
+                    spec=valid_spec(),
+                    code_item_id="ci_code",
+                    code_source_hash="a" * 64,
+                    workspace_root=self.state.workspace_root,
+                    system_design=None,
+                    saved_progress=progress,
+                    manual_budget_extension_attempt=attempt,
+                    on_progress=saved.append,
+                )
+            self.assertEqual(saved[0]["tool_turns"], old_budget)
+            self.assertEqual(saved[0]["budget_extension_attempts"][-1], attempt)
+            self.assertEqual(saved[-1]["tool_turns"], old_budget + 1)
+            progress = saved[-1]
+            progress["tool_turns"] = new_budget
+            restored = QAState(
+                app_spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="a" * 64,
+                workspace_root=self.state.workspace_root,
+            )
+            restore_test_engineer_progress(restored, progress)
+            self.assertEqual(restored.tool_budget, new_budget)
+            self.assertEqual(restored.tool_turns, new_budget)
+        self.assertEqual(progress["budget_extension_attempts"], [4, 6, 8])
+        with self.assertRaisesRegex(BusinessException, "再次扩额"):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="a" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=progress,
+                manual_budget_extension_attempt=9,
+            )
+
+    def test_legacy_v3_qa_grant_restores_without_repeating_first_grant(self):
+        self.state.tool_turns = 118
+        self.state.budget_extension_attempts = [4]
+        saved = export_test_engineer_progress(self.state)
+        saved["schema_version"] = 3
+        saved.pop("execution_extension_attempts")
+        saved.pop("budget_extension_attempts")
+        restored = QAState(
+            app_spec=valid_spec(),
+            code_item_id="ci_code",
+            code_source_hash="a" * 64,
+            workspace_root=self.state.workspace_root,
+        )
+        restore_test_engineer_progress(restored, saved)
+        self.assertEqual(restored.tool_turns, 118)
+        self.assertEqual(restored.tool_budget, 128)
+        self.assertEqual(restored.budget_extension_attempts, [4])
+        upgraded = export_test_engineer_progress(restored)
+        self.assertEqual(upgraded["schema_version"], 6)
+        self.assertEqual(upgraded["budget_extension_attempts"], [4])
+
+    def test_execution_budget_extension_is_explicit_source_bound_and_auditable(self):
+        from app.agents.test_engineer import verify_code
+        from app.schemas.agent_action import ToolExecutionResult
+
+        suite = unit_suite()
+        self.state.suite_versions = [suite]
+        for index in range(6):
+            manifest = unit_manifest(suite)
+            manifest["execution_id"] = f"qa_previous_{index}"
+            self.state.executions.append(manifest)
+        self.assertEqual(self.state.execution_budget, 6)
+        self.assertTrue(can_extend_qa_execution_budget(export_test_engineer_progress(self.state)))
+        result, _ = call(
+            self.state,
+            "adapt_test_script",
+            test_id="test_ac_track",
+            expected_suite_hash=suite.digest(),
+            step_index=0,
+            path="/api/v2/records",
+        )
+        self.assertTrue(result.ok, result.summary)
+        current_suite = self.state.suite_versions[-1]
+        with patch("app.tools.test_engineer.qa_runner.run_acceptance_tests") as runner:
+            result, _ = call(self.state, "run_acceptance_tests")
+        self.assertFalse(result.ok)
+        self.assertIn("执行预算已用尽", result.summary)
+        runner.assert_not_called()
+
+        progress = export_test_engineer_progress(self.state)
+        progress["schema_version"] = 5
+        progress.pop("execution_extension_attempts")
+        saved = []
+        with (
+            patch("app.agents.test_engineer.chat_with_tools", side_effect=RuntimeError("offline")),
+            self.assertRaisesRegex(RuntimeError, "offline"),
+        ):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="a" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=progress,
+                manual_execution_extension_attempt=4,
+                on_progress=saved.append,
+            )
+        self.assertEqual(saved[0]["execution_extension_attempts"], [4])
+        self.assertEqual(saved[0]["executions"], progress["executions"])
+        self.assertEqual(saved[0]["suite_versions"], progress["suite_versions"])
+        with self.assertRaisesRegex(BusinessException, "再次追加独立执行次数"):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="b" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=progress,
+                manual_execution_extension_attempt=4,
+            )
+
+        restored = QAState(
+            app_spec=valid_spec(),
+            code_item_id="ci_code",
+            code_source_hash="a" * 64,
+            workspace_root=self.state.workspace_root,
+        )
+        restore_test_engineer_progress(restored, saved[-1])
+        self.assertEqual(restored.execution_budget, 8)
+        self.assertEqual(len(restored.executions), 6)
+        self.assertEqual(restored.suite_versions[-1].digest(), current_suite.digest())
+        seventh = unit_manifest(current_suite)
+        seventh["execution_id"] = "qa_after_explicit_grant"
+        with patch(
+            "app.tools.test_engineer.qa_runner.run_acceptance_tests",
+            return_value=ToolExecutionResult(
+                tool_call_id="granted",
+                name="run_acceptance_tests",
+                ok=True,
+                summary="复验通过",
+                data={"manifest": seventh},
+            ),
+        ) as runner:
+            result, _ = call(restored, "run_acceptance_tests")
+        self.assertTrue(result.ok, result.summary)
+        runner.assert_called_once()
+        self.assertEqual(restored.executions[-1]["execution_id"], "qa_after_explicit_grant")
+        self.assertEqual(len(restored.executions), 7)
+
+    def test_execution_grants_cannot_be_forged_rewound_or_reissued(self):
+        from app.agents.test_engineer import verify_code
+
+        suite = unit_suite()
+        self.state.suite_versions = [suite]
+        for index in range(6):
+            manifest = unit_manifest(suite)
+            manifest["execution_id"] = f"qa_previous_{index}"
+            self.state.executions.append(manifest)
+        baseline = export_test_engineer_progress(self.state)
+        for grants, count in (([4], 5), ([4, 4], 6), ([True], 6), ([4], 9)):
+            with self.subTest(grants=grants, count=count):
+                invalid = copy.deepcopy(baseline)
+                invalid["execution_extension_attempts"] = grants
+                invalid["executions"] = invalid["executions"][:count]
+                if count == 9:
+                    invalid["executions"].extend(copy.deepcopy(baseline["executions"][:3]))
+                with self.assertRaisesRegex(BusinessException, "检查点损坏"):
+                    restore_test_engineer_progress(
+                        QAState(
+                            app_spec=valid_spec(),
+                            code_item_id="ci_code",
+                            code_source_hash="a" * 64,
+                            workspace_root=self.state.workspace_root,
+                        ),
+                        invalid,
+                    )
+        legacy = copy.deepcopy(baseline)
+        legacy["schema_version"] = 5
+        legacy.pop("execution_extension_attempts")
+        restored = QAState(
+            app_spec=valid_spec(),
+            code_item_id="ci_code",
+            code_source_hash="a" * 64,
+            workspace_root=self.state.workspace_root,
+        )
+        restore_test_engineer_progress(restored, legacy)
+        self.assertEqual(restored.execution_budget, 6)
+        restored.execution_extension_attempts = [4]
+        with self.assertRaisesRegex(BusinessException, "检查点损坏"):
+            restore_test_engineer_progress(restored, baseline)
+        capped = copy.deepcopy(baseline)
+        capped["execution_extension_attempts"] = [4, 6, 8]
+        for index in range(6, 12):
+            manifest = unit_manifest(suite)
+            manifest["execution_id"] = f"qa_previous_{index}"
+            capped["executions"].append(manifest)
+        self.assertFalse(can_extend_qa_execution_budget(capped))
+        with self.assertRaisesRegex(BusinessException, "再次追加独立执行次数"):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="a" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=capped,
+                manual_execution_extension_attempt=10,
+            )
+        from app.core.exceptions import ConflictException
+        from app.orchestration.test_engineer import run_test_engineer_task
+
+        previous = SimpleNamespace(
+            task_id="task_quality",
+            status="failed",
+            draft={"checkpoint": {"kind": "quality_checkpoint", "verification": capped}},
+        )
+        db = MagicMock()
+        db.get.return_value = previous
+        with self.assertRaisesRegex(ConflictException, "显式续额上限"):
+            run_test_engineer_task(
+                db,
+                MagicMock(),
+                1,
+                "run_quality",
+                "task_quality",
+                recovery_execution_id="exec_prior",
+                allow_execution_budget_extension=True,
+            )
+
+    def test_qa_grant_history_rejects_duplicate_and_corrupt_attempt_ids(self):
+        from app.agents.test_engineer import verify_code
+
+        self.state.tool_turns = 128
+        self.state.budget_extension_attempts = [4]
+        progress = export_test_engineer_progress(self.state)
+        for attempts, latest in (([4, 4], 4), ([6, 4], 4), ([4, True], True), ([4, 6], 4)):
+            invalid = copy.deepcopy(progress)
+            invalid["budget_extension_attempts"] = attempts
+            invalid["budget_extension_attempt"] = latest
+            with self.assertRaisesRegex(BusinessException, "检查点损坏"):
+                restore_test_engineer_progress(
+                    QAState(
+                        app_spec=valid_spec(),
+                        code_item_id="ci_code",
+                        code_source_hash="a" * 64,
+                        workspace_root=self.state.workspace_root,
+                    ),
+                    invalid,
+                )
+        premature = copy.deepcopy(progress)
+        premature["budget_extension_attempts"] = [4, 6]
+        premature["budget_extension_attempt"] = 6
+        premature["tool_turns"] = 127
+        with self.assertRaisesRegex(BusinessException, "检查点损坏"):
+            restore_test_engineer_progress(
+                QAState(
+                    app_spec=valid_spec(),
+                    code_item_id="ci_code",
+                    code_source_hash="a" * 64,
+                    workspace_root=self.state.workspace_root,
+                ),
+                premature,
+            )
+        with self.assertRaisesRegex(BusinessException, "再次扩额"):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="a" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=progress,
+                manual_budget_extension_attempt=4,
+            )
+
+    def test_qa_budget_extension_rejects_different_source(self):
+        from app.agents.test_engineer import verify_code
+
+        self.state.tool_turns = 64
+        saved = export_test_engineer_progress(self.state)
+        with self.assertRaisesRegex(BusinessException, "不允许再次扩额"):
+            verify_code(
+                spec=valid_spec(),
+                code_item_id="ci_code",
+                code_source_hash="b" * 64,
+                workspace_root=self.state.workspace_root,
+                system_design=None,
+                saved_progress=saved,
+                manual_budget_extension_attempt=2,
+            )
 
     def test_publication_rejects_pass_without_persisted_platform_evidence(self):
         from app.services import test_engineer as service

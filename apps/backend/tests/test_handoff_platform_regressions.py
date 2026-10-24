@@ -161,6 +161,33 @@ def expected_conflict():
         self.assertFalse(action.updates)
         self.assertEqual((root / "forgeai.smoke.json").read_bytes(), original)
 
+    def test_unsupported_api_auth_is_rejected_before_smoke_write_commits(self):
+        root = self.root / "workspace"
+        create_workspace(root)
+        path = root / "forgeai.smoke.json"
+        original = path.read_bytes()
+        digest = sha256_bytes(original)
+        manifest = json.loads(original)
+        manifest["api_checks"][0]["auth"] = "seeker"
+        action = prepare_action(
+            ToolCall(
+                id="write-auth",
+                name="write_file",
+                arguments={
+                    "path": "forgeai.smoke.json",
+                    "content": json.dumps(manifest),
+                    "expected_hash": digest,
+                },
+            ),
+            root,
+            {"forgeai.smoke.json": digest},
+        )
+        self.assertFalse(action.result.ok)
+        self.assertFalse(action.updates)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIn("capture", action.result.summary)
+        self.assertIn("headers", action.result.summary)
+
     def test_invalid_manifest_preflight_never_starts_docker(self):
         root = self.root / "workspace"
         create_workspace(root)

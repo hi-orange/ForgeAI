@@ -8,13 +8,17 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.agents.test_engineer import verify_code
-from app.core.exceptions import AppException, BusinessException
+from app.agents.test_engineer import TEST_ENGINEER_BUDGET_EXHAUSTED, verify_code
+from app.core.exceptions import AppException, BusinessException, ConflictException
 from app.models.configuration_item import ConfigurationItem
 from app.models.task_execution import TaskExecution
 from app.models.user import User
 from app.schemas.test_report import TestReport
 from app.services import test_engineer as test_engineer_service
+from app.services.qa_verification import (
+    can_extend_qa_execution_budget,
+    qa_execution_budget_exhausted,
+)
 from app.services.source_artifact import ensure_code_workspace
 from app.services.task_execution import fail_execution, renew_execution_lease, save_execution_draft
 from app.telemetry.agent import agent_telemetry_scope
@@ -82,9 +86,38 @@ def run_test_engineer_task(
     task_id: str,
     *,
     recovery_execution_id: str | None = None,
+    manual_budget_extension: bool = False,
+    allow_execution_budget_extension: bool = False,
     on_execution_started: Callable[[TaskExecution], None] | None = None,
 ) -> ConfigurationItem:
     """Verify code read-only, then publish the immutable quality report."""
+
+    previous = db.get(TaskExecution, recovery_execution_id) if recovery_execution_id else None
+    if manual_budget_extension:
+        if (
+            previous is None
+            or previous.task_id != task_id
+            or previous.status != "failed"
+            or previous.error != TEST_ENGINEER_BUDGET_EXHAUSTED
+        ):
+            raise ConflictException("只有预算耗尽的 QA 执行可显式扩额续接")
+
+    eligible_previous = (
+        allow_execution_budget_extension
+        and previous is not None
+        and previous.task_id == task_id
+        and previous.status == "failed"
+    )
+    prior_progress = _saved_quality_progress(previous) if eligible_previous and previous else None
+    if (
+        eligible_previous
+        and qa_execution_budget_exhausted(prior_progress)
+        and not (can_extend_qa_execution_budget(prior_progress))
+    ):
+        raise ConflictException("QA 独立执行次数已达到显式续额上限")
+    manual_execution_extension = eligible_previous and can_extend_qa_execution_budget(
+        prior_progress
+    )
 
     task, execution = test_engineer_service.claim_test_engineer_task(
         db,
@@ -150,6 +183,12 @@ def run_test_engineer_task(
                 acceptance_test_plan=inputs.acceptance_test_plan,
                 workspace_root=workspace_root,
                 saved_progress=_saved_quality_progress(execution),
+                manual_budget_extension_attempt=(
+                    execution.attempt if manual_budget_extension else None
+                ),
+                manual_execution_extension_attempt=(
+                    execution.attempt if manual_execution_extension else None
+                ),
                 inherited_suite=inputs.inherited_suite,
                 heartbeat=heartbeat,
                 on_progress=save_progress,

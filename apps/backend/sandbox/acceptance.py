@@ -14,7 +14,7 @@ _spec = importlib.util.spec_from_file_location("qa_check", Path(__file__).with_n
 check = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(check)
 
-VERSION = "forgeai-qa-v1"
+VERSION = "forgeai-qa-v2"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

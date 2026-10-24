@@ -77,15 +77,25 @@ def suite_test_results(suite: QASuite, execution: dict) -> list[dict]:
     ]
 
 
-RUNNER_VERSION = "forgeai-qa-v1"
+RUNNER_VERSION = "forgeai-qa-v2"
+LEGACY_RUNNER_VERSIONS = frozenset({"forgeai-qa-v1"})
 
 
-def validate_manifest(manifest: dict, identity: dict, suite: QASuite) -> None:
+def validate_manifest(
+    manifest: dict,
+    identity: dict,
+    suite: QASuite,
+    *,
+    allow_legacy: bool = False,
+) -> None:
     if not isinstance(manifest, dict):
         raise BusinessException("执行器清单格式无效")
     if any(manifest.get(key) != value for key, value in identity.items()):
         raise BusinessException("独立执行证据身份不匹配")
-    if manifest.get("runner_version") != RUNNER_VERSION:
+    accepted_versions = (
+        {RUNNER_VERSION, *LEGACY_RUNNER_VERSIONS} if allow_legacy else {RUNNER_VERSION}
+    )
+    if manifest.get("runner_version") not in accepted_versions:
         raise BusinessException("独立执行器版本不匹配")
     rows = manifest.get("results")
     expected = {case.test_id for case in suite.scenarios}
