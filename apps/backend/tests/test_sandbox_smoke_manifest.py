@@ -26,6 +26,12 @@ SPEC.loader.exec_module(sandbox_check)
 
 
 class SmokeManifestTests(unittest.TestCase):
+    def test_browser_contract_describes_required_check_fields(self) -> None:
+        spec = SMOKE_CONTRACT["browser"]
+        self.assertEqual(spec["required_fields"], ["id", "route"])
+        self.assertEqual(spec["route"]["type"], "local_path")
+        self.assertTrue(spec["route"]["example"].startswith("/"))
+
     def test_visual_contract_description_matches_validator(self) -> None:
         spec = SMOKE_CONTRACT["visual_contract"]
         self.assertEqual(spec["applies_to_template"], "fullstack-react-v1")
@@ -268,6 +274,32 @@ class SmokeManifestTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "站内绝对路径"),
             ):
                 sandbox_check.load_smoke_manifest()
+
+    def test_missing_browser_routes_identify_all_checks_and_required_field(self) -> None:
+        manifest = self.baseline()
+        manifest.pop("visual_contract")
+        manifest["browser_checks"] = [
+            {**manifest["browser_checks"][0], "id": "home", "route": "/"},
+            {**manifest["browser_checks"][0], "id": "jobs", "route": "/jobs"},
+        ]
+        for check in manifest["browser_checks"]:
+            del check["route"]
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as error:
+                validate_smoke_manifest(manifest, root=Path(tmp), template_metadata={})
+        self.assertIn("browser_checks[0][home].route", str(error.exception))
+        self.assertIn("browser_checks[1][jobs].route", str(error.exception))
+        self.assertIn("缺少必填字段 route", str(error.exception))
+
+    def test_invalid_browser_route_identifies_check_and_field(self) -> None:
+        manifest = self.baseline()
+        manifest.pop("visual_contract")
+        manifest["browser_checks"][0]["route"] = "https://example.com/jobs"
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as error:
+                validate_smoke_manifest(manifest, root=Path(tmp), template_metadata={})
+        self.assertIn("browser_checks[0][items].route", str(error.exception))
+        self.assertIn("站内绝对路径", str(error.exception))
 
     def test_browser_check_must_prove_a_frontend_api_request(self) -> None:
         manifest = self.baseline()

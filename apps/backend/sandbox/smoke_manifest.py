@@ -224,7 +224,8 @@ def validate_smoke_manifest(manifest: object, *, root: Path, template_metadata: 
             isinstance(key, str) and isinstance(value, str) for key, value in headers.items()
         ):
             raise ValueError("headers 必须是字符串到字符串的对象")
-    for check in browser_checks:
+    missing_routes = []
+    for index, check in enumerate(browser_checks):
         if (
             not isinstance(check, dict)
             or not isinstance(check.get("id"), str)
@@ -234,7 +235,14 @@ def validate_smoke_manifest(manifest: object, *, root: Path, template_metadata: 
         if check["id"] in seen:
             raise ValueError(f"联调项 id 重复：{check['id']}")
         seen.add(check["id"])
-        _validate_local_path(check.get("route"))
+        route_label = f"browser_checks[{index}][{check['id']}].route"
+        if "route" not in check:
+            missing_routes.append(route_label)
+            continue
+        try:
+            _validate_local_path(check["route"])
+        except ValueError as exc:
+            raise ValueError(f"{route_label}: {exc}") from exc
         viewport = check.get("viewport")
         if viewport is not None:
             _validate_contract_object(viewport, BROWSER_CONTRACT["viewport"], "browser viewport")
@@ -277,4 +285,10 @@ def validate_smoke_manifest(manifest: object, *, root: Path, template_metadata: 
                 f"browser_checks[{check['id']}].actions[{index}] 浏览器动作 {action_type}",
                 extra_fields=("type",),
             )
+    if missing_routes:
+        shown = ", ".join(missing_routes[:8])
+        remaining = f"；另有 {len(missing_routes) - 8} 项" if len(missing_routes) > 8 else ""
+        raise ValueError(
+            f"浏览器联调项缺少必填字段 route（请填写站内绝对路径，例如 /jobs）：{shown}{remaining}"
+        )
     return manifest

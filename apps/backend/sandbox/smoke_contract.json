@@ -49,6 +49,8 @@
     ]
   },
   "browser": {
+    "required_fields": ["id", "route"],
+    "route": { "type": "local_path", "example": "/jobs" },
     "kinds": ["integration", "ui"],
     "default_kind": "integration",
     "expect_api": "Integration cases require expect_api. Strings require a successful path-prefix response; objects match exact method, path (including query), and status. UI cases may omit expect_api but require a visible assertion.",
