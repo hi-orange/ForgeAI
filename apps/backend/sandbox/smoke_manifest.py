@@ -167,7 +167,7 @@ def validate_smoke_manifest(manifest: object, *, root: Path, template_metadata: 
         if not REQUIRED_THEME_TOKENS.issubset(required_tokens):
             raise ValueError("视觉合同必须包含主色、强调色和中性色语义 token")
         theme_mode = visual_contract.get("theme_mode")
-        if theme_mode not in {"template", "custom", "preserve"}:
+        if not isinstance(theme_mode, str) or theme_mode not in {"template", "custom", "preserve"}:
             raise ValueError("visual_contract.theme_mode 必须是 template、custom 或 preserve")
         theme_reason = visual_contract.get("theme_reason")
         if not isinstance(theme_reason, str) or len(theme_reason.strip()) < 8:

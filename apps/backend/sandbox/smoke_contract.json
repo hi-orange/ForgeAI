@@ -14,6 +14,18 @@
     "all_timeout_max_seconds": 1200
   },
   "top_level_fields": ["version", "visual_contract", "api_checks", "browser_checks"],
+  "visual_contract": {
+    "applies_to_template": "fullstack-react-v1",
+    "theme_file": { "type": "source_path", "prefix": "frontend/" },
+    "theme_mode": { "enum": ["template", "custom", "preserve"] },
+    "theme_reason": { "type": "string", "min_trimmed_length": 8 },
+    "required_tokens": {
+      "type": "string_array",
+      "item_prefix": "--",
+      "must_include": ["--color-primary", "--color-accent", "--color-muted"]
+    },
+    "local_assets": { "type": "source_path_array", "max_items": 30, "optional": true }
+  },
   "api": {
     "fields": ["id", "method", "path", "json", "expect_status", "expect_json_paths", "capture", "headers"],
     "defaults": { "method": "GET", "expect_status": 200 },

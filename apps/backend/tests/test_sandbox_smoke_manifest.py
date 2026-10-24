@@ -11,6 +11,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sandbox.smoke_manifest import (
+    REQUIRED_THEME_TOKENS,
+    SMOKE_CONTRACT,
     all_check_timeout_seconds,
     browser_smoke_timeout_seconds,
     validate_smoke_manifest,
@@ -24,6 +26,17 @@ SPEC.loader.exec_module(sandbox_check)
 
 
 class SmokeManifestTests(unittest.TestCase):
+    def test_visual_contract_description_matches_validator(self) -> None:
+        spec = SMOKE_CONTRACT["visual_contract"]
+        self.assertEqual(spec["applies_to_template"], "fullstack-react-v1")
+        self.assertEqual(spec["theme_file"], {"type": "source_path", "prefix": "frontend/"})
+        self.assertEqual(set(spec["theme_mode"]["enum"]), {"template", "custom", "preserve"})
+        self.assertEqual(spec["theme_reason"]["min_trimmed_length"], 8)
+        self.assertEqual(set(spec["required_tokens"]["must_include"]), REQUIRED_THEME_TOKENS)
+        self.assertEqual(spec["required_tokens"]["item_prefix"], "--")
+        self.assertEqual(spec["local_assets"]["max_items"], 30)
+        self.assertTrue(spec["local_assets"]["optional"])
+
     def test_browser_timeout_scales_with_manifest_and_remains_bounded(self) -> None:
         self.assertEqual(browser_smoke_timeout_seconds({"browser_checks": [{"id": "one"}]}), 120)
         checks = [

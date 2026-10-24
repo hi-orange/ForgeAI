@@ -20,7 +20,7 @@ from app.tools.code_engineer import (
     validate_tool_call,
 )
 from app.tools.paths import safe_path_under_root, sha256_bytes
-from sandbox.smoke_manifest import parse_smoke_manifest
+from sandbox.smoke_manifest import SMOKE_CONTRACT, parse_smoke_manifest
 
 PROTECTED_ACCEPTANCE_PATHS = (
     "backend/tests/acceptance/",
@@ -28,6 +28,11 @@ PROTECTED_ACCEPTANCE_PATHS = (
     "frontend/e2e/",
     "forgeai.acceptance.json",
 )
+_VISUAL_FEEDBACK_FIELDS = frozenset(
+    {"theme_file", "theme_mode", "theme_reason", "required_tokens", "local_assets"}
+)
+_VISUAL_FEEDBACK_MAX_CHARS = 1500
+_VISUAL_FEEDBACK_MAX_BYTES = 4096
 
 
 @dataclass
@@ -49,6 +54,60 @@ def writable_path(root: Path, path: str) -> str:
     ):
         raise ConflictException("Code Engineer 不能修改冻结验收资产")
     return canonical
+
+
+def _visual_manifest_rejection(
+    call: ToolCall,
+    error: ValueError,
+    *,
+    original: bytes | None,
+    root: Path,
+) -> ToolExecutionResult:
+    """Offer a bounded, previously validated visual contract as repair evidence."""
+    message = str(error)
+    if not original or not any(
+        marker in message for marker in ("visual_contract", "视觉合同", "源码路径")
+    ):
+        return rejected_tool(call, error)
+    try:
+        metadata = json.loads(safe_path_under_root(root, "template.json").read_bytes())
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("template_version") != "fullstack-react-v1"
+        ):
+            return rejected_tool(call, error)
+        current = parse_smoke_manifest(
+            original.decode("utf-8"), root=root.resolve(), template_metadata=metadata
+        )
+        visual = current.get("visual_contract")
+        if not isinstance(visual, dict) or not visual or set(visual) - _VISUAL_FEEDBACK_FIELDS:
+            return rejected_tool(call, error)
+        exact_json = json.dumps(visual, ensure_ascii=False, separators=(",", ":"))
+        if (
+            len(exact_json) > _VISUAL_FEEDBACK_MAX_CHARS
+            or len(exact_json.encode("utf-8")) > _VISUAL_FEEDBACK_MAX_BYTES
+        ):
+            return rejected_tool(call, error)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return rejected_tool(call, error)
+    hint = (
+        "保留下面结构校验已通过的原 visual_contract；只修改需要更新的 api_checks/browser_checks。"
+    )
+    if len(current["api_checks"]) >= SMOKE_CONTRACT["limits"]["api_checks"]:
+        hint += "API 探针已达上限，请替换或合并旧探针。"
+    summary = f"{message[:300]}；{hint} 原 visual_contract={exact_json}"
+    if len(summary) > 2000:
+        return rejected_tool(call, error)
+    result = rejected_tool(call, ValueError(summary))
+    return result.model_copy(
+        update={
+            "data": {
+                **result.data,
+                "current_valid_visual_contract": visual,
+                "repair_hint": hint,
+            }
+        }
+    )
 
 
 def prepare_action(
@@ -150,11 +209,21 @@ def prepare_action(
                     metadata = updates.get("template.json")
                     if metadata is None:
                         metadata = safe_path_under_root(root, "template.json").read_bytes()
-                    manifest = parse_smoke_manifest(
-                        updates["forgeai.smoke.json"].decode("utf-8"),
-                        root=root.resolve(),
-                        template_metadata=json.loads(metadata),
-                    )
+                    try:
+                        manifest = parse_smoke_manifest(
+                            updates["forgeai.smoke.json"].decode("utf-8"),
+                            root=root.resolve(),
+                            template_metadata=json.loads(metadata),
+                        )
+                    except ValueError as exc:
+                        return PreparedAction(
+                            _visual_manifest_rejection(
+                                call,
+                                exc,
+                                original=originals.get("forgeai.smoke.json"),
+                                root=root,
+                            )
+                        )
                     if checkpoint is not None:
                         violation = smoke_probe_violation(checkpoint, manifest)
                         if violation is not None:

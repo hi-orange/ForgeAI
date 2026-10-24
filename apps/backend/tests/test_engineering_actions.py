@@ -1,5 +1,6 @@
 """The engineering tool boundary never writes live source before a fenced commit."""
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -20,6 +21,119 @@ class EngineeringActionTests(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         return sha256_bytes(content)
+
+    def smoke_fixture(self, *, api_check_count=1):
+        self.source("template.json", b'{"template_version":"fullstack-react-v1"}')
+        self.source("frontend/src/index.css", b":root { --color-primary: #111; }")
+        manifest = {
+            "version": 1,
+            "visual_contract": {
+                "theme_file": "frontend/src/index.css",
+                "theme_mode": "custom",
+                "theme_reason": "使用当前项目已确认的主题配色",
+                "required_tokens": ["--color-primary", "--color-accent", "--color-muted"],
+                "local_assets": [],
+            },
+            "api_checks": [
+                {"id": f"ping-{index}", "path": "/api/v1/ping"} for index in range(api_check_count)
+            ],
+            "browser_checks": [{"id": "home", "kind": "ui", "route": "/", "expect_text": ["Home"]}],
+        }
+        digest = self.source("forgeai.smoke.json", json.dumps(manifest).encode("utf-8"))
+        return manifest, digest
+
+    def write_smoke_candidate(self, manifest, digest):
+        return prepare_action(
+            ToolCall(
+                id="smoke",
+                name="write_file",
+                arguments={
+                    "path": "forgeai.smoke.json",
+                    "content": json.dumps(manifest, ensure_ascii=False),
+                    "expected_hash": digest,
+                },
+            ),
+            self.root,
+            {"forgeai.smoke.json": digest},
+        )
+
+    def test_visual_manifest_rejection_returns_exact_valid_original_and_keeps_source(self):
+        original, digest = self.smoke_fixture()
+        candidate = json.loads(json.dumps(original))
+        candidate["visual_contract"]["required_tokens"] = ["--color-primary"]
+        action = self.write_smoke_candidate(candidate, digest)
+        self.assertFalse(action.result.ok)
+        self.assertEqual(action.result.error_code, "TOOL_REJECTED")
+        self.assertEqual(action.updates, {})
+        self.assertEqual(
+            action.result.data["current_valid_visual_contract"], original["visual_contract"]
+        )
+        self.assertIn(
+            json.dumps(original["visual_contract"], ensure_ascii=False, separators=(",", ":")),
+            action.result.summary,
+        )
+        self.assertIn("api_checks/browser_checks", action.result.summary)
+        self.assertLessEqual(len(action.result.summary), 2000)
+        self.assertEqual(
+            json.loads((self.root / "forgeai.smoke.json").read_text(encoding="utf-8")), original
+        )
+
+    def test_visual_manifest_rejection_with_full_api_budget_suggests_replacement(self):
+        original, digest = self.smoke_fixture(api_check_count=50)
+        candidate = json.loads(json.dumps(original))
+        candidate["visual_contract"]["theme_mode"] = "invalid"
+        action = self.write_smoke_candidate(candidate, digest)
+        self.assertIn("替换或合并旧探针", action.result.summary)
+
+    def test_unhashable_visual_mode_is_rejected_with_repair_evidence(self):
+        original, digest = self.smoke_fixture()
+        candidate = json.loads(json.dumps(original))
+        candidate["visual_contract"]["theme_mode"] = ["custom"]
+        action = self.write_smoke_candidate(candidate, digest)
+        self.assertFalse(action.result.ok)
+        self.assertEqual(action.result.error_code, "TOOL_REJECTED")
+        self.assertEqual(
+            action.result.data["current_valid_visual_contract"], original["visual_contract"]
+        )
+
+    def test_visual_asset_path_error_returns_original_visual_contract(self):
+        original, digest = self.smoke_fixture()
+        candidate = json.loads(json.dumps(original))
+        candidate["visual_contract"]["local_assets"] = ["../outside.svg"]
+        action = self.write_smoke_candidate(candidate, digest)
+        self.assertFalse(action.result.ok)
+        self.assertIn("源码路径越界", action.result.summary)
+        self.assertEqual(
+            action.result.data["current_valid_visual_contract"], original["visual_contract"]
+        )
+
+    def test_nonvisual_manifest_rejection_does_not_echo_visual_contract(self):
+        original, digest = self.smoke_fixture()
+        candidate = json.loads(json.dumps(original))
+        candidate["api_checks"][0]["auth"] = "unsupported"
+        action = self.write_smoke_candidate(candidate, digest)
+        self.assertFalse(action.result.ok)
+        self.assertNotIn("current_valid_visual_contract", action.result.data)
+        self.assertNotIn("原 visual_contract=", action.result.summary)
+
+    def test_invalid_or_unbounded_original_visual_contract_is_not_echoed(self):
+        original, _ = self.smoke_fixture()
+        for visual in (
+            {**original["visual_contract"], "theme_mode": "invalid"},
+            {**original["visual_contract"], "unrelated_secret": "do-not-echo"},
+            {**original["visual_contract"], "theme_reason": "a" * 2000},
+        ):
+            with self.subTest(visual=visual.get("theme_mode"), fields=len(visual)):
+                persisted = {**original, "visual_contract": visual}
+                digest = self.source(
+                    "forgeai.smoke.json", json.dumps(persisted, ensure_ascii=False).encode("utf-8")
+                )
+                candidate = json.loads(json.dumps(persisted))
+                candidate["visual_contract"]["required_tokens"] = ["--color-primary"]
+                action = self.write_smoke_candidate(candidate, digest)
+                self.assertFalse(action.result.ok)
+                self.assertNotIn("current_valid_visual_contract", action.result.data)
+                self.assertNotIn("do-not-echo", action.result.summary)
 
     def test_write_is_staged_until_commit_and_revision_restores_original(self):
         path = "backend/app/module.py"
