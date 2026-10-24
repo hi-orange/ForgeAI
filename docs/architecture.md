@@ -113,7 +113,12 @@ scenarios. Execution adapters use a bounded JSON test language, not arbitrary Py
 shell. API assertions and browser interactions run in a disposable off-network application with
 isolated SQLite data. The application runs under a different OS user from the trusted controller and
 cannot write its evidence. Required dependencies must already exist in the selected check image;
-an unavailable dependency is an environment block, never a product pass.
+an unavailable dependency is an environment block, never a product pass. When approved behavior
+depends on startup configuration or an older database revision, a scenario may freeze a bounded
+runtime fixture with application-only environment variables and declarative old-schema rows. The
+trusted controller owns the database URL, migration commands and process restart, and records setup
+evidence before API/browser assertions. A SQLite fixture does not establish PostgreSQL compatibility
+or behavior that requires a token issued by old code.
 
 Each execution binds `code_item_id`, `source_hash`, `suite_hash`, runner version and a unique execution
 id. Operation/expectation/observation records produce case statuses; neither model-authored requirement

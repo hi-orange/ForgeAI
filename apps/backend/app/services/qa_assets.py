@@ -77,8 +77,8 @@ def suite_test_results(suite: QASuite, execution: dict) -> list[dict]:
     ]
 
 
-RUNNER_VERSION = "forgeai-qa-v2"
-LEGACY_RUNNER_VERSIONS = frozenset({"forgeai-qa-v1"})
+RUNNER_VERSION = "forgeai-qa-v3"
+LEGACY_RUNNER_VERSIONS = frozenset({"forgeai-qa-v1", "forgeai-qa-v2"})
 
 
 def validate_manifest(
@@ -125,3 +125,14 @@ def validate_manifest(
             script = suite.scripts.get(row["test_id"])
             if script is None or len(observations) != len(script.steps):
                 raise BusinessException("未完整执行脚本不能通过")
+            case = next(case for case in suite.scenarios if case.test_id == row["test_id"])
+            if case.runtime is not None:
+                expected_runtime = {
+                    "database": "isolated_sqlite",
+                    "startup_env_names": sorted(case.runtime.env),
+                    "before_upgrade_revision": case.runtime.before_upgrade_revision,
+                    "seed_rows": len(case.runtime.seed_rows),
+                    "migrated_to": "head",
+                }
+                if row.get("runtime_evidence") != expected_runtime:
+                    raise BusinessException("场景启动与旧库升级证据缺失或不匹配")

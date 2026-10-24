@@ -44,7 +44,10 @@ _TEST_REPORT_DECISION_SCHEMA = inline_model_json_schema(TestReportDecision)
 TEST_ENGINEER_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="design_test_cases",
-        description="提交需求驱动场景草稿；平台校验获批预期和覆盖后冻结版本，不写业务源码。",
+        description=(
+            "提交需求驱动场景草稿；平台校验获批预期和覆盖后冻结版本，不写业务源码。"
+            "场景 runtime 可指定受限启动变量与旧 Alembic 修订/旧库行，须在首次设计时确定。"
+        ),
         parameters={
             "type": "object",
             "properties": {"suite": inline_model_json_schema(QASuite)},

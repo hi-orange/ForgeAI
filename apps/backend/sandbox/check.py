@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -39,6 +40,10 @@ MAX_BINARY_ASSET_BYTES = 15 * 1024 * 1024
 SECURITY_SCANNER_VERSION = "forgeai-security-v1"
 SECURITY_REPORT_PREFIX = "FORGEAI_SECURITY_REPORT="
 APPLICATION_UID = None
+
+
+class BackendPortUnavailable(OSError):
+    """A pre-existing listener prevents attribution to the new app process."""
 
 
 @contextmanager
@@ -462,7 +467,17 @@ def wait_http(url, process, label):
 
 
 def stop_process(process):
-    process.terminate()
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        process.terminate()
+    except OSError:
+        # The child may exit between poll() and terminate().
+        if process.poll() is None:
+            raise
+        process.wait()
+        return
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -633,17 +648,44 @@ def run_browser_smoke(manifest, variables, base_url):
     )
 
 
-def start_backend(port=8080):
+def start_backend(port=8080, *, env=None):
+    # A stale listener must never be mistaken for the process launched below.
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            pass
+    except ConnectionRefusedError:
+        pass
+    except OSError as exc:
+        raise BackendPortUnavailable(f"后端端口 {port} 状态无法确认") from exc
+    else:
+        raise BackendPortUnavailable(f"后端端口 {port} 已被占用")
     process = subprocess.Popen(
         ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=ROOT / "backend",
+        **({"env": env} if env is not None else {}),
         **application_process_options(),
     )
-    wait_http(f"http://127.0.0.1:{port}/api/v1/health", process, "后端")
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/openapi.json", timeout=2) as response:
-        paths = json.load(response)["paths"]
-    print("已注册接口:", json.dumps(paths, ensure_ascii=False)[:12000], flush=True)
-    return process
+    try:
+        wait_http(f"http://127.0.0.1:{port}/api/v1/health", process, "后端")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/openapi.json", timeout=2) as response:
+            paths = json.load(response)["paths"]
+        if process.poll() is not None:
+            raise RuntimeError("后端进程在健康检查后退出")
+        print("已注册接口:", json.dumps(paths, ensure_ascii=False)[:12000], flush=True)
+        return process
+    except BaseException:
+        try:
+            stop_process(process)
+        except Exception:
+            # Keep the startup error as the primary diagnosis. Attempt a final
+            # kill if a raced cleanup still left our own child alive.
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            except Exception:
+                pass
+        raise
 
 
 def backend():

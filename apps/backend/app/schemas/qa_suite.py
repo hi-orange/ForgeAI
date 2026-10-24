@@ -8,12 +8,34 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
 Identity = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,96}$")]
+RuntimeName = Annotated[str, StringConstraints(pattern=r"^[A-Z][A-Z0-9_]{0,63}$")]
+SQLIdentifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")]
+
+_PROTECTED_ENV_NAMES = frozenset(
+    {"DATABASE_URL", "DEBUG", "PATH", "HOME", "USER", "SHELL", "PWD", "TMP", "TMPDIR"}
+)
+_PROTECTED_ENV_PREFIXES = (
+    "PYTHON",
+    "PIP_",
+    "LD_",
+    "NODE_",
+    "NPM_",
+    "FORGEAI_",
+    "DOCKER_",
+    "AWS_",
+    "GOOGLE_",
+    "OPENAI_",
+    "UVICORN_",
+    "ALEMBIC_",
+)
 
 
 class QAAsset(BaseModel):
@@ -84,6 +106,51 @@ class BrowserStep(QAAsset):
         return self
 
 
+class QALegacyRow(QAAsset):
+    """Bounded declarative DML, inserted before upgrading an old schema."""
+
+    table: SQLIdentifier
+    values: dict[SQLIdentifier, Any] = Field(min_length=1, max_length=24)
+
+    @model_validator(mode="after")
+    def scalar_values_only(self) -> Self:
+        for value in self.values.values():
+            if value is not None and type(value) not in {str, int, float, bool}:
+                raise ValueError("旧库夹具仅接受 JSON 标量")
+            if isinstance(value, str) and len(value) > 2000:
+                raise ValueError("旧库夹具字段过长")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("旧库夹具数值必须有限")
+        return self
+
+
+class QARuntime(QAAsset):
+    """Scenario-specific startup and migration state under trusted runner control."""
+
+    env: dict[RuntimeName, str] = Field(default_factory=dict, max_length=12)
+    before_upgrade_revision: (
+        Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_]{1,96}$")] | None
+    ) = None
+    seed_rows: list[QALegacyRow] = Field(default_factory=list, max_length=24)
+
+    @model_validator(mode="after")
+    def safe_configuration(self) -> Self:
+        for name, value in self.env.items():
+            if name in _PROTECTED_ENV_NAMES or name.startswith(_PROTECTED_ENV_PREFIXES):
+                raise ValueError(f"QA 不能覆盖执行器环境变量 {name}")
+            if len(value) > 256 or re.search(r"[\x00-\x1f\x7f]", value):
+                raise ValueError("QA 启动变量值无效")
+        if self.before_upgrade_revision in {"head", "heads", "base"}:
+            raise ValueError("旧库夹具必须指定具体 Alembic 修订")
+        if self.seed_rows and self.before_upgrade_revision is None:
+            raise ValueError("旧库夹具必须指定升级前修订")
+        if any(row.table.lower() == "alembic_version" for row in self.seed_rows):
+            raise ValueError("旧库夹具不能改写迁移版本表")
+        if len(self.model_dump_json().encode("utf-8")) > 64 * 1024:
+            raise ValueError("QA 场景运行夹具超过 64 KiB")
+        return self
+
+
 Step = Annotated[APIStep | BrowserStep, Field(discriminator="kind")]
 
 
@@ -97,6 +164,7 @@ class QAScenario(QAAsset):
     expected_results: list[Text] = Field(min_length=1, max_length=50)
     category: Literal["normal", "negative", "permission", "regression", "journey", "exploratory"]
     environment: Literal["isolated_api", "isolated_browser", "isolated_fullstack"]
+    runtime: QARuntime | None = None
     # Exact approved text, keyed by acceptance id. Execution adaptation never edits it.
     approved_oracles: dict[Identity, Text]
 
@@ -135,9 +203,14 @@ class QASuite(QAAsset):
         return self
 
     def digest(self) -> str:
+        payload = self.model_dump(mode="json")
+        # Preserve exact hashes for suites written before scenario runtimes existed.
+        for case in payload["scenarios"]:
+            if case.get("runtime") is None:
+                case.pop("runtime", None)
         return hashlib.sha256(
             json.dumps(
-                self.model_dump(mode="json"),
+                payload,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),

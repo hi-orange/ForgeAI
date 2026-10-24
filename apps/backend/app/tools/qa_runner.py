@@ -18,6 +18,13 @@ from app.services.qa_assets import validate_manifest
 from app.tools import checks
 
 
+def qa_timeout_seconds(suite: QASuite, configured_timeout: int) -> int:
+    """Budget bounded extra startup work only for isolated runtime scenarios."""
+
+    runtime_scenarios = sum(case.runtime is not None for case in suite.scenarios)
+    return max(10, min(configured_timeout, 300 + min(600, 60 * runtime_scenarios)))
+
+
 def run_acceptance_tests(
     root: Path,
     *,
@@ -59,7 +66,7 @@ def run_acceptance_tests(
         code, output, truncated = checks._execute(
             command,
             payload,
-            max(10, min(settings.engineering_check_timeout_seconds, 300)),
+            qa_timeout_seconds(suite, settings.engineering_check_timeout_seconds),
         )
         result.data = {**identity, "check_id": "acceptance", "output": output, "exit_code": code}
         result.truncated = truncated

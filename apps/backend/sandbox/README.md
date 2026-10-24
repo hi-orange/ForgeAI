@@ -85,6 +85,19 @@ JSON 脚本，`run_acceptance_tests` 冻结整个套件并实际执行。它不�
 API 支持站内请求、JSON 断言和响应变量；浏览器支持导航、输入、点击、选择、刷新、返回及
 文本/元素/路径断言，以及不计入业务断言的 `wait_for_visible` 状态等待。
 API 准备步骤在浏览器操作之前；每个浏览器用例使用独立会话。
+需要检验启动开关或旧库升级的场景可在首次提交套件时声明受限 `runtime`，例如：
+
+```json
+{"env":{"APP_MODE":"production","SEED_SAMPLE_DATA":"true"},"before_upgrade_revision":"0002_initial","seed_rows":[{"table":"legacy_records","values":{"id":1,"name":"old row"}}]}
+```
+
+可信控制器为该场景分配独立 SQLite 库，先迁移到指定旧修订并参数化插入夹具行，
+再迁移到 head、启动后端，执行同一套 API/浏览器断言；之后恢复普通场景的后端。
+`DATABASE_URL`、执行器变量和进程控制变量不能由测试资产覆盖。运行配置随场景首版冻结，
+脚本适配不能改写；清单只记录变量名、迁移修订和行数，不记录变量值。
+这项能力不构成 PostgreSQL 或旧版会话签发行为的验收证据。
+独立 QA 原有 300 秒预算对每个独立运行配置增加最多 60 秒，整体最多 900 秒，
+且仍受 `ENGINEERING_CHECK_TIMEOUT_SECONDS` 限制。
 
 QA 容器禁用网络，不挂载宿主目录/socket，不传平台密钥。应用、迁移和前端构建使用 nobody；
 可信控制器使用 root，capabilities 限于 SETUID/SETGID/CHOWN/KILL，并保留 no-new-privileges
