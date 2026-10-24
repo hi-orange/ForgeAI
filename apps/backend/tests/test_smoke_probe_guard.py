@@ -2,12 +2,14 @@
 
 import json
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app.generation.engineering.actions import prepare_action
+from app.generation.engineering.actions import PreparedAction, commit_action, prepare_action
 from app.generation.engineering.checkpoint import new_checkpoint
 from app.generation.engineering.smoke_guard import (
+    ensure_smoke_probe_baseline,
     guard_passing_smoke_check,
     hydrate_legacy_failed_api_probes,
     protected_api_probes,
@@ -66,6 +68,246 @@ class SmokeProbeGuardTests(unittest.TestCase):
             ]
         )
         self.path.write_text(json.dumps(self.manifest), encoding="utf-8")
+
+    def _inherited_checkpoint(self):
+        checkpoint = new_checkpoint()
+        checkpoint["model_turns"] = 171  # A resumed legacy checkpoint has no new ledger yet.
+        ensure_smoke_probe_baseline(checkpoint, self.path)
+        return checkpoint
+
+    def _staged_manifest(self, checkpoint, manifest):
+        original = self.path.read_bytes()
+        return prepare_action(
+            ToolCall(
+                id="write-smoke",
+                name="write_files",
+                arguments={
+                    "writes": [
+                        {
+                            "path": "forgeai.smoke.json",
+                            "content": json.dumps(manifest),
+                            "expected_hash": sha256_bytes(original),
+                        }
+                    ]
+                },
+            ),
+            self.root,
+            {"forgeai.smoke.json": sha256_bytes(original)},
+            checkpoint=checkpoint,
+        )
+
+    def test_resumed_checkpoint_rejects_bulk_deletion_before_visual_schema(self):
+        checkpoint = self._inherited_checkpoint()
+        baseline = deepcopy(checkpoint["smoke_probe_baseline_v1"])
+        original = self.path.read_bytes()
+        candidate = deepcopy(self.manifest)
+        candidate["api_checks"] = candidate["api_checks"][:1]
+        candidate["browser_checks"] = []
+        candidate["visual_contract"]["theme_mode"] = "invalid"
+        action = self._staged_manifest(checkpoint, candidate)
+        self.assertFalse(action.result.ok)
+        self.assertIn("2 个 API", action.result.summary)
+        self.assertIn("1 个浏览器", action.result.summary)
+        self.assertIn("edit_file_by_replace", action.result.summary)
+        self.assertNotIn("theme_mode", action.result.summary)
+        self.assertFalse(action.updates)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(checkpoint["smoke_probe_baseline_v1"], baseline)
+
+    def test_unverified_additions_can_be_corrected_or_removed_but_old_ids_remain(self):
+        checkpoint = self._inherited_checkpoint()
+        expanded = deepcopy(self.manifest)
+        expanded["api_checks"].insert(
+            0,
+            {"id": "live-setup", "path": "/api/v1/jobs", "expect_status": 200},
+        )
+        new_browser = deepcopy(expanded["browser_checks"][0])
+        new_browser["id"] = "live-browser"
+        expanded["browser_checks"].append(new_browser)
+        first = self._staged_manifest(checkpoint, expanded)
+        self.assertTrue(first.result.ok, first.result.summary)
+        self.assertTrue(commit_action(first, self.root, revision_id="test-revision").ok)
+        failed_all = ToolExecutionResult(
+            tool_call_id="all",
+            name="run_check",
+            ok=False,
+            error_code="CHECK_FAILED",
+            summary="new probe failed",
+            data={"check_id": "all"},
+        )
+        self.assertFalse(guard_passing_smoke_check(checkpoint, failed_all, self.path).ok)
+        self.assertNotIn("live-setup", checkpoint["smoke_probe_baseline_v1"]["api_checks"])
+
+        corrected = deepcopy(expanded)
+        corrected["api_checks"][0]["path"] = "/api/v1/companies/999999"
+        corrected["api_checks"][0]["expect_status"] = 404
+        corrected["browser_checks"][-1]["route"] = "/login"
+        corrected["browser_checks"][-1]["expect_api"] = ["/api/v1/jobs"]
+        second = self._staged_manifest(checkpoint, corrected)
+        self.assertTrue(second.result.ok, second.result.summary)
+        self.assertTrue(commit_action(second, self.root, revision_id="test-correction").ok)
+
+        reduced = deepcopy(corrected)
+        reduced["api_checks"] = [
+            check for check in reduced["api_checks"] if check["id"] != "live-setup"
+        ]
+        reduced["browser_checks"] = [
+            check for check in reduced["browser_checks"] if check["id"] != "live-browser"
+        ]
+        third = self._staged_manifest(checkpoint, reduced)
+        self.assertTrue(third.result.ok, third.result.summary)
+        self.assertTrue(commit_action(third, self.root, revision_id="test-withdrawal").ok)
+
+        old_removed = deepcopy(reduced)
+        old_removed["api_checks"] = [
+            check
+            for check in old_removed["api_checks"]
+            if check["id"] != "public-list-shows-new-job"
+        ]
+        blocked = self._staged_manifest(checkpoint, old_removed)
+        self.assertFalse(blocked.result.ok)
+        self.assertIn("public-list-shows-new-job", blocked.result.summary)
+
+    def test_passing_all_freezes_added_probe_for_later_writes(self):
+        checkpoint = self._inherited_checkpoint()
+        expanded = deepcopy(self.manifest)
+        expanded["api_checks"].insert(
+            0,
+            {"id": "live-setup", "path": "/api/v1/jobs", "expect_status": 200},
+        )
+        first = self._staged_manifest(checkpoint, expanded)
+        self.assertTrue(first.result.ok, first.result.summary)
+        self.assertTrue(commit_action(first, self.root, revision_id="test-revision").ok)
+        passed = ToolExecutionResult(
+            tool_call_id="all",
+            name="run_check",
+            ok=True,
+            summary="all checks passed",
+            data={"check_id": "all", "source_hash": "source-after"},
+        )
+        self.assertTrue(guard_passing_smoke_check(checkpoint, passed, self.path).ok)
+        self.assertIn("live-setup", checkpoint["smoke_probe_baseline_v1"]["api_checks"])
+        reduced = deepcopy(expanded)
+        reduced["api_checks"] = [
+            check for check in reduced["api_checks"] if check["id"] != "live-setup"
+        ]
+        blocked = self._staged_manifest(checkpoint, reduced)
+        self.assertFalse(blocked.result.ok)
+        self.assertIn("live-setup", blocked.result.summary)
+        self.path.write_text(json.dumps(reduced), encoding="utf-8")
+        self.assertFalse(guard_passing_smoke_check(checkpoint, passed, self.path).ok)
+
+    def test_baseline_preserves_api_and_browser_observations(self):
+        checkpoint = self._inherited_checkpoint()
+        changed = deepcopy(self.manifest)
+        changed["api_checks"][0]["expect_json_paths"] = ["code"]
+        self.assertIn("响应字段断言", smoke_probe_violation(checkpoint, changed))
+        changed = deepcopy(self.manifest)
+        changed["api_checks"][0]["path"] = "/api/v1/private/health"
+        self.assertIn("请求路径", smoke_probe_violation(checkpoint, changed))
+        changed = deepcopy(self.manifest)
+        changed["browser_checks"][0]["expect_api"] = []
+        self.assertIn("前后端请求断言", smoke_probe_violation(checkpoint, changed))
+        changed = deepcopy(self.manifest)
+        changed["browser_checks"][0]["actions"] = []
+        self.assertIn("可观察断言", smoke_probe_violation(checkpoint, changed))
+
+    def test_negative_api_request_input_remains_strict(self):
+        manifest = deepcopy(self.manifest)
+        manifest["api_checks"].append(
+            {
+                "id": "invalid-salary",
+                "method": "POST",
+                "path": "/api/v1/employer/jobs",
+                "json": {"salary_min": 9000, "salary_max": 1000},
+                "expect_status": 422,
+            }
+        )
+        self.path.write_text(json.dumps(manifest), encoding="utf-8")
+        checkpoint = self._inherited_checkpoint()
+        changed = deepcopy(manifest)
+        changed["api_checks"][-1]["json"]["salary_min"] = 1000
+        self.assertIn("负向请求数据", smoke_probe_violation(checkpoint, changed))
+        changed = deepcopy(manifest)
+        changed["api_checks"][-1]["expect_status"] = 201
+        self.assertIn("预期状态码", smoke_probe_violation(checkpoint, changed))
+
+    def test_live_fixture_reordering_capture_rename_and_text_update_are_legal(self):
+        original = deepcopy(self.manifest)
+        original["api_checks"][1]["capture"] = {"old_job_id": "data.items.0.id"}
+        original["api_checks"][2]["path"] = "/api/v1/jobs/${old_job_id}"
+        original["browser_checks"][0]["route"] = "/jobs/1"
+        original["browser_checks"][0]["expect_api"] = [
+            {"method": "GET", "path": "/api/v1/jobs/1", "status": 200}
+        ]
+        self.path.write_text(json.dumps(original), encoding="utf-8")
+        checkpoint = self._inherited_checkpoint()
+        updated = deepcopy(original)
+        updated["api_checks"][1]["capture"] = {"new_job_id": "data.items.0.id"}
+        updated["api_checks"][2]["path"] = "/api/v1/jobs/${new_job_id}"
+        updated["browser_checks"][0]["route"] = "/jobs/${new_job_id}"
+        updated["browser_checks"][0]["expect_api"][0]["path"] = "/api/v1/jobs/${new_job_id}"
+        updated["browser_checks"][0]["expect_text"] = ["现场发布职位", "真实公司"]
+        updated["browser_checks"][0]["actions"][1]["text"] = "现场发布职位"
+        updated["api_checks"] = updated["api_checks"][1:] + updated["api_checks"][:1]
+        updated["browser_checks"].append(
+            {
+                "id": "empty-before-live-setup",
+                "route": "/",
+                "expect_api": ["/api/v1/jobs"],
+                "actions": [{"type": "expect_text", "text": "暂无职位"}],
+            }
+        )
+        self.assertIsNone(smoke_probe_violation(checkpoint, updated))
+        self.assertTrue(self._staged_manifest(checkpoint, updated).result.ok)
+
+    def test_missing_manifest_cannot_turn_a_passing_all_green(self):
+        checkpoint = self._inherited_checkpoint()
+        self.path.unlink()
+        passed = ToolExecutionResult(
+            tool_call_id="all",
+            name="run_check",
+            ok=True,
+            summary="all checks passed",
+            data={"check_id": "all", "source_hash": "source-after"},
+        )
+        guarded = guard_passing_smoke_check(checkpoint, passed, self.path)
+        self.assertFalse(guarded.ok)
+        self.assertEqual(guarded.error_code, "SMOKE_PROBE_WEAKENED")
+
+    def test_commit_refuses_deleting_required_smoke_manifest(self):
+        original = self.path.read_bytes()
+        action = PreparedAction(
+            result=ToolExecutionResult(
+                tool_call_id="delete",
+                name="delete_file",
+                ok=True,
+                summary="deleted",
+            ),
+            originals={"forgeai.smoke.json": original},
+            deletions={"forgeai.smoke.json"},
+        )
+        result = commit_action(action, self.root, revision_id="test-revision")
+        self.assertFalse(result.ok)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_invalid_inherited_manifest_does_not_install_a_baseline(self):
+        invalid = deepcopy(self.manifest)
+        invalid["api_checks"][0].pop("id")
+        self.path.write_text(json.dumps(invalid), encoding="utf-8")
+        checkpoint = new_checkpoint()
+        with self.assertRaises(ValueError):
+            ensure_smoke_probe_baseline(checkpoint, self.path)
+        self.assertNotIn("smoke_probe_baseline_v1", checkpoint)
+
+        repaired = self._staged_manifest(checkpoint, self.manifest)
+        self.assertTrue(repaired.result.ok, repaired.result.summary)
+        self.assertTrue(commit_action(repaired, self.root, revision_id="repair-manifest").ok)
+        ensure_smoke_probe_baseline(checkpoint, self.path)
+        self.assertEqual(
+            set(checkpoint["smoke_probe_baseline_v1"]["api_checks"]),
+            {"health", "public-list-shows-new-job", "public-list-hides-closed-job"},
+        )
 
     def test_legacy_failure_history_rejects_removed_and_private_replacement(self):
         checkpoint = new_checkpoint()

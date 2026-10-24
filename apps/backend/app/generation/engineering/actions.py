@@ -10,7 +10,10 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from app.core.exceptions import AppException, ConflictException
-from app.generation.engineering.smoke_guard import smoke_probe_violation
+from app.generation.engineering.smoke_guard import (
+    smoke_probe_inventory_violation,
+    smoke_probe_violation,
+)
 from app.schemas.agent_action import ToolCall, ToolExecutionResult
 from app.tools import files
 from app.tools.code_engineer import (
@@ -206,6 +209,14 @@ def prepare_action(
                         if content != original:
                             updates[path] = content
                 if "forgeai.smoke.json" in updates:
+                    try:
+                        candidate = json.loads(updates["forgeai.smoke.json"])
+                    except ValueError:
+                        candidate = None  # The full parser gives the syntax error.
+                    if checkpoint is not None:
+                        violation = smoke_probe_inventory_violation(checkpoint, candidate)
+                        if violation is not None:
+                            raise ConflictException(violation)
                     metadata = updates.get("template.json")
                     if metadata is None:
                         metadata = safe_path_under_root(root, "template.json").read_bytes()
@@ -243,7 +254,7 @@ def prepare_action(
                         }
                     )
             return PreparedAction(result, originals, updates)
-    except (AppException, ValueError, OSError) as exc:
+    except (AppException, ValueError, OSError, UnicodeError, TypeError) as exc:
         return PreparedAction(rejected_tool(call, exc))
 
 
@@ -265,6 +276,8 @@ def commit_action(action: PreparedAction, root: Path, *, revision_id: str) -> To
         return action.result
     applied: list[str] = []
     try:
+        if "forgeai.smoke.json" in action.deletions:
+            raise ConflictException("forgeai.smoke.json 是必需的工程联调门禁，不能删除")
         if action.input_source_hash is not None:
             from app.tools.checks import source_snapshot
 

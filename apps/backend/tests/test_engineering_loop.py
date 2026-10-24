@@ -875,6 +875,25 @@ class EngineeringLoopTests(EngineeringClaimTests):
             saved = db.get(TaskExecution, self.execution.execution_id)
             return read_frozen_input_snapshot(saved)["checkpoint"]
 
+    def test_invalid_existing_smoke_manifest_does_not_block_engineer_prepare(self):
+        self._start()
+        path = self.root / "forgeai.smoke.json"
+        invalid = json.loads(path.read_text(encoding="utf-8"))
+        invalid["api_checks"][0].pop("id")
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+
+        prepared = _EngineeringNodes(self.session_factory).prepare(
+            {
+                "user_id": self.owner.id,
+                "project_id": self.project.id,
+                "build_run_id": self.run.run_id,
+                "task_id": self.task.task_id,
+                "execution_id": self.execution.execution_id,
+            }
+        )
+        self.assertEqual(prepared["outcome"], "running")
+        self.assertNotIn("smoke_probe_baseline_v1", self._checkpoint())
+
     def test_decisions_write_sources_and_platform_checks_before_publish(self):
         self._start()
         result = self._run()
@@ -890,6 +909,8 @@ class EngineeringLoopTests(EngineeringClaimTests):
             )
         checkpoint = self._checkpoint()
         self.assertEqual(checkpoint["execution_mode"], EXECUTION_MODE)
+        self.assertEqual(set(checkpoint["smoke_probe_baseline_v1"]["api_checks"]), {"health"})
+        self.assertEqual(set(checkpoint["smoke_probe_baseline_v1"]["browser_checks"]), {"home"})
         self.assertEqual(checkpoint["completed_source_hash"], source_snapshot(self.root)[1])
         with self.session_factory() as db:
             events = list(

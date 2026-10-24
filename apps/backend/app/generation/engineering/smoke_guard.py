@@ -1,17 +1,254 @@
-"""Keep failed engineering smoke probes from becoming a passing substitute."""
+"""Keep engineering smoke coverage from becoming a passing substitute."""
 
 from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from app.schemas.agent_action import ToolExecutionResult
 from app.tools.check_diagnostics import extract_check_diagnostics
+from app.tools.paths import sha256_bytes
+from sandbox.smoke_manifest import SMOKE_CONTRACT, parse_smoke_manifest
 
 _VARIABLE = re.compile(r"\$\{[A-Za-z][A-Za-z0-9_]*\}")
+_OBSERVABLE_ACTIONS = frozenset(
+    {
+        "expect_text",
+        "expect_any_text",
+        "expect_path",
+        "expect_count",
+        "expect_no_horizontal_scroll",
+        "screenshot",
+    }
+)
+_BASELINE_KEY = "smoke_probe_baseline_v1"
+
+
+def _path_shape(value: str) -> str:
+    """Allow a fixed fixture id to become a captured id, without changing routes."""
+    path = urlsplit(value).path
+    return "/".join(
+        "{id}" if segment.isdecimal() else _VARIABLE.sub("{id}", segment)
+        for segment in path.split("/")
+    )
+
+
+def _template_shape(value: Any) -> Any:
+    """Ignore capture variable names while preserving literal request input."""
+    if isinstance(value, str):
+        return _VARIABLE.sub("${value}", value)
+    if isinstance(value, list):
+        return [_template_shape(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _template_shape(item) for key, item in value.items()}
+    return value
+
+
+def _json_type_shape(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_type_shape(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_type_shape(item) for item in value]
+    return type(value).__name__
+
+
+def _api_contract(check: dict[str, Any]) -> dict[str, Any]:
+    path = str(check.get("path") or "")
+    headers = check.get("headers") or {}
+    return {
+        "method": str(check.get("method") or "GET").upper(),
+        "path": _path_shape(path),
+        "query": _query_params(path),
+        "expect_status": check.get("expect_status", 200),
+        "expect_json_paths": list(check.get("expect_json_paths") or []),
+        "capture_paths": list((check.get("capture") or {}).values()),
+        "authorization": any(key.casefold() == "authorization" for key in headers),
+        "json": check.get("json"),
+    }
+
+
+def _browser_expectation(expected: Any) -> str:
+    if isinstance(expected, str):
+        return json.dumps(
+            {"prefix": _path_shape(expected), "query_keys": _query_keys(expected)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    return json.dumps(
+        {
+            "method": expected.get("method"),
+            "path": _path_shape(str(expected.get("path") or "")),
+            "query_keys": _query_keys(str(expected.get("path") or "")),
+            "status": expected.get("status"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _observable_action(action: dict[str, Any]) -> str:
+    action_type = action.get("type")
+    if action_type == "expect_count":
+        # Fixture cardinality can change, but a positive observation cannot
+        # become an empty-state assertion or vice versa.
+        return f"expect_count:{'zero' if action.get('count') == 0 else 'positive'}"
+    return str(action_type)
+
+
+def _browser_contract(check: dict[str, Any]) -> dict[str, Any]:
+    browser = SMOKE_CONTRACT["browser"]
+    return {
+        "route": _path_shape(str(check.get("route") or "")),
+        "kind": check.get("kind", browser["default_kind"]),
+        "viewport": check.get("viewport", browser["default_viewport"]),
+        "expect_api": [_browser_expectation(item) for item in check.get("expect_api") or []],
+        "assertions": [
+            _observable_action(item)
+            for item in check.get("actions") or []
+            if item.get("type") in _OBSERVABLE_ACTIONS
+        ]
+        + ["expect_text"] * len(check.get("expect_text") or []),
+    }
+
+
+def ensure_smoke_probe_baseline(checkpoint: dict[str, Any], manifest_path: Path) -> None:
+    """Freeze inherited probes once; rejected staged writes cannot change this ledger."""
+    if _BASELINE_KEY in checkpoint:
+        return
+    content = manifest_path.read_bytes()
+    root = manifest_path.parent.resolve()
+    metadata = json.loads((root / "template.json").read_text(encoding="utf-8"))
+    manifest = parse_smoke_manifest(content.decode("utf-8"), root=root, template_metadata=metadata)
+    checkpoint[_BASELINE_KEY] = {
+        "initial_manifest_hash": sha256_bytes(content),
+        "api_checks": {check["id"]: _api_contract(check) for check in manifest["api_checks"]},
+        "browser_checks": {
+            check["id"]: _browser_contract(check) for check in manifest["browser_checks"]
+        },
+    }
+
+
+def smoke_probe_inventory_violation(checkpoint: dict[str, Any], manifest: object) -> str | None:
+    """Report removed probes before detailed schema errors obscure the coverage loss."""
+    baseline = checkpoint.get(_BASELINE_KEY)
+    if not isinstance(baseline, dict):
+        return None
+    if not isinstance(manifest, dict):
+        return None  # The schema validator reports malformed input.
+    ids = {}
+    for field in ("api_checks", "browser_checks"):
+        checks = manifest.get(field)
+        if not isinstance(checks, list):
+            return None  # The schema validator gives the precise error.
+        ids[field] = {
+            check["id"]
+            for check in checks
+            if isinstance(check, dict) and isinstance(check.get("id"), str)
+        }
+    dropped = {
+        field: sorted(set(baseline.get(field) or {}) - ids[field])
+        for field in ("api_checks", "browser_checks")
+    }
+    if any(dropped.values()):
+
+        def preview(ids: list[str]) -> str:
+            return ", ".join(ids[:5]) + (f" 等 {len(ids)} 项" if len(ids) > 5 else "")
+
+        return (
+            f"smoke 清单删除了 {len(dropped['api_checks'])} 个 API 探针"
+            f"（{preview(dropped['api_checks']) or '无'}）和 "
+            f"{len(dropped['browser_checks'])} 个浏览器探针"
+            f"（{preview(dropped['browser_checks']) or '无'}）。"
+            "保留旧探针 ID，仅局部调整与获批新需求冲突的数据准备或断言；"
+            "可用 edit_file_by_replace，避免整份重写。"
+        )
+    return None
+
+
+def _baseline_violation(checkpoint: dict[str, Any], manifest: object) -> str | None:
+    baseline = checkpoint.get(_BASELINE_KEY)
+    if not isinstance(baseline, dict):
+        return None
+    if not isinstance(manifest, dict):
+        return "forgeai.smoke.json 已缺失；恢复原清单后重试 all 检查。"
+    inventory_issue = smoke_probe_inventory_violation(checkpoint, manifest)
+    if inventory_issue is not None:
+        return inventory_issue
+    current = {}
+    for field in ("api_checks", "browser_checks"):
+        checks = manifest.get(field)
+        if not isinstance(checks, list):
+            return None  # The schema validator gives the precise error.
+        current[field] = {check.get("id"): check for check in checks if isinstance(check, dict)}
+    for probe_id, previous in (baseline.get("api_checks") or {}).items():
+        check = _api_contract(current["api_checks"][probe_id])
+        label = f"API 探针 {probe_id}"
+        for field, description in (
+            ("method", "请求方法"),
+            ("path", "请求路径"),
+            ("expect_status", "预期状态码"),
+            ("authorization", "身份凭据边界"),
+        ):
+            if check[field] != previous[field]:
+                return f"{label} 的{description}被替换；保留原请求合同，另加新探针验证新行为。"
+        old_query = previous["query"]
+        new_query = check["query"]
+        if [pair[0] for pair in old_query] != [pair[0] for pair in new_query]:
+            return f"{label} 的查询参数被删减或替换；保留原筛选维度。"
+        if previous["expect_status"] >= 400:
+            if _template_shape(old_query) != _template_shape(new_query):
+                return f"{label} 的负向请求条件被修改；保留原错误场景。"
+        elif any(
+            bool(old[1]) and not bool(new[1]) for old, new in zip(old_query, new_query, strict=True)
+        ):
+            return f"{label} 的查询值被清空；保留真实筛选输入。"
+        if not set(previous["expect_json_paths"]).issubset(check["expect_json_paths"]):
+            return f"{label} 的响应字段断言被删减；恢复原断言。"
+        if not Counter(previous["capture_paths"]) <= Counter(check["capture_paths"]):
+            return f"{label} 的响应变量捕获被删减；可改变量名但须保留捕获字段。"
+        old_body, new_body = previous["json"], check["json"]
+        if previous["expect_status"] >= 400:
+            if _template_shape(old_body) != _template_shape(new_body):
+                return f"{label} 的负向请求数据被修改；保留原错误输入。"
+        elif _json_type_shape(old_body) != _json_type_shape(new_body):
+            return f"{label} 的请求数据结构被删减或替换；保留原输入字段。"
+    for probe_id, previous in (baseline.get("browser_checks") or {}).items():
+        check = _browser_contract(current["browser_checks"][probe_id])
+        label = f"浏览器探针 {probe_id}"
+        for field, description in (
+            ("route", "入口路由"),
+            ("kind", "探针类型"),
+            ("viewport", "视口"),
+        ):
+            if check[field] != previous[field]:
+                return f"{label} 的{description}被修改；保留原用户场景。"
+        if not Counter(previous["expect_api"]) <= Counter(check["expect_api"]):
+            return f"{label} 的前后端请求断言被删减；恢复原 expect_api。"
+        if not Counter(previous["assertions"]) <= Counter(check["assertions"]):
+            return f"{label} 的可观察断言被删减；保留旧断言并可增加新断言。"
+    return None
+
+
+def _extend_verified_baseline(checkpoint: dict[str, Any], manifest: object) -> None:
+    """A passing full run makes newly added probes durable obligations."""
+    baseline = checkpoint.get(_BASELINE_KEY)
+    if not isinstance(baseline, dict) or not isinstance(manifest, dict):
+        return
+    for field, contract in (
+        ("api_checks", _api_contract),
+        ("browser_checks", _browser_contract),
+    ):
+        ledger = baseline.get(field)
+        checks = manifest.get(field)
+        if not isinstance(ledger, dict) or not isinstance(checks, list):
+            continue
+        for check in checks:
+            if isinstance(check, dict) and isinstance(check.get("id"), str):
+                ledger.setdefault(check["id"], contract(check))
 
 
 def _request_path(value: str) -> str:
@@ -221,6 +458,9 @@ def record_failed_api_probes(
 def smoke_probe_violation(checkpoint: dict[str, Any], manifest: object) -> str | None:
     """Return an actionable violation; additive and credential fixes remain legal."""
 
+    baseline_issue = _baseline_violation(checkpoint, manifest)
+    if baseline_issue is not None:
+        return baseline_issue
     protected = protected_api_probes(checkpoint)
     if not protected:
         return None
@@ -293,9 +533,10 @@ def guard_passing_smoke_check(
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return result  # The sandbox runner owns schema/read failures.
+        manifest = None  # A missing manifest must not pass a recorded baseline.
     violation = smoke_probe_violation(checkpoint, manifest)
     if violation is None:
+        _extend_verified_baseline(checkpoint, manifest)
         return result
     return result.model_copy(
         update={

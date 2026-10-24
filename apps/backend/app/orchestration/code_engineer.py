@@ -64,6 +64,7 @@ from app.generation.engineering.diagnostics import (
     resolve_protocol_diagnostic,
 )
 from app.generation.engineering.smoke_guard import (
+    ensure_smoke_probe_baseline,
     guard_passing_smoke_check,
     hydrate_legacy_failed_api_probes,
     record_failed_api_probes,
@@ -293,6 +294,13 @@ class _EngineeringNodes:
                 return self._result(checkpoint)
 
             root = _workspace_root(state["project_id"], state["build_run_id"])
+            try:
+                ensure_smoke_probe_baseline(checkpoint, root / "forgeai.smoke.json")
+            except (OSError, UnicodeError, ValueError, TypeError):
+                # Only a valid inherited manifest can be frozen. The existing
+                # manifest validator and run_check diagnose invalid input while
+                # the engineer remains free to repair it.
+                pass
             if "initial_source_files" not in checkpoint:
                 checkpoint["initial_source_files"] = source_file_hashes(
                     check_tools.source_snapshot(root)[0]
